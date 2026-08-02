@@ -121,7 +121,7 @@ describe("macOS Keychain backend", () => {
     const runner = new RecordingRunner();
     runner.outcomes.push({
       exitCode: 0,
-      stdout: `supadrum:v1:${Buffer.from("resolved-value").toString("base64")}\n`,
+      stdout: `${keychainItem("resolved-value")}\n`,
       stderr: ""
     });
     const backend = new MacOsKeychainBackend(runner, "operator");
@@ -155,6 +155,7 @@ describe("macOS Keychain backend", () => {
     },
     {
       case: "a payload that is not the text that was stored",
+      // Not keychainItem: this one is deliberately outside what it can produce.
       stored: `supadrum:v1:${Buffer.from([0xff, 0xfe]).toString("base64")}`,
       message: "Keychain item has invalid Supadrum encoding"
     }
@@ -202,8 +203,7 @@ describe("macOS Keychain backend", () => {
         argv: ["security", "-i"],
         stdin:
           `add-generic-password -U -s supadrum:${reference} ` +
-          `-a operator -w supadrum:v1:` +
-          `${Buffer.from("top-secret-canary").toString("base64")}\n`
+          `-a operator -w ${keychainItem("top-secret-canary")}\n`
       }
     ]);
     expect(JSON.stringify(runner.invocations[0]?.argv)).not.toContain(
@@ -238,8 +238,7 @@ describe("macOS Keychain backend", () => {
       { exitCode: 0, stdout: "", stderr: "" },
       {
         exitCode: 0,
-        stdout:
-          `supadrum:v1:${Buffer.from("existing-secret").toString("base64")}\n`,
+        stdout: `${keychainItem("existing-secret")}\n`,
         stderr: ""
       }
     );
@@ -260,8 +259,7 @@ describe("macOS Keychain backend", () => {
     ).toBe(true);
     expect(runner.invocations[1]?.stdin).toBe(
       `add-generic-password -U -s supadrum:${reference} ` +
-        `-a operator -w supadrum:v1:` +
-        `${Buffer.from("existing-secret").toString("base64")}\n`
+        `-a operator -w ${keychainItem("existing-secret")}\n`
     );
   });
 
