@@ -125,20 +125,17 @@ function cli(overrides: Partial<CliRuntimeShape> = {}) {
 type CliRuntimeShape = Parameters<typeof runCli>[2] & object;
 
 describe("operator CLI", () => {
-  test("shows project wizard commands in root help", async () => {
+  // The only test that runs the CLI as a program rather than calling into
+  // it: it is what proves the entrypoint fires and the module loads at all.
+  // What the help text says is asserted in-process, where it costs nothing.
+  test("runs as a program and reaches its own help", async () => {
     const { stdout, stderr } = await execFileAsync(
       process.execPath,
       ["--import", tsxLoader, cliSource, "--help"],
       { cwd: repositoryRoot }
     );
 
-    expect(stdout).toContain("supadrum project add");
-    expect(stdout).toContain("supadrum project credentials set");
-    expect(stdout).toContain("supadrum project doctor");
-    expect(stdout).toContain("supadrum project setup");
-    expect(stdout).toContain("supadrum project migrations owner");
-    expect(stdout).toContain("supadrum project migrations driver");
-    expect(stdout).toContain("supadrum project live");
+    expect(stdout).toContain("Usage:");
     expect(stderr).toBe("");
   });
 
@@ -1064,13 +1061,27 @@ describe("operator CLI: bootstrap commands", () => {
     });
   });
 
-  test("prints usage without spawning a process", async () => {
+  test("lists every command it accepts in its help", async () => {
     const harness = cli();
 
     expect(await runCli(["--help"], harness.io, harness.runtime)).toBe(0);
 
-    expect(harness.stdout()).toContain("supadrum project add");
-    expect(harness.stdout()).toContain("supadrum approve <job-id>");
+    for (const command of [
+      "supadrum project add",
+      "supadrum project setup",
+      "supadrum project credentials set",
+      "supadrum project migrations owner",
+      "supadrum project migrations driver",
+      "supadrum project live",
+      "supadrum project inspect",
+      "supadrum project doctor",
+      "supadrum project list",
+      "supadrum approve <job-id>",
+      "supadrum status <job-id>",
+      "supadrum demo"
+    ]) {
+      expect(harness.stdout()).toContain(command);
+    }
     expect(harness.stderr()).toBe("");
   });
 
