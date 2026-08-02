@@ -14,6 +14,7 @@ import { describe, expect, test } from "vitest";
 import { parse } from "yaml";
 
 import { runCli } from "../src/cli.js";
+import { SqliteStore } from "../src/store.js";
 import { loadConfig } from "../src/config.js";
 import type { SecretPrompt } from "../src/credential-setup.js";
 import { addProject } from "../src/projects.js";
@@ -65,6 +66,40 @@ function credentialConfig(
   });
   return { root, configPath };
 }
+
+/**
+ * Collects what the CLI wrote and hands back a runtime whose every input is
+ * declared here rather than inherited from the process, so a test can never
+ * pass because of the developer's own environment.
+ */
+function cli(overrides: Partial<CliRuntimeShape> = {}) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const root = overrides.cwd ?? mkdtempSync(join(tmpdir(), "supadrum-cli-"));
+  return {
+    io: {
+      stdout: (text: string) => out.push(text),
+      stderr: (text: string) => err.push(text)
+    },
+    runtime: {
+      cwd: root,
+      homeDirectory: root,
+      environment: {},
+      question: async () => {
+        throw new Error("this command must not prompt");
+      },
+      defaultVaultCommand: undefined,
+      promptSecret: { read: async () => "unused" },
+      keychain: () => new MemoryVault(),
+      ...overrides
+    },
+    root,
+    stdout: () => out.join(""),
+    stderr: () => err.join("")
+  };
+}
+
+type CliRuntimeShape = Parameters<typeof runCli>[2] & object;
 
 describe("operator CLI", () => {
   test("shows project wizard commands in root help", async () => {
@@ -744,5 +779,109 @@ projects:
       )
     ).toContain("name: supadrum");
     expect(repaired.stderr).toBe("");
+  });
+});
+
+describe("operator CLI: queue commands", () => {
+  function queueConfig() {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-queue-"));
+    const repository = join(root, "example-ios");
+    const configPath = join(root, "config.yml");
+    execFileSync("git", ["init", "--quiet", repository]);
+    addProject({
+      alias: "example-ios",
+      repository,
+      project_ref: "abcdefghijklmnopqrst",
+      profile: "admin",
+      config_path: configPath
+    });
+    writeFileSync(
+      configPath,
+      readFileSync(configPath, "utf8").replace(
+        "approval_mode: automatic",
+        "approval_mode: manual"
+      )
+    );
+    const config = loadConfig(configPath);
+    const store = new SqliteStore(
+      config.database_path,
+      undefined,
+      config.approval_mode
+    );
+    const job = store.submit({
+      project: "example-ios",
+      operation: "migration.apply",
+      payload: { migration: "0001.sql" },
+      repo_sha: "abc123",
+      idempotency_key: "example-ios:abc123:apply"
+    });
+    store.transition(job.id, "waiting_approval");
+    store.close();
+    return { configPath, jobId: job.id };
+  }
+
+  test("records the approver from the declared environment", async () => {
+    const { configPath, jobId } = queueConfig();
+    const harness = cli({ environment: { USER: "declared-operator" } });
+
+    expect(
+      await runCli(
+        ["approve", jobId, "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      id: jobId,
+      approved_by: "declared-operator",
+      status: "queued"
+    });
+  });
+
+  test("prefers an explicit --actor over the environment", async () => {
+    const { configPath, jobId } = queueConfig();
+    const harness = cli({ environment: { USER: "declared-operator" } });
+
+    await runCli(
+      ["approve", jobId, "--actor", "release-bot", "--config", configPath],
+      harness.io,
+      harness.runtime
+    );
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      approved_by: "release-bot"
+    });
+  });
+
+  test("reports a job's state without touching it", async () => {
+    const { configPath, jobId } = queueConfig();
+    const harness = cli();
+
+    expect(
+      await runCli(
+        ["status", jobId, "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      id: jobId,
+      status: "waiting_approval",
+      approved_by: null
+    });
+  });
+
+  test("refuses approve and status without a job id", async () => {
+    const { configPath } = queueConfig();
+    const harness = cli();
+
+    await expect(
+      runCli(["approve", "--config", configPath], harness.io, harness.runtime)
+    ).rejects.toThrow("Usage: supadrum approve <job-id>");
+    await expect(
+      runCli(["status", "--config", configPath], harness.io, harness.runtime)
+    ).rejects.toThrow("Usage: supadrum status <job-id>");
   });
 });

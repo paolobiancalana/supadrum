@@ -948,7 +948,8 @@ export async function runCli(
       args[1],
       "supadrum approve <job-id> [--actor <name>] [--config <path>]"
     );
-    const actor = option(args, "--actor") ?? process.env.USER ?? "operator";
+    const actor =
+      option(args, "--actor") ?? runtime.environment.USER ?? "operator";
     const { store } = openConfiguredStore(args, runtime);
     try {
       io.stdout(`${JSON.stringify(store.approve(jobId, actor), null, 2)}\n`);
