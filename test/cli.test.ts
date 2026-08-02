@@ -49,6 +49,19 @@ class MemoryVault implements VaultBackend {
 
 const PROJECT_REF = "abcdefghijklmnopqrst";
 
+/**
+ * A vault_command the CLI recognises as its own keychain backend. Only the
+ * shape of the path is inspected — `node <something>/vault-cli.js keychain
+ * resolve` — so this names a file that need not exist, and tests that use it
+ * substitute the backend itself.
+ */
+const KEYCHAIN_VAULT_COMMAND = [
+  process.execPath,
+  "/package/dist/vault-cli.js",
+  "keychain",
+  "resolve"
+] as const;
+
 /** An operator root: somewhere to put a config, and repositories to point at. */
 function workspace(prefix: string) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -326,12 +339,7 @@ projects:
   });
 
   test("sets missing project credentials without exposing their values", async () => {
-    const { root, configPath } = credentialConfig([
-      process.execPath,
-      "/package/dist/vault-cli.js",
-      "keychain",
-      "resolve"
-    ]);
+    const { root, configPath } = credentialConfig(KEYCHAIN_VAULT_COMMAND);
     const vault = new MemoryVault();
     const labels: string[] = [];
     const values = [
@@ -424,12 +432,7 @@ projects:
   });
 
   test("replaces one selected credential through the masked wizard", async () => {
-    const { root, configPath } = credentialConfig([
-      process.execPath,
-      "/package/dist/vault-cli.js",
-      "keychain",
-      "resolve"
-    ]);
+    const { root, configPath } = credentialConfig(KEYCHAIN_VAULT_COMMAND);
     const vault = new MemoryVault();
     vault.values.set(
       "vault://supabase/example-ios/secret",
@@ -1136,12 +1139,7 @@ describe("operator CLI: input validation and prompting", () => {
   });
 
   test("rejects an unknown credential name for --replace", async () => {
-    const { configPath } = credentialConfig([
-      process.execPath,
-      join(repositoryRoot, "dist", "vault-cli.js"),
-      "keychain",
-      "resolve"
-    ]);
+    const { configPath } = credentialConfig(KEYCHAIN_VAULT_COMMAND);
     const harness = cli();
 
     await expect(
@@ -1346,13 +1344,6 @@ process.stdin.on("end", () => {
 });
 
 describe("operator CLI: failure paths that guide the operator", () => {
-  const keychainVaultCommand = [
-    process.execPath,
-    join(repositoryRoot, "dist", "vault-cli.js"),
-    "keychain",
-    "resolve"
-  ];
-
   test("points at setup when the alias is already configured", async () => {
     const space = workspace("supadrum-cli-dup-");
     register(space, "example-ios");
@@ -1375,7 +1366,7 @@ describe("operator CLI: failure paths that guide the operator", () => {
   });
 
   test("rejects a migration driver that is neither supabase nor prisma", async () => {
-    const { configPath } = credentialConfig(keychainVaultCommand);
+    const { configPath } = credentialConfig(KEYCHAIN_VAULT_COMMAND);
     const harness = cli();
 
     await expect(
@@ -1422,7 +1413,7 @@ projects:
   });
 
   test("surfaces a keychain failure while collecting credentials", async () => {
-    const { configPath } = credentialConfig(keychainVaultCommand);
+    const { configPath } = credentialConfig(KEYCHAIN_VAULT_COMMAND);
     class LockedKeychain extends MemoryVault {
       override async get(): Promise<string> {
         throw new Error("The user name or passphrase you entered is not correct");
@@ -1516,11 +1507,13 @@ describe("operator CLI: human-readable output and agent wiring", () => {
     const harness = cli({
       cwd: root,
       codexAgentSetup: {
+        // The skill directory is really copied, so this one must exist; the
+        // MCP argv is only written into the generated config.
         skillSource: join(
           repositoryRoot, "plugins", "supadrum", "skills", "supadrum"
         ),
         mcpCommand: process.execPath,
-        mcpArgs: [join(repositoryRoot, "dist", "mcp.js")],
+        mcpArgs: ["/package/dist/mcp.js"],
         mcpCwd: repositoryRoot
       }
     });
