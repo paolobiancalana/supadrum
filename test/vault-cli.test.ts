@@ -60,11 +60,21 @@ function io(stdin: string) {
 
 const reference = "vault://supabase/example-web/management";
 
+function keychainItem(value: string): string {
+  return `supadrum:v1:${Buffer.from(value, "utf8").toString("base64")}`;
+}
+
 describe("macOS Keychain backend", () => {
   test("rejects accounts that are unsafe in an interactive command", () => {
     expect(
       () => new MacOsKeychainBackend(new RecordingRunner(), "operator; quit")
     ).toThrow("Keychain account contains unsafe characters");
+  });
+
+  test("requires an account when the environment does not name one", () => {
+    expect(() => new MacOsKeychainBackend(new RecordingRunner(), "")).toThrow(
+      "Keychain account is required"
+    );
   });
 
   test("maps references to deterministic Keychain items", async () => {
@@ -92,6 +102,55 @@ describe("macOS Keychain backend", () => {
     ]);
   });
 
+  test.each([
+    {
+      case: "an item some other tool owns",
+      stored: "plain-secret-from-another-tool",
+      message: "Keychain item has an unsupported Supadrum format"
+    },
+    {
+      case: "a truncated payload",
+      stored: "supadrum:v1:dG9wLXNlY3JldC1jYW5hcm",
+      message: "Keychain item has invalid Supadrum encoding"
+    },
+    {
+      case: "a payload that is not the text that was stored",
+      stored: `supadrum:v1:${Buffer.from([0xff, 0xfe]).toString("base64")}`,
+      message: "Keychain item has invalid Supadrum encoding"
+    }
+  ])("refuses to hand back $case", async ({ stored, message }) => {
+    const runner = new RecordingRunner();
+    runner.outcomes.push({ exitCode: 0, stdout: `${stored}\n`, stderr: "" });
+    const backend = new MacOsKeychainBackend(runner, "operator");
+
+    await expect(backend.get(reference)).rejects.toThrow(message);
+  });
+
+  test("reports a missing item apart from an unreadable one", async () => {
+    const missing = new RecordingRunner();
+    missing.outcomes.push({ exitCode: 44, stdout: "", stderr: "" });
+    const locked = new RecordingRunner();
+    locked.outcomes.push({ exitCode: 1, stdout: "", stderr: "denied" });
+
+    await expect(
+      new MacOsKeychainBackend(missing, "operator").get(reference)
+    ).rejects.toThrow(MissingVaultValueError);
+    // A locked or denied Keychain must not read as "no value yet": callers
+    // treat that as permission to mint a replacement.
+    await expect(
+      new MacOsKeychainBackend(locked, "operator").get(reference)
+    ).rejects.not.toThrow(MissingVaultValueError);
+  });
+
+  test("refuses an item that decodes to nothing", async () => {
+    const runner = new RecordingRunner();
+    runner.outcomes.push({ exitCode: 0, stdout: "\n", stderr: "" });
+
+    await expect(
+      new MacOsKeychainBackend(runner, "operator").get(reference)
+    ).rejects.toThrow("Keychain item is empty");
+  });
+
   test("writes an encoded value through the security interactive stdin", async () => {
     const runner = new RecordingRunner();
     const backend = new MacOsKeychainBackend(runner, "operator");
@@ -109,6 +168,26 @@ describe("macOS Keychain backend", () => {
     ]);
     expect(JSON.stringify(runner.invocations[0]?.argv)).not.toContain(
       "top-secret-canary"
+    );
+  });
+
+  test("refuses to overwrite a stored credential with nothing", async () => {
+    const runner = new RecordingRunner();
+    const backend = new MacOsKeychainBackend(runner, "operator");
+
+    await expect(backend.put(reference, "")).rejects.toThrow(
+      "Keychain value cannot be empty"
+    );
+    expect(runner.invocations).toEqual([]);
+  });
+
+  test("surfaces a rejected write instead of reporting success", async () => {
+    const runner = new RecordingRunner();
+    runner.outcomes.push({ exitCode: 1, stdout: "", stderr: "denied" });
+    const backend = new MacOsKeychainBackend(runner, "operator");
+
+    await expect(backend.put(reference, "top-secret-canary")).rejects.toThrow(
+      "Keychain write failed"
     );
   });
 
@@ -144,6 +223,33 @@ describe("macOS Keychain backend", () => {
         `-a operator -w supadrum:v1:` +
         `${Buffer.from("existing-secret").toString("base64")}\n`
     );
+  });
+
+  test.each(["", "operator"])(
+    "refuses an import whose source names no service (account %j)",
+    async (account) => {
+      const runner = new RecordingRunner();
+      const backend = new MacOsKeychainBackend(runner, "operator");
+
+      await expect(
+        backend.import(reference, { service: "", account })
+      ).rejects.toThrow("Keychain import source is incomplete");
+      expect(runner.invocations).toEqual([]);
+    }
+  );
+
+  test("does not report an import as verified when the item did not change", async () => {
+    const runner = new RecordingRunner();
+    runner.outcomes.push(
+      { exitCode: 0, stdout: "existing-secret\n", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: `${keychainItem("stale-secret")}\n`, stderr: "" }
+    );
+    const backend = new MacOsKeychainBackend(runner, "operator");
+
+    await expect(
+      backend.import(reference, { service: "supabase-pat", account: "operator" })
+    ).rejects.toThrow("Keychain import round-trip mismatch");
   });
 });
 
