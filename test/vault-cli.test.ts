@@ -394,6 +394,19 @@ describe("vault operator CLI", () => {
     expect(streams.stdout.join("")).not.toContain("top-secret-canary");
   });
 
+  test("stores what was piped in, not the line ending that carried it", async () => {
+    const backend = new MemoryBackend();
+
+    await expect(
+      runVaultCli(
+        ["keychain", "put", reference],
+        io("top-secret-canary\r\n").io,
+        { keychain: backend }
+      )
+    ).resolves.toBe(0);
+    expect(backend.values.get(reference)).toBe("top-secret-canary");
+  });
+
   test("does not report a put that the vault did not honour", async () => {
     class DriftingBackend extends MemoryBackend {
       override async put(vaultReference: string): Promise<void> {
@@ -942,6 +955,18 @@ describe("SOPS age backend", () => {
     ).resolves.toBe(0);
     expect(bootstrapStreams.stdout).toEqual([`${recipient}\n`]);
     expect(bootstrapStreams.stdout.join("")).not.toContain("AGE-SECRET");
+  });
+
+  test("refuses to resolve without being told which encrypted file to read", async () => {
+    const runner = new RecordingRunner();
+
+    await expect(
+      runVaultCli(["sops", "resolve"], io(`${reference}\n`).io, {
+        keychain: identityVault(),
+        runner
+      })
+    ).rejects.toThrow("SOPS resolve requires --file");
+    expect(runner.invocations).toEqual([]);
   });
 });
 

@@ -558,6 +558,8 @@ export async function runVaultCli(
     return 0;
   }
 
+  const runner = dependencies.runner ?? nodeProcessRunner;
+
   if (args[0] === "migrate") {
     if (args[1] !== "dotenv") {
       io.stderr(
@@ -574,7 +576,6 @@ export async function runVaultCli(
     // and stores a key: a migration that can never run must not leave an age
     // identity behind that no backup was ever encrypted to.
     const mappings = migrationMappings(args);
-    const runner = dependencies.runner ?? nodeProcessRunner;
     const recipient = await bootstrapAgeIdentity(
       dependencies.keychain,
       runner
@@ -597,7 +598,6 @@ export async function runVaultCli(
 
   if (args[0] === "sops") {
     const command = args[1];
-    const runner = dependencies.runner ?? nodeProcessRunner;
     if (command === "resolve") {
       const file = option(args, "--file");
       if (!file) throw new Error("SOPS resolve requires --file");
@@ -676,14 +676,6 @@ export async function runVaultCli(
   return 1;
 }
 
-async function readProcessStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
 /*
  * Process bootstrap: binds this module to the real process — its argv, its
  * stdio, its exit code. The guard is false by design whenever the module is
@@ -693,6 +685,14 @@ async function readProcessStdin(): Promise<string> {
  * "code the instrument can see" rather than carrying a permanent red block.
  */
 /* v8 ignore start */
+async function readProcessStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 const entrypoint = process.argv[1];
 if (isEntrypoint(import.meta.url, entrypoint)) {
   runVaultCli(
