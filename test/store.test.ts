@@ -1,10 +1,48 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import type { JobSubmission } from "../src/domain.js";
 import { SqliteStore } from "../src/store.js";
+
+/**
+ * Opens the queue from another process and holds it for `holdMs` without
+ * switching it to WAL. Another process cannot make that switch while this
+ * connection is open, and SQLite refuses it outright rather than through the
+ * busy handler — which is the race two Supadrum daemons hit on a fresh queue.
+ * It has to be another process: a second connection here would block the very
+ * thread that must release it.
+ */
+async function holdUnmigratedQueue(
+  path: string,
+  holdMs: number
+): Promise<() => void> {
+  const driver = createRequire(import.meta.url).resolve("better-sqlite3");
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      [
+        `const Database = require(${JSON.stringify(driver)});`,
+        `const db = new Database(${JSON.stringify(path)});`,
+        `db.exec("CREATE TABLE IF NOT EXISTS holder (x)");`,
+        `db.exec("BEGIN IMMEDIATE");`,
+        `db.prepare("INSERT INTO holder VALUES (1)").run();`,
+        `process.stdout.write("held");`,
+        `setTimeout(() => { db.exec("COMMIT"); db.close(); }, ${holdMs});`
+      ].join("")
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] }
+  );
+  await new Promise<void>((resolve, reject) => {
+    child.stdout.once("data", () => resolve());
+    child.once("error", reject);
+  });
+  return () => child.kill();
+}
 
 const stores: SqliteStore[] = [];
 const now = () => new Date("2026-07-29T15:00:00.000Z");
@@ -32,6 +70,54 @@ function submission(
 
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
+});
+
+describe("opening the queue", () => {
+  test("waits for another process to finish opening it", async () => {
+    const path = join(
+      mkdtempSync(join(tmpdir(), "supadrum-store-")),
+      "queue.sqlite"
+    );
+    const holdMs = 300;
+    const release = await holdUnmigratedQueue(path, holdMs);
+    const started = Date.now();
+
+    try {
+      // Whichever of the two daemons loses the race must queue behind the
+      // other and start, not exit with "database is locked".
+      const store = new SqliteStore(path, now, "manual");
+      stores.push(store);
+
+      expect(Date.now() - started).toBeGreaterThanOrEqual(holdMs - 50);
+      expect(store.submit(submission()).status).toBe("queued");
+    } finally {
+      release();
+    }
+  });
+
+  test("refuses a queue path that is not a database", () => {
+    const path = join(
+      mkdtempSync(join(tmpdir(), "supadrum-store-")),
+      "queue.sqlite"
+    );
+    writeFileSync(path, "this is a note, not a queue");
+    const started = Date.now();
+
+    expect(() => new SqliteStore(path, now, "manual")).toThrow(
+      /not a database/i
+    );
+    // And at once: a misconfigured database_path is not something anyone is
+    // about to let go of, so it must not be retried against the busy deadline.
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("can be closed more than once", () => {
+    const { store } = createStore();
+
+    store.close();
+
+    expect(() => store.close()).not.toThrow();
+  });
 });
 
 describe("durable jobs", () => {
