@@ -19,28 +19,37 @@ import { SqliteStore } from "../src/store.js";
 const stores: SqliteStore[] = [];
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 
-function setup(approvalMode?: "automatic" | "manual") {
-  const directory = mkdtempSync(join(tmpdir(), "supadrum-mcp-"));
-  const configPath = join(directory, "supadrum.yml");
-  writeFileSync(
-    configPath,
-    `version: 1
+function project(name: string, capabilities: readonly string[]): string {
+  return `  ${name}:
+    project_ref: ${name}-ref
+    credentials:
+      secret_key: vault://supabase/${name}/secret
+      management_token: vault://supabase/${name}/management
+      database_access: vault://supabase/${name}/postgres
+    capabilities:
+${capabilities.map((capability) => `      - ${capability}`).join("\n")}
+`;
+}
+
+function configYaml(
+  projects: string,
+  approvalMode?: "automatic" | "manual"
+): string {
+  return `version: 1
 database: queue.sqlite
 executor: dry-run
 ${approvalMode ? `approval_mode: ${approvalMode}\n` : ""}projects:
-  alpha:
-    project_ref: alpha-ref
-    credentials:
-      secret_key: vault://supabase/alpha/secret
-      management_token: vault://supabase/alpha/management
-      database_access: vault://supabase/alpha/postgres
-    capabilities:
-      - data-api
-      - migrations
-      - schema-inspection
-      - project-management
-`
-  );
+${projects}`;
+}
+
+function writeConfig(prefix: string, contents: string): string {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  const configPath = join(directory, "supadrum.yml");
+  writeFileSync(configPath, contents);
+  return configPath;
+}
+
+function openStore(configPath: string) {
   const config = loadConfig(configPath);
   const store = new SqliteStore(
     config.database_path,
@@ -48,7 +57,23 @@ ${approvalMode ? `approval_mode: ${approvalMode}\n` : ""}projects:
     config.approval_mode
   );
   stores.push(store);
-  return { config, store };
+  return { config, configPath, store };
+}
+
+const ALPHA_CAPABILITIES = [
+  "data-api",
+  "migrations",
+  "schema-inspection",
+  "project-management"
+] as const;
+
+function setup(approvalMode?: "automatic" | "manual") {
+  return openStore(
+    writeConfig(
+      "supadrum-mcp-",
+      configYaml(project("alpha", ALPHA_CAPABILITIES), approvalMode)
+    )
+  );
 }
 
 // Reading a field off a tool result needs a shape the SDK types as unknown.
@@ -88,55 +113,17 @@ function activateLease(
   return session;
 }
 
-function credentials(project: string): string {
-  return `    credentials:
-      secret_key: vault://supabase/${project}/secret
-      management_token: vault://supabase/${project}/management
-      database_access: vault://supabase/${project}/postgres`;
-}
-
-function configYaml(projects: string): string {
-  return `version: 1
-database: queue.sqlite
-executor: dry-run
-projects:
-${projects}`;
-}
-
 function setupProjects(projects: string) {
-  const directory = mkdtempSync(join(tmpdir(), "supadrum-mcp-projects-"));
-  const configPath = join(directory, "supadrum.yml");
-  writeFileSync(configPath, configYaml(projects));
-  const config = loadConfig(configPath);
-  const store = new SqliteStore(
-    config.database_path,
-    undefined,
-    config.approval_mode
+  return openStore(
+    writeConfig("supadrum-mcp-projects-", configYaml(projects))
   );
-  stores.push(store);
-  return { config, configPath, store };
 }
 
 function createStdioConfig(prefix: string): string {
-  const directory = mkdtempSync(join(tmpdir(), prefix));
-  const configPath = join(directory, "supadrum.yml");
-  writeFileSync(
-    configPath,
-    `version: 1
-database: queue.sqlite
-executor: dry-run
-projects:
-  alpha:
-    project_ref: alpha-ref
-    credentials:
-      secret_key: vault://supabase/alpha/secret
-      management_token: vault://supabase/alpha/management
-      database_access: vault://supabase/alpha/postgres
-    capabilities:
-      - project-management
-`
+  return writeConfig(
+    prefix,
+    configYaml(project("alpha", ["project-management"]))
   );
-  return configPath;
 }
 
 function createStdioClient(name: string, configPath: string) {
@@ -530,12 +517,7 @@ describe("MCP protocol surface", () => {
   });
 
   test("refuses an operation the project holds no capability for", () => {
-    const { config, store } = setupProjects(`  narrow:
-    project_ref: narrow-ref
-${credentials("narrow")}
-    capabilities:
-      - project-management
-`);
+    const { config, store } = setupProjects(project("narrow", ["project-management"]));
     const handlers = createHandlers(config, store);
 
     expect(() =>
@@ -551,17 +533,9 @@ ${credentials("narrow")}
   });
 
   test("lists every project sorted and free of credential references", () => {
-    const { config, store } = setupProjects(`  zulu:
-    project_ref: zulu-ref
-${credentials("zulu")}
-    capabilities:
-      - data-api
-  alpha:
-    project_ref: alpha-ref
-${credentials("alpha")}
-    capabilities:
-      - data-api
-`);
+    const { config, store } = setupProjects(
+      project("zulu", ["data-api"]) + project("alpha", ["data-api"])
+    );
     const listed = createHandlers(config, store).projectsList();
 
     expect(listed.projects.map((project) => project.name)).toEqual([
@@ -575,14 +549,8 @@ ${credentials("alpha")}
   });
 
   test("reads a fresh configuration per call when given a config function", () => {
-    const alpha = (capabilities: string) => `  alpha:
-    project_ref: alpha-ref
-${credentials("alpha")}
-    capabilities:
-${capabilities}
-`;
     const { configPath, store } = setupProjects(
-      alpha("      - project-management")
+      project("alpha", ["project-management"])
     );
     const handlers = createHandlers(() => loadConfig(configPath), store);
     const submission = {
@@ -599,7 +567,7 @@ ${capabilities}
 
     writeFileSync(
       configPath,
-      configYaml(alpha("      - project-management\n      - data-api"))
+      configYaml(project("alpha", ["project-management", "data-api"]))
     );
 
     expect(handlers.jobsSubmit(submission)).toMatchObject({
@@ -745,12 +713,7 @@ describe("session leases", () => {
   });
 
   test("refuses a lease over a capability the project lacks", () => {
-    const { config, store } = setupProjects(`  narrow:
-    project_ref: narrow-ref
-${credentials("narrow")}
-    capabilities:
-      - project-management
-`);
+    const { config, store } = setupProjects(project("narrow", ["project-management"]));
     const handlers = createHandlers(config, store);
 
     expect(() =>
@@ -834,17 +797,11 @@ ${credentials("narrow")}
 });
 
 describe("configuration reloading", () => {
-  const alpha = (capabilities: string) => `  alpha:
-    project_ref: alpha-ref
-${credentials("alpha")}
-    capabilities:
-${capabilities}
-`;
-
   function reloaderFor(projects: string) {
-    const directory = mkdtempSync(join(tmpdir(), "supadrum-mcp-reload-"));
-    const configPath = join(directory, "supadrum.yml");
-    writeFileSync(configPath, configYaml(projects));
+    const configPath = writeConfig(
+      "supadrum-mcp-reload-",
+      configYaml(projects)
+    );
     let tick = 0;
     // mtime is stamped explicitly: some filesystems only resolve to a
     // second, so two quick writes can share a timestamp. Passing the same
@@ -863,14 +820,14 @@ ${capabilities}
 
   test("serves the capabilities from the file as it changes", () => {
     const { getConfig, rewrite } = reloaderFor(
-      alpha("      - project-management")
+      project("alpha", ["project-management"])
     );
 
     expect(getConfig().projects.alpha?.capabilities).toEqual([
       "project-management"
     ]);
 
-    rewrite(configYaml(alpha("      - project-management\n      - sql")));
+    rewrite(configYaml(project("alpha", ["project-management", "sql"])));
 
     expect(getConfig().projects.alpha?.capabilities).toEqual([
       "project-management",
@@ -880,7 +837,7 @@ ${capabilities}
 
   test("keeps serving the last valid config when an edit breaks the file", () => {
     const { getConfig, rewrite } = reloaderFor(
-      alpha("      - project-management")
+      project("alpha", ["project-management"])
     );
     const before = getConfig();
 
@@ -891,7 +848,7 @@ ${capabilities}
 
   test("recovers from a repair stamped in the same filesystem tick", () => {
     const { getConfig, rewrite } = reloaderFor(
-      alpha("      - project-management")
+      project("alpha", ["project-management"])
     );
     getConfig();
 
@@ -900,7 +857,7 @@ ${capabilities}
       "project-management"
     ]);
 
-    rewrite(configYaml(alpha("      - project-management\n      - sql")), 1);
+    rewrite(configYaml(project("alpha", ["project-management", "sql"])), 1);
 
     expect(getConfig().projects.alpha?.capabilities).toEqual([
       "project-management",
@@ -910,7 +867,7 @@ ${capabilities}
 
   test("keeps serving the last config when the file disappears", () => {
     const { getConfig, configPath } = reloaderFor(
-      alpha("      - project-management")
+      project("alpha", ["project-management"])
     );
     const before = getConfig();
 
@@ -920,7 +877,7 @@ ${capabilities}
   });
 
   test("does not reload while the file is untouched", () => {
-    const { getConfig } = reloaderFor(alpha("      - project-management"));
+    const { getConfig } = reloaderFor(project("alpha", ["project-management"]));
 
     expect(getConfig()).toBe(getConfig());
   });
@@ -928,22 +885,10 @@ ${capabilities}
 
 describe("MCP protocol surface (stdio)", () => {
   test("reloads configuration for a running MCP server when the file changes", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "supadrum-mcp-reload-"));
-    const configPath = join(directory, "supadrum.yml");
-    const yaml = (capabilities: string) => `version: 1
-database: queue.sqlite
-executor: dry-run
-projects:
-  alpha:
-    project_ref: alpha-ref
-    credentials:
-      secret_key: vault://supabase/alpha/secret
-      management_token: vault://supabase/alpha/management
-      database_access: vault://supabase/alpha/postgres
-    capabilities:
-${capabilities}
-`;
-    writeFileSync(configPath, yaml("      - project-management"));
+    const configPath = writeConfig(
+      "supadrum-mcp-reload-",
+      configYaml(project("alpha", ["project-management"]))
+    );
     const { client, transport, stderr } = createStdioClient(
       "stdio-reload-client",
       configPath
@@ -965,7 +910,7 @@ ${capabilities}
 
       writeFileSync(
         configPath,
-        yaml("      - project-management\n      - sql")
+        configYaml(project("alpha", ["project-management", "sql"]))
       );
 
       const accepted = await client.callTool({
