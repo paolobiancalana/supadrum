@@ -1008,7 +1008,7 @@ describe("operator CLI: read-only commands", () => {
     ).toEqual(["alpha-app", "zulu-app"]);
   });
 
-  test("renders a doctor report as text when not asked for JSON", async () => {
+  test("tells the operator what is wrong and what to run next", async () => {
     const { configPath } = twoProjects();
     const harness = cli();
 
@@ -1018,9 +1018,13 @@ describe("operator CLI: read-only commands", () => {
       harness.runtime
     );
 
-    expect(harness.stdout()).toContain("alpha-app");
+    expect(harness.stdout()).toContain("Supadrum doctor — alpha-app");
+    expect(harness.stdout()).toContain("Credentials  0/3 valid");
+    expect(harness.stdout()).toContain("Not ready");
+    expect(harness.stdout()).toContain(
+      "supadrum project credentials set alpha-app"
+    );
     expect(harness.stdout()).not.toContain("vault://");
-    expect(() => JSON.parse(harness.stdout())).toThrow();
   });
 });
 
@@ -1438,18 +1442,23 @@ projects:
     ).rejects.toThrow("passphrase you entered is not correct");
   });
 
-  test("renders every project's doctor report as text", async () => {
-    const { configPath } = credentialConfig(keychainVaultCommand);
+  test("renders one text report per project under --all", async () => {
+    const space = workspace("supadrum-cli-doctor-all-");
+    register(space, "zulu-app");
+    register(space, "alpha-app");
     const harness = cli();
 
     await runCli(
-      ["project", "doctor", "--all", "--config", configPath],
+      ["project", "doctor", "--all", "--config", space.configPath],
       harness.io,
       harness.runtime
     );
 
-    expect(harness.stdout()).toContain("example-ios");
-    expect(() => JSON.parse(harness.stdout())).toThrow();
+    expect(harness.stdout()).toContain("Supadrum doctor — alpha-app");
+    expect(harness.stdout()).toContain("Supadrum doctor — zulu-app");
+    expect(
+      harness.stdout().indexOf("alpha-app")
+    ).toBeLessThan(harness.stdout().indexOf("zulu-app"));
   });
 });
 
