@@ -1223,3 +1223,231 @@ describe("operator CLI: input validation and prompting", () => {
     ).rejects.toThrow("Usage: supadrum project doctor <alias>");
   });
 });
+
+describe("operator CLI: chamber adoption during setup", () => {
+  const SHARED_REF = "abcdefghijklmnopqrst";
+
+  /** A vault that answers for the named chambers only, so a peer can be
+   *  complete while the project under setup is not. */
+  function resolver(root: string, completeChambers: readonly string[]) {
+    const path = join(root, "resolver.mjs");
+    writeFileSync(
+      path,
+      `let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  const complete = ${JSON.stringify(completeChambers)};
+  const known = complete.some(name => input.includes("/" + name + "/"));
+  if (!known) { process.exitCode = 1; process.stdout.write(""); return; }
+  process.stdout.write(
+    input.includes("/postgres")
+      ? "postgresql://postgres:configured@db.example.test/postgres"
+      : "configured"
+  );
+});`
+    );
+    return [process.execPath, path];
+  }
+
+  function withPeers(completeChambers: readonly string[]) {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-adopt-"));
+    const configPath = join(root, "config.yml");
+    const vaultCommand = resolver(root, completeChambers);
+    for (const alias of ["target-app", "peer-one", "peer-two"]) {
+      const repository = join(root, alias);
+      execFileSync("git", ["init", "--quiet", repository]);
+      addProject({
+        alias,
+        repository,
+        project_ref: SHARED_REF,
+        profile: "development",
+        config_path: configPath,
+        vault_command: vaultCommand
+      });
+    }
+    return { root, configPath };
+  }
+
+  test("adopts the chamber of the one peer whose credentials resolve", async () => {
+    const { root, configPath } = withPeers(["peer-one"]);
+    const harness = cli({ cwd: root });
+
+    expect(
+      await runCli(
+        ["project", "setup", "target-app", "--config", configPath,
+         "--no-agent-setup"],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(loadConfig(configPath).projects["target-app"]?.chamber).toBe(
+      "peer-one"
+    );
+  });
+
+  test("leaves the chamber alone when two peers could both be adopted", async () => {
+    const { root, configPath } = withPeers(["peer-one", "peer-two"]);
+    const harness = cli({ cwd: root });
+
+    await runCli(
+      ["project", "setup", "target-app", "--config", configPath,
+       "--no-agent-setup"],
+      harness.io,
+      harness.runtime
+    );
+
+    // Adopting either one would silently bind the project to credentials the
+    // operator never chose.
+    expect(loadConfig(configPath).projects["target-app"]?.chamber).toBe(
+      "target-app"
+    );
+  });
+
+  test("refuses setup for a project the config does not define", async () => {
+    const { root, configPath } = withPeers([]);
+    const harness = cli({ cwd: root });
+
+    await expect(
+      runCli(
+        ["project", "setup", "ghost-app", "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Unknown project: ghost-app");
+  });
+
+  test("refuses credentials set for a project the config does not define", async () => {
+    const { root, configPath } = withPeers([]);
+    const harness = cli({ cwd: root });
+
+    await expect(
+      runCli(
+        ["project", "credentials", "set", "ghost-app", "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Unknown project: ghost-app");
+  });
+});
+
+describe("operator CLI: failure paths that guide the operator", () => {
+  const keychainVaultCommand = [
+    process.execPath,
+    join(repositoryRoot, "dist", "vault-cli.js"),
+    "keychain",
+    "resolve"
+  ];
+
+  test("points at setup when the alias is already configured", async () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-dup-"));
+    const repository = join(root, "example-ios");
+    const configPath = join(root, "config.yml");
+    execFileSync("git", ["init", "--quiet", repository]);
+    addProject({
+      alias: "example-ios",
+      repository,
+      project_ref: "abcdefghijklmnopqrst",
+      profile: "development",
+      config_path: configPath
+    });
+    const harness = cli({ cwd: root });
+
+    await expect(
+      runCli(
+        [
+          "project", "add", "example-ios",
+          "--repo", repository,
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", configPath,
+          "--no-agent-setup", "--yes"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Next: supadrum project setup example-ios");
+  });
+
+  test("rejects a migration driver that is neither supabase nor prisma", async () => {
+    const { configPath } = credentialConfig(keychainVaultCommand);
+    const harness = cli();
+
+    await expect(
+      runCli(
+        [
+          "project", "migrations", "driver", "example-ios", "sqlite",
+          "--config", configPath
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Migration driver must be supabase or prisma, got sqlite");
+  });
+
+  test("says where to pass a repository it cannot discover", async () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-norepo-"));
+    const away = mkdtempSync(join(tmpdir(), "supadrum-cli-norepo-away-"));
+    const configPath = join(root, "config.yml");
+    writeFileSync(
+      configPath,
+      `version: 1
+database: queue.sqlite
+projects:
+  orphan-app:
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/orphan-app/secret
+      management_token: vault://supabase/orphan-app/management
+      database_access: vault://supabase/orphan-app/postgres
+    capabilities: [migrations]
+`
+    );
+    const harness = cli({ cwd: away });
+
+    await expect(
+      runCli(
+        ["project", "setup", "orphan-app", "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow(
+      "Repository not found for orphan-app; pass it with project add --repo"
+    );
+  });
+
+  test("surfaces a keychain failure while collecting credentials", async () => {
+    const { configPath } = credentialConfig(keychainVaultCommand);
+    class LockedKeychain extends MemoryVault {
+      override async get(): Promise<string> {
+        throw new Error("The user name or passphrase you entered is not correct");
+      }
+    }
+    const harness = cli({
+      keychain: () => new LockedKeychain(),
+      promptSecret: { read: async () => "typed-secret" }
+    });
+
+    await expect(
+      runCli(
+        ["project", "credentials", "set", "example-ios", "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("passphrase you entered is not correct");
+  });
+
+  test("renders every project's doctor report as text", async () => {
+    const { configPath } = credentialConfig(keychainVaultCommand);
+    const harness = cli();
+
+    await runCli(
+      ["project", "doctor", "--all", "--config", configPath],
+      harness.io,
+      harness.runtime
+    );
+
+    expect(harness.stdout()).toContain("example-ios");
+    expect(() => JSON.parse(harness.stdout())).toThrow();
+  });
+});
+

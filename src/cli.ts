@@ -59,7 +59,6 @@ import { readMaskedSecret } from "./secret-prompt.js";
 import { SqliteStore } from "./store.js";
 import {
   MacOsKeychainBackend,
-  MissingVaultValueError,
   nodeProcessRunner
 } from "./vault-cli.js";
 import type { VaultBackend } from "./vault.js";
@@ -866,19 +865,13 @@ export async function runCli(
         }
       }
     });
-    const doctor = await doctorProject(
-      alias,
-      config,
-      async (_name, reference) => {
-        try {
-          await keychain.get(reference);
-          return true;
-        } catch (error) {
-          if (error instanceof MissingVaultValueError) return false;
-          throw error;
-        }
-      }
-    );
+    // setupProjectCredentials only returns once every credential has been
+    // read back out of the vault and compared, so re-reading them here would
+    // just ask the keychain the same question again — three more
+    // authorisation prompts on macOS for an answer already in hand. What is
+    // still worth reporting is whether the repository and project ref check
+    // out, which doctorProject decides on its own.
+    const doctor = await doctorProject(alias, config, async () => true);
     io.stdout(formatCredentialSetup(alias, doctor.ready));
     return 0;
   }
