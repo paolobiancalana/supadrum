@@ -276,14 +276,19 @@ describe("durable jobs", () => {
     ]);
   });
 
-  test("returns an already-finished job from cancel unchanged", () => {
-    const { store } = createStore();
-    const job = store.submit(submission());
-    store.transition(job.id, "cancelled");
+  test.each(["cancelled", "failed"] as const)(
+    "returns a job that already %s from cancel unchanged",
+    (status) => {
+      const { store } = createStore();
+      const job = store.submit(submission());
+      store.transition(job.id, status);
 
-    expect(store.cancel(job.id).status).toBe("cancelled");
-    expect(store.events(job.id, 0)).toHaveLength(2);
-  });
+      // Terminal is terminal: cancelling again is a no-op, not an illegal
+      // move, so an operator retrying a cancel is not told off for it.
+      expect(store.cancel(job.id).status).toBe(status);
+      expect(store.events(job.id, 0)).toHaveLength(2);
+    }
+  );
 
   test.each(["running", "verifying"] as const)(
     "refuses to cancel a job that is already %s",
