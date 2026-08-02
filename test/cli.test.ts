@@ -1451,3 +1451,152 @@ projects:
   });
 });
 
+
+describe("operator CLI: human-readable output and agent wiring", () => {
+  function bare(prefix: string) {
+    const root = mkdtempSync(join(tmpdir(), prefix));
+    const repository = join(root, "example-ios");
+    execFileSync("git", ["init", "--quiet", repository]);
+    return { root, repository, configPath: join(root, "config.yml") };
+  }
+
+  test("summarises a remote project in prose when not asked for JSON", async () => {
+    const { root, repository, configPath } = bare("supadrum-cli-prose-");
+    const harness = cli({ cwd: root });
+
+    expect(
+      await runCli(
+        [
+          "project", "add", "example-ios",
+          "--repo", repository,
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", configPath,
+          "--no-agent-setup", "--yes"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(harness.stdout()).toContain("example-ios");
+    expect(harness.stdout()).not.toContain("vault://");
+    expect(() => JSON.parse(harness.stdout())).toThrow();
+  });
+
+  test("summarises a local project in prose", async () => {
+    const { root, repository, configPath } = bare("supadrum-cli-prose-local-");
+    const harness = cli({ cwd: root });
+
+    await runCli(
+      [
+        "project", "add", "example-ios", "--local",
+        "--repo", repository,
+        "--config", configPath,
+        "--no-agent-setup"
+      ],
+      harness.io,
+      harness.runtime
+    );
+
+    expect(harness.stdout()).toContain("Target       local");
+    expect(harness.stdout()).toContain("Mode         live");
+  });
+
+  test("installs the Codex agent files when a setup is configured", async () => {
+    const { root, repository, configPath } = bare("supadrum-cli-codex-");
+    const harness = cli({
+      cwd: root,
+      codexAgentSetup: {
+        skillSource: join(
+          repositoryRoot, "plugins", "supadrum", "skills", "supadrum"
+        ),
+        mcpCommand: process.execPath,
+        mcpArgs: [join(repositoryRoot, "dist", "mcp.js")],
+        mcpCwd: repositoryRoot
+      }
+    });
+
+    expect(
+      await runCli(
+        [
+          "project", "add", "example-ios",
+          "--repo", repository,
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", configPath,
+          "--yes", "--json"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    const report = JSON.parse(harness.stdout());
+    expect(report.agent_setup).toMatchObject({ ready: true });
+    expect(existsSync(report.agent_setup.skill_path)).toBe(true);
+    expect(existsSync(report.agent_setup.codex_config_path)).toBe(true);
+  });
+
+  test("reports a project whose vault command fails as not ready", async () => {
+    const harness = cli();
+    const { configPath } = credentialConfig([
+      process.execPath,
+      "-e",
+      "process.exit(3)"
+    ]);
+
+    await runCli(
+      ["project", "doctor", "example-ios", "--config", configPath, "--json"],
+      harness.io,
+      harness.runtime
+    );
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      project: "example-ios",
+      ready: false
+    });
+  });
+});
+
+describe("operator CLI: misconfiguration is reported, not crashed on", () => {
+  test("survives a vault command that cannot be executed at all", async () => {
+    const { configPath } = credentialConfig([
+      join(tmpdir(), "supadrum-no-such-binary")
+    ]);
+    const harness = cli();
+
+    expect(
+      await runCli(
+        ["project", "doctor", "example-ios", "--config", configPath, "--json"],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      project: "example-ios",
+      ready: false
+    });
+  });
+
+  test("does not attach the setup hint to an unrelated failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-notgit-"));
+    const repository = join(root, "plain-directory");
+    mkdirSync(repository);
+    const harness = cli({ cwd: root });
+
+    await expect(
+      runCli(
+        [
+          "project", "add", "example-ios",
+          "--repo", repository,
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", join(root, "config.yml"),
+          "--no-agent-setup", "--yes"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow(`Not a Git repository: ${repository}`);
+    expect(harness.stdout()).not.toContain("Next: supadrum project setup");
+  });
+});

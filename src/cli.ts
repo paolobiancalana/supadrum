@@ -625,7 +625,8 @@ export async function runCli(
     let project = config.projects[alias];
     if (!project) throw new Error(`Unknown project: ${alias}`);
 
-    if (!project.repo) {
+    let repository = project.repo;
+    if (!repository) {
       const discovered = discoverProjectRepository({
         alias,
         cwd: runtime.cwd,
@@ -639,6 +640,8 @@ export async function runCli(
       setProjectRepository(configPath, alias, discovered.path);
       config = loadConfig(configPath);
       project = config.projects[alias] as typeof project;
+      // Prefer what was stored: setProjectRepository canonicalises the path.
+      repository = project.repo ?? discovered.path;
     }
 
     const currentDoctor = await probeConfiguredCredentials(
@@ -680,13 +683,10 @@ export async function runCli(
       config,
       runtime.environment
     );
-    if (!project.repo) {
-      throw new Error(`Repository not found for ${alias}`);
-    }
     const agentSetup = configureCodexAgent({
       args,
       runtime,
-      repository: project.repo,
+      repository,
       configPath
     });
     const siblings = Object.entries(config.projects)
@@ -700,7 +700,7 @@ export async function runCli(
       [
         `Supadrum setup — ${alias}`,
         "",
-        `✓ Repository   ${project.repo}`,
+        `✓ Repository   ${repository}`,
         `✓ Supabase     ${project.project_ref}`,
         `✓ Chamber      ${project.chamber}${siblings.length > 0 ? ` (shared with ${siblings.join(", ")})` : ""}`,
         `${report.ready ? "✓" : "○"} Credentials  ${Object.values(report.credentials).filter(Boolean).length}/3 valid`,
