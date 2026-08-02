@@ -1,5 +1,12 @@
 import { describe, expect, test } from "vitest";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,6 +52,26 @@ class MemoryBackend implements VaultBackend {
 
   async put(reference: string, value: string): Promise<void> {
     this.values.set(reference, value);
+  }
+}
+
+/** A vault that has never held the reference, as opposed to one that won't say. */
+class EmptyBackend extends MemoryBackend {
+  override async get(vaultReference: string): Promise<string> {
+    const value = this.values.get(vaultReference);
+    if (value === undefined) throw new MissingVaultValueError(vaultReference);
+    return value;
+  }
+}
+
+async function withDirectory<T>(
+  run: (directory: string) => Promise<T>
+): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "supadrum-vault-"));
+  try {
+    return await run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -364,6 +391,12 @@ describe("SOPS age backend", () => {
   ].join("\n");
   const recipient = "age1canaryrecipient";
 
+  function identityVault(): MemoryBackend {
+    const keychain = new MemoryBackend();
+    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
+    return keychain;
+  }
+
   test("extracts one reference with the age identity only in the child environment", async () => {
     const runner = new RecordingRunner();
     runner.outcomes.push({
@@ -399,16 +432,7 @@ describe("SOPS age backend", () => {
   });
 
   test("bootstraps a missing age identity and returns only its recipient", async () => {
-    class EmptyKeychain extends MemoryBackend {
-      override async get(vaultReference: string): Promise<string> {
-        const value = this.values.get(vaultReference);
-        if (value === undefined) {
-          throw new MissingVaultValueError(vaultReference);
-        }
-        return value;
-      }
-    }
-    const keychain = new EmptyKeychain();
+    const keychain = new EmptyBackend();
     const runner = new RecordingRunner();
     runner.outcomes.push(
       { exitCode: 0, stdout: ageIdentity, stderr: recipient },
@@ -463,9 +487,63 @@ describe("SOPS age backend", () => {
     expect(runner.invocations).toEqual([]);
   });
 
+  test.each([
+    { case: "age-keygen fails", outcome: { exitCode: 1, stdout: "", stderr: "no entropy" } },
+    { case: "age-keygen prints nothing", outcome: { exitCode: 0, stdout: "", stderr: "" } }
+  ])("stores no identity when $case", async ({ outcome }) => {
+    const keychain = new EmptyBackend();
+    const runner = new RecordingRunner();
+    runner.outcomes.push(outcome);
+
+    await expect(bootstrapAgeIdentity(keychain, runner)).rejects.toThrow(
+      "age identity generation failed"
+    );
+    expect(keychain.values.size).toBe(0);
+  });
+
+  test.each([
+    {
+      case: "derivation fails",
+      outcome: { exitCode: 1, stdout: "", stderr: "bad key" },
+      message: "age recipient derivation failed"
+    },
+    {
+      case: "derivation returns something that is not an age recipient",
+      outcome: { exitCode: 0, stdout: "Usage: age-keygen [-y]\n", stderr: "" },
+      message: "age-keygen returned an invalid recipient"
+    }
+  ])("refuses to encrypt to a recipient when $case", async ({ outcome, message }) => {
+    const keychain = new MemoryBackend();
+    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
+    const runner = new RecordingRunner();
+    runner.outcomes.push(outcome);
+
+    await expect(bootstrapAgeIdentity(keychain, runner)).rejects.toThrow(
+      message
+    );
+  });
+
+  test("refuses a generated identity the Keychain did not store faithfully", async () => {
+    class LyingKeychain extends EmptyBackend {
+      override async put(vaultReference: string): Promise<void> {
+        this.values.set(vaultReference, "truncated-identi");
+      }
+    }
+    const keychain = new LyingKeychain();
+    const runner = new RecordingRunner();
+    runner.outcomes.push(
+      { exitCode: 0, stdout: ageIdentity, stderr: "" },
+      { exitCode: 0, stdout: `${recipient}\n`, stderr: "" }
+    );
+
+    // Reporting this recipient would hand the operator a backup encrypted
+    // to a key whose private half no longer exists anywhere.
+    await expect(bootstrapAgeIdentity(keychain, runner)).rejects.toThrow(
+      "age identity Keychain round-trip mismatch"
+    );
+  });
+
   test("writes and verifies only encrypted backup bytes before atomic replacement", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "supadrum-sops-"));
-    const path = join(directory, "secrets.enc.json");
     const encrypted = '{"sops":{"version":"test"},"ciphertext":"ENC[...]"}';
     const plaintextTree = {
       supabase: {
@@ -474,8 +552,6 @@ describe("SOPS age backend", () => {
         }
       }
     };
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
     const runner = new RecordingRunner();
     runner.outcomes.push(
       { exitCode: 0, stdout: encrypted, stderr: "" },
@@ -486,8 +562,9 @@ describe("SOPS age backend", () => {
       }
     );
 
-    try {
-      const backup = new SopsAgeBackup(path, recipient, keychain, runner);
+    await withDirectory(async (directory) => {
+      const path = join(directory, "secrets.enc.json");
+      const backup = new SopsAgeBackup(path, recipient, identityVault(), runner);
       await backup.writeAndVerify({
         [reference]: "top-secret-canary"
       });
@@ -517,39 +594,220 @@ describe("SOPS age backend", () => {
         "json"
       ]);
       expect(runner.invocations[1]?.env?.SOPS_AGE_KEY).toBe(ageIdentity);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
+    });
   });
 
-  test("leaves the previous encrypted backup unchanged when verification fails", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "supadrum-sops-"));
-    const path = join(directory, "secrets.enc.json");
-    const previous = '{"previous":"ciphertext"}';
-    await writeFile(path, previous, { mode: 0o600 });
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
-    const runner = new RecordingRunner();
-    runner.outcomes.push(
-      { exitCode: 0, stdout: '{"new":"ciphertext"}', stderr: "" },
-      {
+  test.each([
+    {
+      case: "the round trip returns a different value",
+      decrypted: {
         exitCode: 0,
         stdout: JSON.stringify({
           supabase: { "example-web": { management: "wrong-value" } }
         }),
         stderr: ""
-      }
-    );
+      },
+      message: "SOPS backup round-trip mismatch"
+    },
+    {
+      case: "the round trip does not reach the value at all",
+      decrypted: {
+        exitCode: 0,
+        stdout: JSON.stringify({ supabase: "flattened-by-a-later-edit" }),
+        stderr: ""
+      },
+      message: "SOPS backup round-trip mismatch"
+    },
+    {
+      case: "decryption fails",
+      decrypted: { exitCode: 1, stdout: "", stderr: "no matching key" },
+      message: "SOPS backup verification failed"
+    },
+    {
+      case: "decryption returns something that is not JSON",
+      decrypted: { exitCode: 0, stdout: "sops: ERROR", stderr: "" },
+      message: "SOPS backup verification returned invalid JSON"
+    }
+  ])(
+    "keeps the previous backup and leaves no temporary file when $case",
+    async ({ decrypted, message }) => {
+      const previous = '{"previous":"ciphertext"}';
+      const runner = new RecordingRunner();
+      runner.outcomes.push(
+        { exitCode: 0, stdout: '{"new":"ciphertext"}', stderr: "" },
+        decrypted
+      );
 
-    try {
-      const backup = new SopsAgeBackup(path, recipient, keychain, runner);
+      await withDirectory(async (directory) => {
+        const path = join(directory, "secrets.enc.json");
+        await writeFile(path, previous, { mode: 0o600 });
+        const backup = new SopsAgeBackup(
+          path,
+          recipient,
+          identityVault(),
+          runner
+        );
+
+        await expect(
+          backup.writeAndVerify({ [reference]: "top-secret-canary" })
+        ).rejects.toThrow(message);
+        expect(await readFile(path, "utf8")).toBe(previous);
+        expect(await readdir(directory)).toEqual(["secrets.enc.json"]);
+      });
+    }
+  );
+
+  test("writes nothing at all when encryption fails", async () => {
+    const runner = new RecordingRunner();
+    runner.outcomes.push({ exitCode: 1, stdout: "", stderr: "no recipient" });
+
+    await withDirectory(async (directory) => {
+      const backup = new SopsAgeBackup(
+        join(directory, "secrets.enc.json"),
+        recipient,
+        identityVault(),
+        runner
+      );
+
       await expect(
         backup.writeAndVerify({ [reference]: "top-secret-canary" })
-      ).rejects.toThrow("SOPS backup round-trip mismatch");
-      expect(await readFile(path, "utf8")).toBe(previous);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
+      ).rejects.toThrow("SOPS backup encryption failed");
+      expect(await readdir(directory)).toEqual([]);
+    });
+  });
+
+  test("surfaces why the backup was not replaced, not why the cleanup failed", async () => {
+    await withDirectory(async (directory) => {
+      const path = join(directory, "secrets.enc.json");
+      const runner: ProcessRunner = {
+        async run(invocation) {
+          if (invocation.argv[1] === "encrypt") {
+            return { exitCode: 0, stdout: '{"new":"ciphertext"}', stderr: "" };
+          }
+          // The operator's directory disappears mid-write: the rename fails,
+          // and so does removing the temporary file it was meant to replace.
+          await rm(directory, { recursive: true, force: true });
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              supabase: { "example-web": { management: "top-secret-canary" } }
+            }),
+            stderr: ""
+          };
+        }
+      };
+      const backup = new SopsAgeBackup(path, recipient, identityVault(), runner);
+
+      await expect(
+        backup.writeAndVerify({ [reference]: "top-secret-canary" })
+      ).rejects.toThrow(/rename/);
+    });
+  });
+
+  test.each([
+    {
+      case: "a reference that would nest under a stored value",
+      values: {
+        "vault://legacy/app/db": "first",
+        "vault://legacy/app/db/url": "second"
+      }
+    },
+    {
+      case: "a reference that would overwrite a nested branch",
+      values: {
+        "vault://legacy/app/db/url": "first",
+        "vault://legacy/app/db": "second"
+      }
+    },
+  ])("refuses to silently drop a secret from the backup: $case", async ({ values }) => {
+    const runner = new RecordingRunner();
+    const backup = new SopsAgeBackup(
+      "/operator/secrets.enc.json",
+      recipient,
+      identityVault(),
+      runner
+    );
+
+    await expect(backup.writeAndVerify(values)).rejects.toThrow(
+      "SOPS backup reference collision"
+    );
+    expect(runner.invocations).toEqual([]);
+  });
+
+  test("refuses to write a backup with nothing in it", async () => {
+    const runner = new RecordingRunner();
+    const backup = new SopsAgeBackup(
+      "/operator/secrets.enc.json",
+      recipient,
+      identityVault(),
+      runner
+    );
+
+    await expect(backup.writeAndVerify({})).rejects.toThrow(
+      "SOPS backup cannot be empty"
+    );
+    expect(runner.invocations).toEqual([]);
+  });
+
+  test.each([
+    {
+      case: "no path to write to",
+      build: () => new SopsAgeBackup("", recipient, identityVault()),
+      message: "SOPS backup path is required"
+    },
+    {
+      case: "a recipient age never produced",
+      build: () =>
+        new SopsAgeBackup("/operator/secrets.enc.json", "AGE-SECRET-KEY-1CANARY", identityVault()),
+      message: "age-keygen returned an invalid recipient"
+    },
+    {
+      case: "no encrypted file to read",
+      build: () => new SopsAgeBackend("", identityVault()),
+      message: "SOPS encrypted file is required"
     }
+  ])("refuses to be constructed with $case", ({ build, message }) => {
+    expect(build).toThrow(message);
+  });
+
+  test.each([
+    {
+      case: "decryption fails",
+      outcome: { exitCode: 1, stdout: "", stderr: "no matching key found" },
+      message: "SOPS decrypt failed"
+    },
+    {
+      case: "the extract is empty",
+      outcome: { exitCode: 0, stdout: "", stderr: "" },
+      message: "SOPS extract did not return a non-empty string"
+    }
+  ])("does not resolve a reference when $case", async ({ outcome, message }) => {
+    const runner = new RecordingRunner();
+    runner.outcomes.push(outcome);
+    const backend = new SopsAgeBackend(
+      "/operator/secrets.enc.json",
+      identityVault(),
+      runner
+    );
+
+    const attempt = backend.get(reference);
+
+    await expect(attempt).rejects.toThrow(message);
+    // sops writes key material hints to stderr; none of it belongs in an
+    // error an operator may paste into a bug report.
+    await expect(attempt).rejects.not.toThrow(/matching key/);
+  });
+
+  test("refuses to pretend it can write through a reference backend", async () => {
+    const backend = new SopsAgeBackend(
+      "/operator/secrets.enc.json",
+      identityVault(),
+      new RecordingRunner()
+    );
+
+    await expect(backend.put()).rejects.toThrow(
+      "SOPS reference backend is read-only"
+    );
   });
 
   test("exposes SOPS resolve and bootstrap through metadata-safe CLI commands", async () => {
