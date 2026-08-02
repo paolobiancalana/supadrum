@@ -1,0 +1,58 @@
+version: 1
+database: .supadrum/queue.sqlite
+# Capability-authorized jobs run without interruption by default.
+# Set this to manual only when a second human gate is required.
+approval_mode: automatic
+
+# The resolver receives one vault:// reference on stdin and prints the value
+# on stdout. The bundled macOS setup writes these references to Keychain.
+vault_command: [supadrum-vault, keychain, resolve]
+
+chambers:
+  example-backend:
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/example/secret
+      management_token: vault://supabase/example/management
+      database_access: vault://supabase/example/postgres
+    # Optional Function Secrets are operator-mapped. Jobs submit names only.
+    managed_secrets:
+      STRIPE_SECRET_KEY: vault://supabase/example/functions/STRIPE_SECRET_KEY
+
+projects:
+  example-web:
+    repo: /absolute/path/to/example-web
+    chamber: example-backend
+    mode: dry-run
+    migrations: owner
+    # Defaults to supabase. Use prisma for repositories with prisma/migrations.
+    # Prisma baselines require an approved migration.baseline job whose
+    # explicit list is a clean, tracked contiguous migration prefix.
+    migration_driver: supabase
+    capabilities:
+      - data-api
+      - auth-admin
+      - storage
+      - realtime
+      - edge-functions
+      - secrets
+      - migrations
+      - schema-inspection
+      - sql
+      - project-management
+
+  example-ios:
+    repo: /absolute/path/to/example-ios
+    chamber: example-backend
+    mode: dry-run
+    migrations: consumer
+    capabilities:
+      - data-api
+      - storage
+      - edge-functions
+      - schema-inspection
+
+# Enable one logical project only after setup and doctor pass:
+#   supadrum project setup example-web
+#   supadrum project migrations owner example-web
+#   supadrum project live example-web

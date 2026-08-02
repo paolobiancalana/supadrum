@@ -1,0 +1,25 @@
+{
+  "name": "supadrum",
+  "version": "0.1.0",
+  "description": "Capability-scoped Supabase operations without exposing credentials to agents",
+  "author": {
+    "name": "Supadrum contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["supabase", "mcp", "credentials", "scheduler"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Supadrum",
+    "shortDescription": "Broker privileged Supabase operations safely.",
+    "longDescription": "Routes typed Supabase jobs through a durable, capability-scoped broker while keeping vault credentials outside agent context and queue storage.",
+    "developerName": "Supadrum contributors",
+    "category": "Developer Tools",
+    "capabilities": ["MCP", "Supabase", "Approval gates"],
+    "defaultPrompt": [
+      "Inspect my Supadrum projects.",
+      "Submit this migration through Supadrum.",
+      "Wait for my Supadrum job to finish."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

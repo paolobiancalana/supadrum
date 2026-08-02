@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "supadrum": {
+      "command": "supadrum-mcp",
+      "env": {
+        "SUPADRUM_CONFIG": "/absolute/path/to/supadrum.yml"
+      }
+    }
+  }
+}

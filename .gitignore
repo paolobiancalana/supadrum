@@ -1,0 +1,16 @@
+dist/
+node_modules/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+.supadrum/
+
+# internal agent tooling / build strategy — not for public release
+.claude/
+.agents/
+.impeccable/
+skills-lock.json
+CLAUDE.md
+docs/agents/
+docs/superpowers/

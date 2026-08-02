@@ -1,0 +1,4 @@
+interface:
+  display_name: "Supadrum"
+  short_description: "Route Supabase work through the safe broker"
+  default_prompt: "Use $supadrum to submit this Supabase operation through the credential broker."
