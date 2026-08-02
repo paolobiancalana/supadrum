@@ -481,6 +481,15 @@ function option(args: readonly string[], name: string): string | undefined {
   return index === -1 ? undefined : args[index + 1];
 }
 
+/**
+ * The argument after a command, unless the operator left it out and the next
+ * option slid into its place — `keychain import --service X` must not read as
+ * a request to import into a reference named `--service`.
+ */
+function positional(value: string | undefined): string | undefined {
+  return value === undefined || value.startsWith("--") ? undefined : value;
+}
+
 function options(args: readonly string[], name: string): readonly string[] {
   const values: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -630,7 +639,7 @@ export async function runVaultCli(
     return 0;
   }
   if (command === "put") {
-    const reference = args[2];
+    const reference = positional(args[2]);
     if (!reference) throw new Error("Keychain put requires a vault reference");
     const value = trimTerminalNewline(await io.readStdin());
     await dependencies.keychain.put(reference, value);
@@ -642,7 +651,7 @@ export async function runVaultCli(
     return 0;
   }
   if (command === "import") {
-    const reference = args[2];
+    const reference = positional(args[2]);
     const service = option(args, "--service");
     const account = option(args, "--account") ?? process.env.USER;
     if (!reference || !service || !account) {
