@@ -265,18 +265,18 @@ describe("macOS Keychain backend", () => {
     );
   });
 
-  test.each(["", "operator"])(
-    "refuses an import whose source names no service (account %j)",
-    async (account) => {
-      const runner = new RecordingRunner();
-      const backend = new MacOsKeychainBackend(runner, "operator");
+  test.each([
+    { case: "no service", source: { service: "", account: "operator" } },
+    { case: "no account", source: { service: "supabase-pat", account: "" } }
+  ])("refuses an import whose source names $case", async ({ source }) => {
+    const runner = new RecordingRunner();
+    const backend = new MacOsKeychainBackend(runner, "operator");
 
-      await expect(
-        backend.import(reference, { service: "", account })
-      ).rejects.toThrow("Keychain import source is incomplete");
-      expect(runner.invocations).toEqual([]);
-    }
-  );
+    await expect(backend.import(reference, source)).rejects.toThrow(
+      "Keychain import source is incomplete"
+    );
+    expect(runner.invocations).toEqual([]);
+  });
 
   test("does not report an import as verified when the item did not change", async () => {
     const runner = new RecordingRunner();
