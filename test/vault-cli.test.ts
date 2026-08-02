@@ -1046,12 +1046,22 @@ describe("dotenv migration CLI", () => {
     }
   });
 
+  const mappingUsage = "Each migration mapping must be NAME=vault://reference";
+
   test.each([
-    { case: "a mapping with no reference", map: "DATABASE_URL" },
-    { case: "a mapping whose name is not an environment variable", map: "9=vault://legacy/app/db" },
-    { case: "a mapping with an empty reference", map: "DATABASE_URL=" },
-    { case: "a reference that is not a vault reference", map: "DATABASE_URL=/etc/passwd" }
-  ])("rejects $case before touching the vault", async ({ map }) => {
+    { case: "a mapping with no reference", map: "DATABASE_URL", message: mappingUsage },
+    {
+      case: "a mapping whose name is not an environment variable",
+      map: "9=vault://legacy/app/db",
+      message: mappingUsage
+    },
+    { case: "a mapping with an empty reference", map: "DATABASE_URL=", message: mappingUsage },
+    {
+      case: "a reference that is not a vault reference",
+      map: "DATABASE_URL=/etc/passwd",
+      message: "Expected a vault reference"
+    }
+  ])("rejects $case before touching the vault", async ({ map, message }) => {
     const keychain = new EmptyBackend();
     const runner = new RecordingRunner();
 
@@ -1061,7 +1071,7 @@ describe("dotenv migration CLI", () => {
         io("").io,
         { keychain, runner }
       )
-    ).rejects.toThrow();
+    ).rejects.toThrow(message);
     // An unusable command line must not leave a freshly minted age identity
     // behind: the operator would then hold a key no backup was encrypted to.
     expect(keychain.values.size).toBe(0);
