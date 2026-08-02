@@ -47,25 +47,47 @@ class MemoryVault implements VaultBackend {
   }
 }
 
+const PROJECT_REF = "abcdefghijklmnopqrst";
+
+/** An operator root: somewhere to put a config, and repositories to point at. */
+function workspace(prefix: string) {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  return {
+    root,
+    configPath: join(root, "config.yml"),
+    gitRepo(name: string): string {
+      const path = join(root, name);
+      execFileSync("git", ["init", "--quiet", path]);
+      return path;
+    }
+  };
+}
+
+/** Registers `alias` against a fresh repository of the same name. */
+function register(
+  space: ReturnType<typeof workspace>,
+  alias: string,
+  extra: Partial<Parameters<typeof addProject>[0]> = {}
+) {
+  addProject({
+    alias,
+    repository: space.gitRepo(alias),
+    project_ref: PROJECT_REF,
+    profile: "development",
+    config_path: space.configPath,
+    ...extra
+  });
+}
+
 function credentialConfig(
   vaultCommand: readonly string[]
 ): {
   readonly root: string;
   readonly configPath: string;
 } {
-  const root = mkdtempSync(join(tmpdir(), "supadrum-cli-credentials-"));
-  const repository = join(root, "example-ios");
-  const configPath = join(root, "config.yml");
-  execFileSync("git", ["init", "--quiet", repository]);
-  addProject({
-    alias: "example-ios",
-    repository,
-    project_ref: "abcdefghijklmnopqrst",
-    profile: "development",
-    config_path: configPath,
-    vault_command: vaultCommand
-  });
-  return { root, configPath };
+  const space = workspace("supadrum-cli-credentials-");
+  register(space, "example-ios", { vault_command: vaultCommand });
+  return { root: space.root, configPath: space.configPath };
 }
 
 /**
@@ -785,17 +807,9 @@ projects:
 
 describe("operator CLI: queue commands", () => {
   function queueConfig() {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-queue-"));
-    const repository = join(root, "example-ios");
-    const configPath = join(root, "config.yml");
-    execFileSync("git", ["init", "--quiet", repository]);
-    addProject({
-      alias: "example-ios",
-      repository,
-      project_ref: "abcdefghijklmnopqrst",
-      profile: "admin",
-      config_path: configPath
-    });
+    const space = workspace("supadrum-cli-queue-");
+    const { configPath } = space;
+    register(space, "example-ios", { profile: "admin" });
     // Setting the key through the parser rather than substituting the string
     // addProject happens to write: a substitution that stopped matching would
     // leave the queue on automatic approval, and only some of these tests
@@ -892,20 +906,11 @@ describe("operator CLI: queue commands", () => {
 
 describe("operator CLI: read-only commands", () => {
   function twoProjects() {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-read-"));
-    const configPath = join(root, "config.yml");
-    for (const alias of ["zulu-app", "alpha-app"]) {
-      const repository = join(root, alias);
-      execFileSync("git", ["init", "--quiet", repository]);
-      addProject({
-        alias,
-        repository,
-        project_ref: "abcdefghijklmnopqrst",
-        profile: "development",
-        config_path: configPath
-      });
-    }
-    return { root, configPath };
+    const space = workspace("supadrum-cli-read-");
+    // Registered out of alphabetical order: the commands under test are the
+    // ones that must sort them.
+    for (const alias of ["zulu-app", "alpha-app"]) register(space, alias);
+    return space;
   }
 
   test("inspects a project without printing credential references", async () => {
@@ -921,7 +926,7 @@ describe("operator CLI: read-only commands", () => {
     ).toBe(0);
 
     expect(harness.stdout()).toContain("Project: alpha-app");
-    expect(harness.stdout()).toContain("Supabase ref: abcdefghijklmnopqrst");
+    expect(harness.stdout()).toContain(`Supabase ref: ${PROJECT_REF}`);
     expect(harness.stdout()).not.toContain("vault://");
   });
 
@@ -960,8 +965,8 @@ describe("operator CLI: read-only commands", () => {
     );
 
     expect(JSON.parse(viaProjects.stdout())).toEqual([
-      { name: "alpha-app", project_ref: "abcdefghijklmnopqrst" },
-      { name: "zulu-app", project_ref: "abcdefghijklmnopqrst" }
+      { name: "alpha-app", project_ref: PROJECT_REF },
+      { name: "zulu-app", project_ref: PROJECT_REF }
     ]);
     expect(viaProjectList.stdout()).toBe(viaProjects.stdout());
   });
@@ -1083,14 +1088,15 @@ describe("operator CLI: bootstrap commands", () => {
 
 describe("operator CLI: input validation and prompting", () => {
   function bareProject() {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-validate-"));
+    const space = workspace("supadrum-cli-validate-");
     // Discovery walks up from cwd and home, so an unrelated directory is the
     // only way to reach the prompt: a sibling of the repo would be found.
     const away = mkdtempSync(join(tmpdir(), "supadrum-cli-away-"));
-    const repository = join(root, "example-ios");
-    const configPath = join(root, "config.yml");
-    execFileSync("git", ["init", "--quiet", repository]);
-    return { root, away, repository, configPath };
+    return {
+      ...space,
+      away,
+      repository: space.gitRepo("example-ios")
+    };
   }
 
   test("rejects a mistyped profile instead of falling back to a default", async () => {
@@ -1102,7 +1108,7 @@ describe("operator CLI: input validation and prompting", () => {
         [
           "project", "add", "example-ios",
           "--repo", repository,
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--profile", "developement",
           "--config", configPath,
           "--no-agent-setup", "--yes"
@@ -1151,7 +1157,7 @@ describe("operator CLI: input validation and prompting", () => {
       runCli(
         [
           "project", "add", "nowhere-app",
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--config", join(root, "config.yml"),
           "--no-agent-setup", "--yes"
         ],
@@ -1176,7 +1182,7 @@ describe("operator CLI: input validation and prompting", () => {
       await runCli(
         [
           "project", "add", "example-ios",
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--config", configPath,
           "--no-agent-setup", "--json"
         ],
@@ -1202,7 +1208,7 @@ describe("operator CLI: input validation and prompting", () => {
       runCli(
         [
           "project", "add", "example-ios",
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--config", configPath,
           "--no-agent-setup"
         ],
@@ -1228,8 +1234,6 @@ describe("operator CLI: input validation and prompting", () => {
 });
 
 describe("operator CLI: chamber adoption during setup", () => {
-  const SHARED_REF = "abcdefghijklmnopqrst";
-
   /** A vault that answers for the named chambers only, so a peer can be
    *  complete while the project under setup is not. */
   function resolver(root: string, completeChambers: readonly string[]) {
@@ -1253,22 +1257,14 @@ process.stdin.on("end", () => {
   }
 
   function withPeers(completeChambers: readonly string[]) {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-adopt-"));
-    const configPath = join(root, "config.yml");
-    const vaultCommand = resolver(root, completeChambers);
+    const space = workspace("supadrum-cli-adopt-");
+    const vaultCommand = resolver(space.root, completeChambers);
+    // All three share one project ref, which is what makes them candidates
+    // to share one credential chamber.
     for (const alias of ["target-app", "peer-one", "peer-two"]) {
-      const repository = join(root, alias);
-      execFileSync("git", ["init", "--quiet", repository]);
-      addProject({
-        alias,
-        repository,
-        project_ref: SHARED_REF,
-        profile: "development",
-        config_path: configPath,
-        vault_command: vaultCommand
-      });
+      register(space, alias, { vault_command: vaultCommand });
     }
-    return { root, configPath };
+    return space;
   }
 
   test("adopts the chamber of the one peer whose credentials resolve", async () => {
@@ -1343,25 +1339,17 @@ describe("operator CLI: failure paths that guide the operator", () => {
   ];
 
   test("points at setup when the alias is already configured", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-dup-"));
-    const repository = join(root, "example-ios");
-    const configPath = join(root, "config.yml");
-    execFileSync("git", ["init", "--quiet", repository]);
-    addProject({
-      alias: "example-ios",
-      repository,
-      project_ref: "abcdefghijklmnopqrst",
-      profile: "development",
-      config_path: configPath
-    });
+    const space = workspace("supadrum-cli-dup-");
+    register(space, "example-ios");
+    const { root, configPath } = space;
     const harness = cli({ cwd: root });
 
     await expect(
       runCli(
         [
           "project", "add", "example-ios",
-          "--repo", repository,
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--repo", join(root, "example-ios"),
+          "--project-ref", PROJECT_REF,
           "--config", configPath,
           "--no-agent-setup", "--yes"
         ],
@@ -1397,7 +1385,7 @@ describe("operator CLI: failure paths that guide the operator", () => {
 database: queue.sqlite
 projects:
   orphan-app:
-    project_ref: abcdefghijklmnopqrst
+    project_ref: ${PROJECT_REF}
     credentials:
       secret_key: vault://supabase/orphan-app/secret
       management_token: vault://supabase/orphan-app/management
@@ -1457,10 +1445,8 @@ projects:
 
 describe("operator CLI: human-readable output and agent wiring", () => {
   function bare(prefix: string) {
-    const root = mkdtempSync(join(tmpdir(), prefix));
-    const repository = join(root, "example-ios");
-    execFileSync("git", ["init", "--quiet", repository]);
-    return { root, repository, configPath: join(root, "config.yml") };
+    const space = workspace(prefix);
+    return { ...space, repository: space.gitRepo("example-ios") };
   }
 
   test("summarises a remote project in prose when not asked for JSON", async () => {
@@ -1472,7 +1458,7 @@ describe("operator CLI: human-readable output and agent wiring", () => {
         [
           "project", "add", "example-ios",
           "--repo", repository,
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--config", configPath,
           "--no-agent-setup", "--yes"
         ],
@@ -1524,7 +1510,7 @@ describe("operator CLI: human-readable output and agent wiring", () => {
         [
           "project", "add", "example-ios",
           "--repo", repository,
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--config", configPath,
           "--yes", "--json"
         ],
@@ -1592,7 +1578,7 @@ describe("operator CLI: misconfiguration is reported, not crashed on", () => {
         [
           "project", "add", "example-ios",
           "--repo", repository,
-          "--project-ref", "abcdefghijklmnopqrst",
+          "--project-ref", PROJECT_REF,
           "--config", join(root, "config.yml"),
           "--no-agent-setup", "--yes"
         ],
