@@ -391,14 +391,13 @@ export class SqliteStore {
         return null;
       }
       const timestamp = this.#clock().toISOString();
-      const updated = this.#database
+      this.#database
         .prepare(
           `UPDATE jobs
            SET status = 'granted', updated_at = ?, lease_expires_at = ?
            WHERE id = ? AND status = ?`
         )
         .run(timestamp, leaseExpiresAt, id, current.status);
-      if (updated.changes !== 1) return null;
       if (current.status !== "queued") {
         this.#insertEvent(id, "queued", null, timestamp);
       }
