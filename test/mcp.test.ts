@@ -876,10 +876,22 @@ describe("configuration reloading", () => {
     expect(getConfig()).toEqual(before);
   });
 
-  test("does not reload while the file is untouched", () => {
-    const { getConfig } = reloaderFor(project("alpha", ["project-management"]));
+  test("does not re-read the file while its mtime is unchanged", () => {
+    const { getConfig, rewrite } = reloaderFor(
+      project("alpha", ["project-management"])
+    );
+    rewrite(configYaml(project("alpha", ["project-management"])), 1);
+    expect(getConfig().projects.alpha?.capabilities).toEqual([
+      "project-management"
+    ]);
 
-    expect(getConfig()).toBe(getConfig());
+    // Same mtime, different bytes: only a reloader that re-reads on every
+    // call would serve `sql` here.
+    rewrite(configYaml(project("alpha", ["project-management", "sql"])), 1);
+
+    expect(getConfig().projects.alpha?.capabilities).toEqual([
+      "project-management"
+    ]);
   });
 });
 
