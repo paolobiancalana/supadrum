@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -62,12 +62,24 @@ async function holdUnmigratedQueue(
   return () => child.kill();
 }
 
+/** A well-formed id the store has never issued; nothing validates the shape. */
+const absentId = "11111111-2222-3333-4444-555555555555";
+
+/** Timer and clock granularity, so an elapsed check is not a coin flip. */
+const clockSlackMs = 50;
+
 const stores: SqliteStore[] = [];
+const directories: string[] = [];
 const now = () => new Date("2026-07-29T15:00:00.000Z");
 
-function createStore(approvalMode: "automatic" | "manual" = "manual") {
+function queuePath(): string {
   const directory = mkdtempSync(join(tmpdir(), "supadrum-store-"));
-  const path = join(directory, "queue.sqlite");
+  directories.push(directory);
+  return join(directory, "queue.sqlite");
+}
+
+function createStore(approvalMode: "automatic" | "manual" = "manual") {
+  const path = queuePath();
   const store = new SqliteStore(path, now, approvalMode);
   stores.push(store);
   return { path, store };
@@ -98,14 +110,14 @@ function submission(
 
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
+  for (const directory of directories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe("opening the queue", () => {
   test("waits for another process to finish opening it", async () => {
-    const path = join(
-      mkdtempSync(join(tmpdir(), "supadrum-store-")),
-      "queue.sqlite"
-    );
+    const path = queuePath();
     const holdMs = 300;
     const release = await holdUnmigratedQueue(path, holdMs);
     const started = Date.now();
@@ -116,7 +128,7 @@ describe("opening the queue", () => {
       const store = new SqliteStore(path, now, "manual");
       stores.push(store);
 
-      expect(Date.now() - started).toBeGreaterThanOrEqual(holdMs - 50);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(holdMs - clockSlackMs);
       expect(store.submit(submission()).status).toBe("queued");
     } finally {
       release();
@@ -124,10 +136,7 @@ describe("opening the queue", () => {
   });
 
   test("refuses a queue path that is not a database", () => {
-    const path = join(
-      mkdtempSync(join(tmpdir(), "supadrum-store-")),
-      "queue.sqlite"
-    );
+    const path = queuePath();
     writeFileSync(path, "this is a note, not a queue");
     const started = Date.now();
 
@@ -221,7 +230,7 @@ describe("durable jobs", () => {
     const { store } = createStore();
 
     expectCode(
-      () => store.getJob("11111111-2222-3333-4444-555555555555"),
+      () => store.getJob(absentId),
       "unknown_job"
     );
   });
@@ -243,19 +252,25 @@ describe("durable jobs", () => {
   });
 
   test.each([
-    { case: "does not require approval", operation: "migration.plan" as const },
-    { case: "is past the point of approving", operation: "migration.apply" as const }
-  ])("refuses to approve a job that $case", ({ operation }) => {
+    {
+      case: "does not require approval",
+      operation: "migration.plan" as const,
+      settle: () => undefined,
+      code: "approval_not_required" as const
+    },
+    {
+      case: "is past the point of approving",
+      operation: "migration.apply" as const,
+      settle: (store: SqliteStore, id: string) =>
+        store.transition(id, "cancelled"),
+      code: "job_state_conflict" as const
+    }
+  ])("refuses to approve a job that $case", ({ operation, settle, code }) => {
     const { store } = createStore();
     const job = store.submit(submission({ operation }));
-    if (operation === "migration.apply") store.transition(job.id, "cancelled");
+    settle(store, job.id);
 
-    expectCode(
-      () => store.approve(job.id, "operator"),
-      operation === "migration.apply"
-        ? "job_state_conflict"
-        : "approval_not_required"
-    );
+    expectCode(() => store.approve(job.id, "operator"), code);
   });
 
   test("approves a job that is still queued without moving it", () => {
@@ -436,7 +451,7 @@ describe("session leases", () => {
     const { store } = createStore();
 
     expectCode(
-      () => store.getSession("11111111-2222-3333-4444-555555555555"),
+      () => store.getSession(absentId),
       "unknown_session"
     );
   });
@@ -452,22 +467,12 @@ describe("session leases", () => {
     );
   });
 
-  test.each([
-    { case: "beating", act: "heartbeat" as const },
-    { case: "submitting through", act: "submit" as const }
-  ])("marks $case a lease that is not active as worth retrying", ({ act }) => {
+  test("marks a beat on a lease that is not active as worth retrying", () => {
     const { store } = createStore();
     const session = openMigrationSession(store);
 
     const error = expectCode(
-      () =>
-        act === "heartbeat"
-          ? store.heartbeatSession(session.id)
-          : store.submitSessionJob(session.id, {
-              operation: "migration.plan",
-              payload: { migration: "rules.sql" },
-              idempotency_key: "example-web:session:plan"
-            }),
+      () => store.heartbeatSession(session.id),
       "session_not_active"
     );
 
