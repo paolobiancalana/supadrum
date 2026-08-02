@@ -109,6 +109,14 @@ interface CliRuntime {
   readonly keychain: () => VaultBackend;
 }
 
+/*
+ * The default bindings to the real process — its streams, its terminal, its
+ * keychain. Tests reach runCli through injected substitutes precisely so none
+ * of this runs, which is the point of the seam rather than a gap in it: there
+ * is no assertion to make about `process.stdout.write` that would not just be
+ * restating it. Excluded on the same grounds as the entrypoint block below.
+ */
+/* v8 ignore start */
 const processIo: CliIo = {
   stdout: (text) => process.stdout.write(text),
   stderr: (text) => process.stderr.write(text)
@@ -158,6 +166,7 @@ const processRuntime: CliRuntime = {
   },
   keychain: () => new MacOsKeychainBackend()
 };
+/* v8 ignore stop */
 
 function option(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name);

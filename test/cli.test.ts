@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   statSync,
   writeFileSync
 } from "node:fs";
@@ -883,5 +884,342 @@ describe("operator CLI: queue commands", () => {
     await expect(
       runCli(["status", "--config", configPath], harness.io, harness.runtime)
     ).rejects.toThrow("Usage: supadrum status <job-id>");
+  });
+});
+
+describe("operator CLI: read-only commands", () => {
+  function twoProjects() {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-read-"));
+    const configPath = join(root, "config.yml");
+    for (const alias of ["zulu-app", "alpha-app"]) {
+      const repository = join(root, alias);
+      execFileSync("git", ["init", "--quiet", repository]);
+      addProject({
+        alias,
+        repository,
+        project_ref: "abcdefghijklmnopqrst",
+        profile: "development",
+        config_path: configPath
+      });
+    }
+    return { root, configPath };
+  }
+
+  test("inspects a project without printing credential references", async () => {
+    const { configPath } = twoProjects();
+    const harness = cli();
+
+    expect(
+      await runCli(
+        ["project", "inspect", "alpha-app", "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(harness.stdout()).toContain("Project: alpha-app");
+    expect(harness.stdout()).toContain("Supabase ref: abcdefghijklmnopqrst");
+    expect(harness.stdout()).not.toContain("vault://");
+  });
+
+  test("keeps credential references out of inspect --json too", async () => {
+    const { configPath } = twoProjects();
+    const harness = cli();
+
+    await runCli(
+      ["project", "inspect", "alpha-app", "--config", configPath, "--json"],
+      harness.io,
+      harness.runtime
+    );
+
+    const report = JSON.parse(harness.stdout());
+    expect(report).toMatchObject({
+      name: "alpha-app",
+      credentials: ["database_access", "management_token", "secret_key"]
+    });
+    expect(harness.stdout()).not.toContain("vault://");
+  });
+
+  test("lists every project sorted, under both spellings", async () => {
+    const { configPath } = twoProjects();
+    const viaProjects = cli();
+    const viaProjectList = cli();
+
+    await runCli(
+      ["projects", "--config", configPath],
+      viaProjects.io,
+      viaProjects.runtime
+    );
+    await runCli(
+      ["project", "list", "--config", configPath],
+      viaProjectList.io,
+      viaProjectList.runtime
+    );
+
+    expect(JSON.parse(viaProjects.stdout())).toEqual([
+      { name: "alpha-app", project_ref: "abcdefghijklmnopqrst" },
+      { name: "zulu-app", project_ref: "abcdefghijklmnopqrst" }
+    ]);
+    expect(viaProjectList.stdout()).toBe(viaProjects.stdout());
+  });
+
+  test("reports unresolvable credentials as not ready", async () => {
+    const { configPath } = twoProjects();
+    const harness = cli();
+
+    expect(
+      await runCli(
+        ["project", "doctor", "alpha-app", "--config", configPath, "--json"],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      project: "alpha-app",
+      ready: false,
+      missing_credentials: [
+        "secret_key",
+        "management_token",
+        "database_access"
+      ]
+    });
+  });
+
+  test("doctors every configured project in sorted order", async () => {
+    const { configPath } = twoProjects();
+    const harness = cli();
+
+    await runCli(
+      ["project", "doctor", "--all", "--config", configPath, "--json"],
+      harness.io,
+      harness.runtime
+    );
+
+    expect(
+      JSON.parse(harness.stdout()).map(
+        (report: { project: string }) => report.project
+      )
+    ).toEqual(["alpha-app", "zulu-app"]);
+  });
+
+  test("renders a doctor report as text when not asked for JSON", async () => {
+    const { configPath } = twoProjects();
+    const harness = cli();
+
+    await runCli(
+      ["project", "doctor", "alpha-app", "--config", configPath],
+      harness.io,
+      harness.runtime
+    );
+
+    expect(harness.stdout()).toContain("alpha-app");
+    expect(harness.stdout()).not.toContain("vault://");
+    expect(() => JSON.parse(harness.stdout())).toThrow();
+  });
+});
+
+describe("operator CLI: bootstrap commands", () => {
+  test("writes a starter config only the operator can read", async () => {
+    const harness = cli();
+    const configPath = join(harness.root, "nested", "supadrum.yml");
+
+    expect(
+      await runCli(["init", configPath], harness.io, harness.runtime)
+    ).toBe(0);
+
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    expect(loadConfig(configPath).projects).toBeDefined();
+  });
+
+  test("refuses to overwrite a config that already exists", async () => {
+    const harness = cli();
+    const configPath = join(harness.root, "supadrum.yml");
+    writeFileSync(configPath, "version: 1\nprojects: {}\n");
+
+    await expect(
+      runCli(["init", configPath], harness.io, harness.runtime)
+    ).rejects.toThrow();
+
+    expect(readFileSync(configPath, "utf8")).toBe("version: 1\nprojects: {}\n");
+  });
+
+  test("demo completes a job without persisting any credential", async () => {
+    const harness = cli();
+
+    expect(await runCli(["demo"], harness.io, harness.runtime)).toBe(0);
+
+    expect(JSON.parse(harness.stdout())).toMatchObject({
+      status: "completed",
+      operation: "migration.plan",
+      credentials_persisted: false
+    });
+  });
+
+  test("prints usage without spawning a process", async () => {
+    const harness = cli();
+
+    expect(await runCli(["--help"], harness.io, harness.runtime)).toBe(0);
+
+    expect(harness.stdout()).toContain("supadrum project add");
+    expect(harness.stdout()).toContain("supadrum approve <job-id>");
+    expect(harness.stderr()).toBe("");
+  });
+
+  test("answers an unknown command on stderr with a failing code", async () => {
+    const harness = cli();
+
+    expect(
+      await runCli(["teleport"], harness.io, harness.runtime)
+    ).toBe(1);
+
+    expect(harness.stderr()).toContain("Usage: supadrum");
+    expect(harness.stdout()).toBe("");
+  });
+});
+
+describe("operator CLI: input validation and prompting", () => {
+  function bareProject() {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-validate-"));
+    // Discovery walks up from cwd and home, so an unrelated directory is the
+    // only way to reach the prompt: a sibling of the repo would be found.
+    const away = mkdtempSync(join(tmpdir(), "supadrum-cli-away-"));
+    const repository = join(root, "example-ios");
+    const configPath = join(root, "config.yml");
+    execFileSync("git", ["init", "--quiet", repository]);
+    return { root, away, repository, configPath };
+  }
+
+  test("rejects a mistyped profile instead of falling back to a default", async () => {
+    const { root, repository, configPath } = bareProject();
+    const harness = cli({ cwd: root });
+
+    await expect(
+      runCli(
+        [
+          "project", "add", "example-ios",
+          "--repo", repository,
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--profile", "developement",
+          "--config", configPath,
+          "--no-agent-setup", "--yes"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Unknown profile: developement");
+    expect(existsSync(configPath)).toBe(false);
+  });
+
+  test("rejects an unknown credential name for --replace", async () => {
+    const { configPath } = credentialConfig([
+      process.execPath,
+      join(repositoryRoot, "dist", "vault-cli.js"),
+      "keychain",
+      "resolve"
+    ]);
+    const harness = cli();
+
+    await expect(
+      runCli(
+        [
+          "project", "credentials", "set", "example-ios",
+          "--replace", "secret-key",
+          "--config", configPath
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow(
+      "Credential must be secret_key, management_token, or database_access"
+    );
+  });
+
+  test("fails loudly under --yes rather than waiting for an answer", async () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-noninteractive-"));
+    const harness = cli({
+      cwd: root,
+      question: async () => {
+        throw new Error("--yes must never prompt");
+      }
+    });
+
+    await expect(
+      runCli(
+        [
+          "project", "add", "nowhere-app",
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", join(root, "config.yml"),
+          "--no-agent-setup", "--yes"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Could not discover repo; pass --repo");
+  });
+
+  test("asks for an undiscoverable repository when allowed to prompt", async () => {
+    const { away, repository, configPath } = bareProject();
+    const asked: string[] = [];
+    const harness = cli({
+      cwd: away,
+      question: async (prompt: string) => {
+        asked.push(prompt);
+        return `  ${repository}  `;
+      }
+    });
+
+    expect(
+      await runCli(
+        [
+          "project", "add", "example-ios",
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", configPath,
+          "--no-agent-setup", "--json"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).toBe(0);
+
+    expect(asked).toEqual(["Repository path: "]);
+    expect(loadConfig(configPath).projects["example-ios"]?.repo).toBe(
+      realpathSync(repository)
+    );
+  });
+
+  test("refuses an empty answer instead of storing it", async () => {
+    const { away, configPath } = bareProject();
+    const harness = cli({
+      cwd: away,
+      question: async () => "   "
+    });
+
+    await expect(
+      runCli(
+        [
+          "project", "add", "example-ios",
+          "--project-ref", "abcdefghijklmnopqrst",
+          "--config", configPath,
+          "--no-agent-setup"
+        ],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("repo is required");
+    expect(existsSync(configPath)).toBe(false);
+  });
+
+  test("refuses doctor without an alias", async () => {
+    const { configPath } = credentialConfig([process.execPath, "-e", "0"]);
+    const harness = cli();
+
+    await expect(
+      runCli(
+        ["project", "doctor", "--config", configPath],
+        harness.io,
+        harness.runtime
+      )
+    ).rejects.toThrow("Usage: supadrum project doctor <alias>");
   });
 });
