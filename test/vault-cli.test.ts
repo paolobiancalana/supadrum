@@ -457,21 +457,27 @@ describe("vault operator CLI", () => {
   });
 
   test.each([
-    { case: "put without a reference", argv: ["keychain", "put"] },
+    {
+      case: "put without a reference",
+      argv: ["keychain", "put"],
+      message: "Keychain put requires a vault reference"
+    },
     {
       case: "import without a service",
-      argv: ["keychain", "import", reference, "--account", "operator"]
+      argv: ["keychain", "import", reference, "--account", "operator"],
+      message: "Keychain import requires a reference, --service, and account"
     },
     {
       case: "import without a reference",
-      argv: ["keychain", "import", "--service", "supabase-pat"]
+      argv: ["keychain", "import", "--service", "supabase-pat"],
+      message: "Keychain import requires a reference, --service, and account"
     }
-  ])("refuses $case rather than acting on a flag", async ({ argv }) => {
+  ])("refuses $case rather than acting on a flag", async ({ argv, message }) => {
     const keychain = new ImportingBackend();
 
     await expect(
       runVaultCli(argv, io("top-secret-canary\n").io, { keychain })
-    ).rejects.toThrow(/requires/);
+    ).rejects.toThrow(message);
     expect(keychain.values.size).toBe(0);
     expect(keychain.imports).toEqual([]);
   });
