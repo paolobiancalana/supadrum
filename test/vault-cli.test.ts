@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  AGE_IDENTITY_REFERENCE,
   MacOsKeychainBackend,
   MissingVaultValueError,
   SopsAgeBackend,
@@ -102,6 +103,19 @@ const reference = "vault://supabase/example-web/management";
 
 function keychainItem(value: string): string {
   return `supadrum:v1:${Buffer.from(value, "utf8").toString("base64")}`;
+}
+
+const ageIdentity = [
+  "# created: 2026-07-29T00:00:00Z",
+  "# public key: age1canaryrecipient",
+  "AGE-SECRET-KEY-1CANARY"
+].join("\n");
+const recipient = "age1canaryrecipient";
+
+function identityVault(): MemoryBackend {
+  const keychain = new MemoryBackend();
+  keychain.values.set(AGE_IDENTITY_REFERENCE, ageIdentity);
+  return keychain;
 }
 
 describe("macOS Keychain backend", () => {
@@ -498,18 +512,11 @@ describe("vault operator CLI", () => {
 });
 
 describe("SOPS age backend", () => {
-  const ageIdentity = [
-    "# created: 2026-07-29T00:00:00Z",
-    "# public key: age1canaryrecipient",
-    "AGE-SECRET-KEY-1CANARY"
-  ].join("\n");
-  const recipient = "age1canaryrecipient";
-
-  function identityVault(): MemoryBackend {
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
-    return keychain;
-  }
+  test("names the Keychain item the operator's identity already lives in", () => {
+    // Changing this string orphans every age identity stored under the old
+    // one, and with it every backup encrypted to that identity.
+    expect(AGE_IDENTITY_REFERENCE).toBe("vault://supadrum/keys/age");
+  });
 
   test("extracts one reference with the age identity only in the child environment", async () => {
     const runner = new RecordingRunner();
@@ -518,11 +525,9 @@ describe("SOPS age backend", () => {
       stdout: "resolved-secret",
       stderr: "non-secret diagnostic that must not reach output"
     });
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
     const backend = new SopsAgeBackend(
       "/operator/secrets.enc.json",
-      keychain,
+      identityVault(),
       runner
     );
 
@@ -566,12 +571,11 @@ describe("SOPS age backend", () => {
         (invocation) => !JSON.stringify(invocation.argv).includes(ageIdentity)
       )
     ).toBe(true);
-    expect(keychain.values.get("vault://supadrum/keys/age")).toBe(ageIdentity);
+    expect(keychain.values.get(AGE_IDENTITY_REFERENCE)).toBe(ageIdentity);
   });
 
   test("reuses an existing age identity instead of rotating it", async () => {
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
+    const keychain = identityVault();
     const runner = new RecordingRunner();
     runner.outcomes.push({
       exitCode: 0,
@@ -627,8 +631,7 @@ describe("SOPS age backend", () => {
       message: "age-keygen returned an invalid recipient"
     }
   ])("refuses to encrypt to a recipient when $case", async ({ outcome, message }) => {
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
+    const keychain = identityVault();
     const runner = new RecordingRunner();
     runner.outcomes.push(outcome);
 
@@ -925,8 +928,7 @@ describe("SOPS age backend", () => {
   });
 
   test("exposes SOPS resolve and bootstrap through metadata-safe CLI commands", async () => {
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
+    const keychain = identityVault();
     const resolveRunner = new RecordingRunner();
     resolveRunner.outcomes.push({
       exitCode: 0,
@@ -982,10 +984,7 @@ describe("dotenv migration CLI", () => {
     const databaseReference =
       "vault://legacy/example-service-env/database-url";
     const jwtReference = "vault://legacy/example-service-env/jwt-secret";
-    const ageIdentity = "TEST-PRIVATE-AGE-IDENTITY";
-    const recipient = "age1canaryrecipient";
-    const keychain = new MemoryBackend();
-    keychain.values.set("vault://supadrum/keys/age", ageIdentity);
+    const keychain = identityVault();
     const runner = new RecordingRunner();
     runner.outcomes.push(
       { exitCode: 0, stdout: `${recipient}\n`, stderr: "" },
