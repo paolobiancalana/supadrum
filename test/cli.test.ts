@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 
 import { runCli } from "../src/cli.js";
 import { SqliteStore } from "../src/store.js";
@@ -796,14 +796,17 @@ describe("operator CLI: queue commands", () => {
       profile: "admin",
       config_path: configPath
     });
-    writeFileSync(
-      configPath,
-      readFileSync(configPath, "utf8").replace(
-        "approval_mode: automatic",
-        "approval_mode: manual"
-      )
-    );
+    // Setting the key through the parser rather than substituting the string
+    // addProject happens to write: a substitution that stopped matching would
+    // leave the queue on automatic approval, and only some of these tests
+    // would notice.
+    const document = parse(readFileSync(configPath, "utf8"));
+    document.approval_mode = "manual";
+    writeFileSync(configPath, stringify(document));
     const config = loadConfig(configPath);
+    if (config.approval_mode !== "manual") {
+      throw new Error("fixture failed to require approval");
+    }
     const store = new SqliteStore(
       config.database_path,
       undefined,
