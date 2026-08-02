@@ -64,6 +64,30 @@ function structured<Schema extends z.ZodType>(
   return schema.parse(structuredContent);
 }
 
+// Mirrors the runner's session.open path (src/runner.ts:154-186): grant the
+// open job, run it, activate the lease, then verify and complete. Driving the
+// store by hand instead left the open job parked in `granted` while its
+// session was active — a pairing the running system never holds.
+function activateLease(
+  store: SqliteStore,
+  opened: { session: { id: string }; open_job: { id: string } }
+) {
+  const granted = store.grantIfSchedulable(
+    opened.open_job.id,
+    new Date(Date.now() + 60_000).toISOString()
+  );
+  if (!granted) {
+    throw new Error(`Open job was not schedulable: ${opened.open_job.id}`);
+  }
+  store.transition(granted.id, "running");
+  const session = store.activateSession(opened.session.id);
+  store.transition(granted.id, "verifying");
+  store.transition(granted.id, "completed", null, {
+    lease_expires_at: null
+  });
+  return session;
+}
+
 function credentials(project: string): string {
   return `    credentials:
       secret_key: vault://supabase/${project}/secret
@@ -359,8 +383,7 @@ describe("MCP protocol surface", () => {
         open_job: { operation: "session.open", status: "queued" }
       });
 
-      store.transition(openJob.id, "granted");
-      store.activateSession(session.id);
+      activateLease(store, { session, open_job: openJob });
 
       const executed = await client.callTool({
         name: "sessions.exec",
@@ -768,8 +791,7 @@ ${credentials("narrow")}
     const handlers = createHandlers(config, store);
     const opened = handlers.sessionsOpen(openInput);
     store.approve(opened.open_job.id, "operator");
-    store.transition(opened.open_job.id, "granted");
-    store.activateSession(opened.session.id);
+    activateLease(store, opened);
 
     const queued = handlers.sessionsExec({
       session_id: opened.session.id,
@@ -803,8 +825,7 @@ ${credentials("narrow")}
     const { config, store } = setup();
     const handlers = createHandlers(config, store);
     const opened = handlers.sessionsOpen(openInput);
-    store.transition(opened.open_job.id, "granted");
-    store.activateSession(opened.session.id);
+    activateLease(store, opened);
 
     expect(
       handlers.sessionsClose({ session_id: opened.session.id })
