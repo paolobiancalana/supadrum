@@ -1000,6 +1000,15 @@ export async function runCli(
   return 1;
 }
 
+/*
+ * Process bootstrap: binds this module to the real process — its argv, its
+ * stdio, its exit code. The guard is false by design whenever the module is
+ * imported rather than executed, so a coverage instrument scoped to the test
+ * process can never observe it. The logic it wires into is exported and
+ * tested directly; excluded from the measurement so the reported number means
+ * "code the instrument can see" rather than carrying a permanent red block.
+ */
+/* v8 ignore start */
 const entrypoint = process.argv[1];
 if (isEntrypoint(import.meta.url, entrypoint)) {
   runCli(process.argv.slice(2))
@@ -1013,3 +1022,4 @@ if (isEntrypoint(import.meta.url, entrypoint)) {
       process.exitCode = 1;
     });
 }
+/* v8 ignore stop */

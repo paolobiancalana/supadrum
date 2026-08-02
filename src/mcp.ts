@@ -351,6 +351,17 @@ export function createConfigReloader(
   };
 }
 
+/*
+ * Process bootstrap: everything below binds this module to the real process —
+ * its stdio, its argv, its exit code — so calling it in-process would hijack
+ * the test runner's own streams, and the entrypoint guard is false by design
+ * whenever the module is imported rather than executed. The spawned-server
+ * tests in test/mcp.test.ts do exercise it end-to-end; a coverage instrument
+ * scoped to the test process simply cannot observe a child process. Excluded
+ * from the measurement so the reported number means "code the instrument can
+ * see", rather than carrying a permanent red block everyone learns to ignore.
+ */
+/* v8 ignore start */
 export async function runMcp(
   configPath = resolveOperatorConfigPath({
     args: [],
@@ -393,3 +404,4 @@ if (isEntrypoint(import.meta.url, entrypoint)) {
     process.exitCode = 1;
   });
 }
+/* v8 ignore stop */
