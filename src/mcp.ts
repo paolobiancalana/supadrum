@@ -276,6 +276,32 @@ export function createMcpServer(
   return server;
 }
 
+// ponytail: database_path and approval_mode stay fixed for the process
+// lifetime; capability and project changes hot-reload per request.
+export function createConfigReloader(
+  configPath: string
+): () => SupadrumConfig {
+  let config = loadConfig(configPath);
+  let mtime = configMtime(configPath);
+  return () => {
+    const current = configMtime(configPath);
+    if (current !== null && current !== mtime) {
+      try {
+        config = loadConfig(configPath);
+        mtime = current;
+      } catch {
+        // Keep serving the last valid config; a broken edit must not kill
+        // live agent sessions. mtime deliberately stays at the last good
+        // read so the next call retries: filesystems with coarse mtime
+        // resolution can stamp a broken write and its repair with the same
+        // timestamp, and consuming it here would strand the process on a
+        // stale config until some later write happened to differ.
+      }
+    }
+    return config;
+  };
+}
+
 export async function runMcp(
   configPath = resolveOperatorConfigPath({
     args: [],
@@ -284,23 +310,8 @@ export async function runMcp(
     homeDirectory: homedir()
   })
 ): Promise<void> {
-  let config = loadConfig(configPath);
-  let mtime = configMtime(configPath);
-  // ponytail: database_path and approval_mode stay fixed for the process
-  // lifetime; capability and project changes hot-reload per request.
-  const getConfig = () => {
-    const current = configMtime(configPath);
-    if (current !== null && current !== mtime) {
-      mtime = current;
-      try {
-        config = loadConfig(configPath);
-      } catch {
-        // Keep serving the last valid config; a broken edit must not
-        // kill live agent sessions.
-      }
-    }
-    return config;
-  };
+  const getConfig = createConfigReloader(configPath);
+  const config = getConfig();
   const store = new SqliteStore(
     config.database_path,
     undefined,
