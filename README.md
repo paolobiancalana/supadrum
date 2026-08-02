@@ -266,6 +266,33 @@ supadrum approve <job-id> --actor operator --config ./supadrum.yml
 
 Then the agent resumes `jobs.wait` from its last cursor.
 
+### Coded errors
+
+Anything a caller can provoke comes back as a tool error carrying a code, so
+an agent can tell a denial from a not-yet:
+
+```json
+{
+  "error": {
+    "code": "session_not_active",
+    "message": "Session is not active: 0f0c…",
+    "retryable": true
+  }
+}
+```
+
+`retryable` is true only when repeating the identical call could succeed
+without the caller changing anything — today that means `session_not_active`,
+where the lease exists but its open job has not been granted yet. Every other
+code asks the caller to do something different: `unknown_project`,
+`unknown_job`, `unknown_session`, `capability_denied`,
+`approval_not_required`, `invalid_input`, `idempotency_conflict`,
+`job_state_conflict`, `session_state_conflict`.
+
+`internal_invariant` is the exception that is nobody's fault but the broker's
+— it means Supadrum rejected its own state transition, and retrying will not
+help. A failure with no code at all is a crash, not a protocol answer.
+
 ### Read-only schema contracts
 
 `schema.inspect` lets an agent verify exact database requirements without

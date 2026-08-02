@@ -22,6 +22,7 @@ import {
   JobSubmissionSchema
 } from "./domain.js";
 import { isEntrypoint } from "./entrypoint.js";
+import { BrokerError } from "./errors.js";
 import { resolveOperatorConfigPath } from "./projects.js";
 import { SqliteStore } from "./store.js";
 
@@ -39,9 +40,17 @@ function assertProjectCapability(
   capability: (typeof capabilityNames)[number]
 ) {
   const project = config.projects[projectName];
-  if (!project) throw new Error(`Unknown project: ${projectName}`);
+  if (!project) {
+    throw new BrokerError(
+      "unknown_project",
+      `Unknown project: ${projectName}`
+    );
+  }
   if (!project.capabilities.includes(capability)) {
-    throw new Error(`Project ${projectName} lacks ${capability}`);
+    throw new BrokerError(
+      "capability_denied",
+      `Project ${projectName} lacks ${capability}`
+    );
   }
   return project;
 }
@@ -175,6 +184,46 @@ function toolResult(value: unknown) {
   };
 }
 
+function toolError(error: BrokerError) {
+  const payload = {
+    error: {
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable
+    }
+  };
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(payload)
+      }
+    ],
+    structuredContent: payload,
+    isError: true
+  };
+}
+
+/**
+ * Turns the failures a caller can provoke into a coded result, and lets
+ * everything else through as a fault. An agent needs to tell "you may not do
+ * that" from "not ready yet, ask again" from "the broker is broken", and a
+ * bare thrown message tells it none of the three.
+ */
+async function callTool(run: () => unknown | Promise<unknown>) {
+  try {
+    return toolResult(await run());
+  } catch (error) {
+    if (error instanceof BrokerError) return toolError(error);
+    if (error instanceof z.ZodError) {
+      return toolError(
+        new BrokerError("invalid_input", z.prettifyError(error))
+      );
+    }
+    throw error;
+  }
+}
+
 export function createMcpServer(
   configSource: ConfigSource,
   store: SqliteStore
@@ -191,7 +240,7 @@ export function createMcpServer(
       description: "List configured projects without credential references",
       inputSchema: {}
     },
-    async () => toolResult(handlers.projectsList())
+    async () => callTool(() => handlers.projectsList())
   );
   server.registerTool(
     "projects.inspect",
@@ -199,7 +248,7 @@ export function createMcpServer(
       description: "Inspect one redacted project chamber",
       inputSchema: { project: z.string().min(1) }
     },
-    async (input) => toolResult(handlers.projectsInspect(input))
+    async (input) => callTool(() => handlers.projectsInspect(input))
   );
   server.registerTool(
     "jobs.submit",
@@ -207,7 +256,7 @@ export function createMcpServer(
       description: "Submit one atomic Supabase operation",
       inputSchema: JobSubmissionSchema.shape
     },
-    async (input) => toolResult(handlers.jobsSubmit(input))
+    async (input) => callTool(() => handlers.jobsSubmit(input))
   );
   server.registerTool(
     "jobs.wait",
@@ -219,7 +268,7 @@ export function createMcpServer(
         timeout_ms: z.number().int().min(0).max(30_000).default(30_000)
       }
     },
-    async (input) => toolResult(await handlers.jobsWait(input))
+    async (input) => callTool(() => handlers.jobsWait(input))
   );
   server.registerTool(
     "jobs.status",
@@ -227,7 +276,7 @@ export function createMcpServer(
       description: "Read current job status",
       inputSchema: { job_id: z.string().uuid() }
     },
-    async (input) => toolResult(handlers.jobsStatus(input))
+    async (input) => callTool(() => handlers.jobsStatus(input))
   );
   server.registerTool(
     "jobs.cancel",
@@ -235,7 +284,7 @@ export function createMcpServer(
       description: "Cancel a job that has not started running",
       inputSchema: { job_id: z.string().uuid() }
     },
-    async (input) => toolResult(handlers.jobsCancel(input))
+    async (input) => callTool(() => handlers.jobsCancel(input))
   );
   server.registerTool(
     "sessions.open",
@@ -249,7 +298,7 @@ export function createMcpServer(
         ttl_ms: z.number().int().min(1_000).max(900_000).default(60_000)
       }
     },
-    async (input) => toolResult(handlers.sessionsOpen(input))
+    async (input) => callTool(() => handlers.sessionsOpen(input))
   );
   server.registerTool(
     "sessions.exec",
@@ -262,7 +311,7 @@ export function createMcpServer(
         idempotency_key: z.string().min(1).max(255)
       }
     },
-    async (input) => toolResult(handlers.sessionsExec(input))
+    async (input) => callTool(() => handlers.sessionsExec(input))
   );
   server.registerTool(
     "sessions.close",
@@ -270,7 +319,7 @@ export function createMcpServer(
       description: "Close a session and release its chamber",
       inputSchema: { session_id: z.string().uuid() }
     },
-    async (input) => toolResult(handlers.sessionsClose(input))
+    async (input) => callTool(() => handlers.sessionsClose(input))
   );
 
   return server;

@@ -18,6 +18,7 @@ import {
   type JobSubmission,
   type Session
 } from "./domain.js";
+import { BrokerError } from "./errors.js";
 
 type Clock = () => Date;
 const sqliteRetrySignal = new Int32Array(new SharedArrayBuffer(4));
@@ -301,7 +302,8 @@ export class SqliteStore {
           .pluck()
           .get(existing.id) as string;
         if (storedHash !== requestHash) {
-          throw new Error(
+          throw new BrokerError(
+            "idempotency_conflict",
             `Idempotency key already belongs to different work: ${submission.idempotency_key}`
           );
         }
@@ -342,7 +344,7 @@ export class SqliteStore {
     const row = this.#database
       .prepare("SELECT * FROM jobs WHERE id = ?")
       .get(id) as JobRow | undefined;
-    if (!row) throw new Error(`Unknown job: ${id}`);
+    if (!row) throw new BrokerError("unknown_job", `Unknown job: ${id}`);
     return toJob(row);
   }
 
@@ -456,7 +458,8 @@ export class SqliteStore {
       const current = this.getJob(id);
       if (current.status === next) return current;
       if (!allowedTransitions[current.status].includes(next)) {
-        throw new Error(
+        throw new BrokerError(
+          "internal_invariant",
           `Illegal job transition: ${current.status} -> ${next}`
         );
       }
@@ -498,13 +501,19 @@ export class SqliteStore {
     return this.#database.transaction(() => {
       const current = this.getJob(id);
       if (!current.requires_approval) {
-        throw new Error(`Job does not require approval: ${id}`);
+        throw new BrokerError(
+          "approval_not_required",
+          `Job does not require approval: ${id}`
+        );
       }
       if (
         current.status !== "waiting_approval" &&
         current.status !== "queued"
       ) {
-        throw new Error(`Job cannot be approved from ${current.status}`);
+        throw new BrokerError(
+          "job_state_conflict",
+          `Job cannot be approved from ${current.status}`
+        );
       }
       const timestamp = this.#clock().toISOString();
       this.#database
@@ -523,7 +532,10 @@ export class SqliteStore {
 
   openSession(input: SessionOpenInput): Session {
     if (!Number.isInteger(input.ttl_ms) || input.ttl_ms < 1_000) {
-      throw new Error("Session ttl_ms must be an integer of at least 1000");
+      throw new BrokerError(
+        "invalid_input",
+        "Session ttl_ms must be an integer of at least 1000"
+      );
     }
     const requiresApproval = Object.values(operationCatalog).some(
       (definition) =>
@@ -541,7 +553,8 @@ export class SqliteStore {
           .prepare("SELECT * FROM sessions WHERE open_job_id = ?")
           .get(existing.id) as SessionRow | undefined;
         if (!session) {
-          throw new Error(
+          throw new BrokerError(
+            "idempotency_conflict",
             `Idempotency key already belongs to different work: ${input.idempotency_key}`
           );
         }
@@ -585,7 +598,9 @@ export class SqliteStore {
     const row = this.#database
       .prepare("SELECT * FROM sessions WHERE id = ?")
       .get(id) as SessionRow | undefined;
-    if (!row) throw new Error(`Unknown session: ${id}`);
+    if (!row) {
+      throw new BrokerError("unknown_session", `Unknown session: ${id}`);
+    }
     return toSession(row);
   }
 
@@ -604,7 +619,10 @@ export class SqliteStore {
   activateSession(id: string): Session {
     const session = this.getSession(id);
     if (session.status !== "queued") {
-      throw new Error(`Session cannot activate from ${session.status}`);
+      throw new BrokerError(
+        "session_state_conflict",
+        `Session cannot activate from ${session.status}`
+      );
     }
     const timestamp = this.#clock().toISOString();
     const expiresAt = new Date(
@@ -623,7 +641,10 @@ export class SqliteStore {
   heartbeatSession(id: string): Session {
     const session = this.getSession(id);
     if (session.status !== "active") {
-      throw new Error(`Session is not active: ${id}`);
+      throw new BrokerError(
+        "session_not_active",
+        `Session is not active: ${id}`
+      );
     }
     const timestamp = this.#clock().toISOString();
     const expiresAt = new Date(
@@ -659,7 +680,10 @@ export class SqliteStore {
   submitSessionJob(sessionId: string, input: SessionJobInput): Job {
     const session = this.getSession(sessionId);
     if (session.status !== "active") {
-      throw new Error(`Session is not active: ${sessionId}`);
+      throw new BrokerError(
+        "session_not_active",
+        `Session is not active: ${sessionId}`
+      );
     }
     const parsed = JobSubmissionSchema.parse({
       project: session.project,
@@ -670,7 +694,8 @@ export class SqliteStore {
     });
     const definition = operationCatalog[parsed.operation];
     if (definition.capability !== session.capability) {
-      throw new Error(
+      throw new BrokerError(
+        "capability_denied",
         `Session ${sessionId} does not grant ${definition.capability}; it grants ${session.capability}`
       );
     }
@@ -702,7 +727,10 @@ export class SqliteStore {
       return current;
     }
     if (current.status === "running" || current.status === "verifying") {
-      throw new Error("Running jobs cannot be cancelled atomically");
+      throw new BrokerError(
+        "job_state_conflict",
+        "Running jobs cannot be cancelled atomically"
+      );
     }
     return this.transition(id, "cancelled");
   }

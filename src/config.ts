@@ -4,6 +4,7 @@ import { parse } from "yaml";
 import { z } from "zod";
 
 import { CapabilitySchema, OperationSchema } from "./domain.js";
+import { BrokerError } from "./errors.js";
 
 const VaultReferenceSchema = z
   .string()
@@ -274,7 +275,7 @@ export function loadConfig(path: string): SupadrumConfig {
 export function inspectProject(name: string, config: SupadrumConfig) {
   const project = config.projects[name];
   if (!project) {
-    throw new Error(`Unknown project: ${name}`);
+    throw new BrokerError("unknown_project", `Unknown project: ${name}`);
   }
 
   return {

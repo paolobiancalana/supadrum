@@ -14,6 +14,7 @@ import {
   createHandlers,
   createMcpServer
 } from "../src/mcp.js";
+import { brokerErrorCodes } from "../src/errors.js";
 import { SqliteStore } from "../src/store.js";
 
 const stores: SqliteStore[] = [];
@@ -793,6 +794,134 @@ describe("session leases", () => {
     expect(
       handlers.sessionsClose({ session_id: opened.session.id })
     ).toMatchObject({ status: "closing" });
+  });
+});
+
+describe("error taxonomy on the tool surface", () => {
+  const ERROR_RESULT = z.object({
+    error: z.object({
+      code: z.enum(brokerErrorCodes),
+      message: z.string().min(1),
+      retryable: z.boolean()
+    })
+  });
+
+  async function connect(configSource: Parameters<typeof createMcpServer>[0]) {
+    const { store } = setup();
+    const server = createMcpServer(configSource, store);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      client.connect(clientTransport),
+      server.connect(serverTransport)
+    ]);
+    return {
+      client,
+      store,
+      [Symbol.asyncDispose]: async () => {
+        await client.close();
+        await server.close();
+      }
+    };
+  }
+
+  test("codes a capability denial as the caller's to fix", async () => {
+    await using connected = await connect(setup().config);
+
+    const denied = await connected.client.callTool({
+      name: "jobs.submit",
+      arguments: {
+        project: "alpha",
+        operation: "sql.execute",
+        payload: { path: "x.sql", digest: "0".repeat(64) },
+        repo_sha: "abc123",
+        idempotency_key: "alpha:errors:denied"
+      }
+    });
+
+    expect(denied.isError).toBe(true);
+    expect(structured(denied, ERROR_RESULT).error).toMatchObject({
+      code: "capability_denied",
+      retryable: false
+    });
+  });
+
+  test("codes an unopened lease as worth retrying", async () => {
+    await using connected = await connect(setup().config);
+    const opened = await connected.client.callTool({
+      name: "sessions.open",
+      arguments: {
+        project: "alpha",
+        capability: "migrations",
+        repo_sha: "abc123",
+        idempotency_key: "alpha:errors:lease",
+        ttl_ms: 60_000
+      }
+    });
+    const { session } = structured(
+      opened,
+      z.object({ session: z.object({ id: z.string().uuid() }) })
+    );
+
+    const early = await connected.client.callTool({
+      name: "sessions.exec",
+      arguments: {
+        session_id: session.id,
+        operation: "migration.apply",
+        payload: { migration: "rules.sql" },
+        idempotency_key: "alpha:errors:early"
+      }
+    });
+
+    expect(structured(early, ERROR_RESULT).error).toMatchObject({
+      code: "session_not_active",
+      retryable: true
+    });
+  });
+
+  test("codes a rejected payload as invalid input, readably", async () => {
+    await using connected = await connect(setup().config);
+
+    const rejected = await connected.client.callTool({
+      name: "jobs.submit",
+      arguments: {
+        project: "alpha",
+        operation: "schema.inspect",
+        payload: {
+          checks: [
+            {
+              kind: "relation",
+              schema: "pg_catalog",
+              name: "pg_class",
+              sql: "select 1"
+            }
+          ]
+        },
+        repo_sha: "abc123",
+        idempotency_key: "alpha:errors:payload"
+      }
+    });
+
+    const { error } = structured(rejected, ERROR_RESULT);
+    expect(error.code).toBe("invalid_input");
+    expect(error.message).not.toContain('"_zod"');
+  });
+
+  test("leaves a genuine fault a fault instead of dressing it as protocol", async () => {
+    await using connected = await connect(() => {
+      throw new TypeError("config source exploded");
+    });
+
+    const faulted = await connected.client.callTool({
+      name: "projects.list",
+      arguments: {}
+    });
+
+    // The SDK still reports a failure, but without a taxonomy code: an
+    // agent must not read a broker crash as "you asked for the wrong thing".
+    expect(faulted.isError).toBe(true);
+    expect(() => structured(faulted, ERROR_RESULT)).toThrow();
   });
 });
 
