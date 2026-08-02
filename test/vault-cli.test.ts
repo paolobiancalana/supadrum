@@ -9,6 +9,7 @@ import {
   SopsAgeBackend,
   SopsAgeBackup,
   bootstrapAgeIdentity,
+  nodeProcessRunner,
   runVaultCli,
   type ProcessInvocation,
   type ProcessOutcome,
@@ -250,6 +251,60 @@ describe("macOS Keychain backend", () => {
     await expect(
       backend.import(reference, { service: "supabase-pat", account: "operator" })
     ).rejects.toThrow("Keychain import round-trip mismatch");
+  });
+});
+
+describe("node process runner", () => {
+  const node = (script: string) => [process.execPath, "-e", script];
+
+  test("refuses an invocation that names no program", async () => {
+    await expect(nodeProcessRunner.run({ argv: [] })).rejects.toThrow(
+      "Process argv cannot be empty"
+    );
+  });
+
+  test("keeps a child's stdout, stderr and exit code apart", async () => {
+    await expect(
+      nodeProcessRunner.run({
+        argv: node(
+          'process.stdout.write("out");process.stderr.write("err");process.exitCode=44'
+        )
+      })
+    ).resolves.toEqual({ exitCode: 44, stdout: "out", stderr: "err" });
+  });
+
+  test("feeds the value through stdin rather than the command line", async () => {
+    const invocation = {
+      argv: node(
+        'let d="";process.stdin.on("data",(c)=>{d+=c});' +
+          'process.stdin.on("end",()=>process.stdout.write(d.toUpperCase()))'
+      ),
+      stdin: "top-secret-canary"
+    };
+
+    const outcome = await nodeProcessRunner.run(invocation);
+
+    expect(outcome.stdout).toBe("TOP-SECRET-CANARY");
+    expect(invocation.argv.join(" ")).not.toContain("top-secret-canary");
+  });
+
+  test("rejects when the program is not installed", async () => {
+    await expect(
+      nodeProcessRunner.run({
+        argv: ["supadrum-no-such-binary"],
+        stdin: "top-secret-canary"
+      })
+    ).rejects.toThrow(/ENOENT/);
+  });
+
+  test("does not read a killed child as a success", async () => {
+    // security and sops are killed rather than exited when a sandbox or an
+    // OOM reaper takes them; a null exit status must not pass for zero.
+    const outcome = await nodeProcessRunner.run({
+      argv: node('process.kill(process.pid,"SIGKILL")')
+    });
+
+    expect(outcome.exitCode).not.toBe(0);
   });
 });
 
