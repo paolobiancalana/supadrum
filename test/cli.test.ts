@@ -62,6 +62,46 @@ const KEYCHAIN_VAULT_COMMAND = [
   "resolve"
 ] as const;
 
+/**
+ * Writes a stand-in for a vault command. The contract it imitates — take a
+ * reference on stdin, print the value on stdout, exit non-zero when the
+ * reference is unknown — belongs to probeConfiguredCredentials: a change
+ * there will not fail these tests, it will quietly make this fake wrong.
+ *
+ * `resolves` lists reference fragments that are answered; omit it to answer
+ * everything. `databaseValue` is what a database_access reference yields,
+ * which is how a test makes credentials resolve but fail validation.
+ */
+function fakeVault(
+  root: string,
+  options: {
+    readonly resolves?: readonly string[];
+    readonly databaseValue?: string;
+  } = {}
+): readonly string[] {
+  const path = join(root, "resolver.mjs");
+  const databaseValue =
+    options.databaseValue ??
+    "postgresql://postgres:configured@db.example.test/postgres";
+  writeFileSync(
+    path,
+    `let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  const resolves = ${JSON.stringify(options.resolves ?? null)};
+  if (resolves && !resolves.some(part => input.includes(part))) {
+    process.exitCode = 1;
+    process.stdout.write("");
+    return;
+  }
+  process.stdout.write(
+    input.includes("/postgres") ? ${JSON.stringify(databaseValue)} : "configured"
+  );
+});`
+  );
+  return [process.execPath, path];
+}
+
 /** An operator root: somewhere to put a config, and repositories to point at. */
 function workspace(prefix: string) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -111,6 +151,9 @@ function credentialConfig(
 function cli(overrides: Partial<CliRuntimeShape> = {}) {
   const out: string[] = [];
   const err: string[] = [];
+  // cwd and home default to the same directory: project discovery searches
+  // both, so a test that moves one and not the other is usually not testing
+  // what it means to. Pass `homeDirectory` explicitly to separate them.
   const root = overrides.cwd ?? mkdtempSync(join(tmpdir(), "supadrum-cli-"));
   return {
     io: {
@@ -135,7 +178,7 @@ function cli(overrides: Partial<CliRuntimeShape> = {}) {
   };
 }
 
-type CliRuntimeShape = Parameters<typeof runCli>[2] & object;
+type CliRuntimeShape = NonNullable<Parameters<typeof runCli>[2]>;
 
 describe("operator CLI", () => {
   // The only test that runs the CLI as a program rather than calling into
@@ -157,27 +200,16 @@ describe("operator CLI", () => {
     const webRepository = join(root, "example-web");
     const iosRepository = join(root, "example-ios");
     const configPath = join(root, "config.yml");
-    const resolver = join(root, "resolver.mjs");
     execFileSync("git", ["init", "--quiet", webRepository]);
     execFileSync("git", ["init", "--quiet", iosRepository]);
-    writeFileSync(
-      resolver,
-      `let input = "";
-process.stdin.on("data", chunk => input += chunk);
-process.stdin.on("end", () => process.stdout.write(
-  input.includes("/postgres")
-    ? "postgresql://postgres:configured@db.example.test/postgres"
-    : "configured"
-));`
-    );
+    const vaultCommand = fakeVault(root);
     writeFileSync(
       configPath,
       `
 version: 1
 database: queue.sqlite
 vault_command:
-  - ${process.execPath}
-  - ${resolver}
+${vaultCommand.map((part) => `  - ${part}`).join("\n")}
 chambers:
   example-platform:
     project_ref: abcdefghijklmnopqrst
@@ -240,26 +272,11 @@ projects:
   });
 
   test("refuses live mode when database access is not a PostgreSQL URI", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-invalid-db-"));
-    const repository = join(root, "example-ios");
-    const resolver = join(root, "resolver.mjs");
-    const configPath = join(root, "config.yml");
-    execFileSync("git", ["init", "--quiet", repository]);
-    writeFileSync(
-      resolver,
-      `let input = "";
-process.stdin.on("data", chunk => input += chunk);
-process.stdin.on("end", () => process.stdout.write(
-  input.includes("/postgres") ? "password-only" : "configured"
-));`
-    );
-    addProject({
-      alias: "example-ios",
-      repository,
-      project_ref: "abcdefghijklmnopqrst",
-      profile: "development",
-      config_path: configPath,
-      vault_command: [process.execPath, resolver]
+    const space = workspace("supadrum-cli-invalid-db-");
+    const { root, configPath } = space;
+    // Resolves, but to a bare password rather than a connection URI.
+    register(space, "example-ios", {
+      vault_command: fakeVault(root, { databaseValue: "password-only" })
     });
 
     await expect(runCli(
@@ -891,13 +908,19 @@ describe("operator CLI: queue commands", () => {
     });
   });
 
-  test("refuses approve and status without a job id", async () => {
+  test("refuses to approve without a job id", async () => {
     const { configPath } = queueConfig();
     const harness = cli();
 
     await expect(
       runCli(["approve", "--config", configPath], harness.io, harness.runtime)
     ).rejects.toThrow("Usage: supadrum approve <job-id>");
+  });
+
+  test("refuses to report status without a job id", async () => {
+    const { configPath } = queueConfig();
+    const harness = cli();
+
     await expect(
       runCli(["status", "--config", configPath], harness.io, harness.runtime)
     ).rejects.toThrow("Usage: supadrum status <job-id>");
@@ -1247,31 +1270,13 @@ describe("operator CLI: input validation and prompting", () => {
 });
 
 describe("operator CLI: chamber adoption during setup", () => {
-  /** A vault that answers for the named chambers only, so a peer can be
-   *  complete while the project under setup is not. */
-  function resolver(root: string, completeChambers: readonly string[]) {
-    const path = join(root, "resolver.mjs");
-    writeFileSync(
-      path,
-      `let input = "";
-process.stdin.on("data", chunk => input += chunk);
-process.stdin.on("end", () => {
-  const complete = ${JSON.stringify(completeChambers)};
-  const known = complete.some(name => input.includes("/" + name + "/"));
-  if (!known) { process.exitCode = 1; process.stdout.write(""); return; }
-  process.stdout.write(
-    input.includes("/postgres")
-      ? "postgresql://postgres:configured@db.example.test/postgres"
-      : "configured"
-  );
-});`
-    );
-    return [process.execPath, path];
-  }
-
   function withPeers(completeChambers: readonly string[]) {
     const space = workspace("supadrum-cli-adopt-");
-    const vaultCommand = resolver(space.root, completeChambers);
+    // Only the named chambers answer, so a peer can be complete while the
+    // project being set up is not.
+    const vaultCommand = fakeVault(space.root, {
+      resolves: completeChambers.map((chamber) => `/${chamber}/`)
+    });
     // All three share one project ref, which is what makes them candidates
     // to share one credential chamber.
     for (const alias of ["target-app", "peer-one", "peer-two"]) {
