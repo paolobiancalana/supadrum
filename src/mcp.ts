@@ -97,11 +97,12 @@ export function createHandlers(
       const deadline = Date.now() + input.timeout_ms;
       do {
         const events = store.events(input.job_id, input.cursor);
-        if (events.length > 0) {
+        const last = events.at(-1);
+        if (last) {
           return {
             job: publicJob(store, input.job_id),
             events,
-            cursor: events.at(-1)?.cursor ?? input.cursor
+            cursor: last.cursor
           };
         }
         if (input.timeout_ms === 0) break;
