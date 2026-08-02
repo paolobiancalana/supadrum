@@ -561,6 +561,10 @@ export async function runVaultCli(
     if (!source || !backupPath) {
       throw new Error("Dotenv migration requires --source and --backup");
     }
+    // Settle the whole command line before bootstrapAgeIdentity, which mints
+    // and stores a key: a migration that can never run must not leave an age
+    // identity behind that no backup was ever encrypted to.
+    const mappings = migrationMappings(args);
     const runner = dependencies.runner ?? nodeProcessRunner;
     const recipient = await bootstrapAgeIdentity(
       dependencies.keychain,
@@ -568,7 +572,7 @@ export async function runVaultCli(
     );
     const report = await migrateDotenv({
       path: source,
-      mappings: migrationMappings(args),
+      mappings,
       vault: dependencies.keychain,
       backup: new SopsAgeBackup(
         backupPath,

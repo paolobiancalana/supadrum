@@ -18,6 +18,8 @@ import {
   bootstrapAgeIdentity,
   nodeProcessRunner,
   runVaultCli,
+  type KeychainBackend,
+  type KeychainImportSource,
   type ProcessInvocation,
   type ProcessOutcome,
   type ProcessRunner,
@@ -52,6 +54,16 @@ class MemoryBackend implements VaultBackend {
 
   async put(reference: string, value: string): Promise<void> {
     this.values.set(reference, value);
+  }
+}
+
+class ImportingBackend extends MemoryBackend implements KeychainBackend {
+  readonly imports: KeychainImportSource[] = [];
+
+  async import(vaultReference: string, source: KeychainImportSource) {
+    this.imports.push(source);
+    this.values.set(vaultReference, "imported-secret");
+    return { reference: vaultReference, verified: true as const };
   }
 }
 
@@ -380,6 +392,91 @@ describe("vault operator CLI", () => {
       `${JSON.stringify({ reference, verified: true })}\n`
     ]);
     expect(streams.stdout.join("")).not.toContain("top-secret-canary");
+  });
+
+  test("does not report a put that the vault did not honour", async () => {
+    class DriftingBackend extends MemoryBackend {
+      override async put(vaultReference: string): Promise<void> {
+        this.values.set(vaultReference, "some-other-value");
+      }
+    }
+    const streams = io("top-secret-canary\n");
+
+    await expect(
+      runVaultCli(["keychain", "put", reference], streams.io, {
+        keychain: new DriftingBackend()
+      })
+    ).rejects.toThrow("Keychain put round-trip mismatch");
+    expect(streams.stdout).toEqual([]);
+  });
+
+  test("imports an existing item and reports only where it landed", async () => {
+    const keychain = new ImportingBackend();
+    const streams = io("");
+
+    await expect(
+      runVaultCli(
+        ["keychain", "import", reference, "--service", "supabase-pat", "--account", "operator"],
+        streams.io,
+        { keychain }
+      )
+    ).resolves.toBe(0);
+
+    expect(keychain.imports).toEqual([
+      { service: "supabase-pat", account: "operator" }
+    ]);
+    expect(JSON.parse(streams.stdout.join(""))).toEqual({
+      reference,
+      verified: true
+    });
+  });
+
+  test("says so when the configured backend has nothing to import from", async () => {
+    const streams = io("");
+
+    await expect(
+      runVaultCli(
+        ["keychain", "import", reference, "--service", "supabase-pat", "--account", "operator"],
+        streams.io,
+        { keychain: new MemoryBackend() }
+      )
+    ).rejects.toThrow("Configured backend cannot import Keychain items");
+  });
+
+  test.each([
+    { case: "put without a reference", argv: ["keychain", "put"] },
+    {
+      case: "import without a service",
+      argv: ["keychain", "import", reference, "--account", "operator"]
+    },
+    {
+      case: "import without a reference",
+      argv: ["keychain", "import", "--service", "supabase-pat"]
+    }
+  ])("refuses $case rather than acting on a flag", async ({ argv }) => {
+    const keychain = new ImportingBackend();
+
+    await expect(
+      runVaultCli(argv, io("top-secret-canary\n").io, { keychain })
+    ).rejects.toThrow(/requires/);
+    expect(keychain.values.size).toBe(0);
+    expect(keychain.imports).toEqual([]);
+  });
+
+  test.each([
+    { case: "nothing at all", argv: [] },
+    { case: "an unknown group", argv: ["vault"] },
+    { case: "an unknown keychain command", argv: ["keychain", "rotate"] },
+    { case: "an unknown sops command", argv: ["sops", "rotate"] },
+    { case: "an unknown migration source", argv: ["migrate", "json"] }
+  ])("prints usage on stderr and fails for $case", async ({ argv }) => {
+    const streams = io("");
+
+    await expect(
+      runVaultCli(argv, streams.io, { keychain: new MemoryBackend() })
+    ).resolves.toBe(1);
+    expect(streams.stdout).toEqual([]);
+    expect(streams.stderr.join("")).toContain("Usage: supadrum-vault");
   });
 });
 
@@ -947,5 +1044,77 @@ describe("dotenv migration CLI", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  test.each([
+    { case: "a mapping with no reference", map: "DATABASE_URL" },
+    { case: "a mapping whose name is not an environment variable", map: "9=vault://legacy/app/db" },
+    { case: "a mapping with an empty reference", map: "DATABASE_URL=" },
+    { case: "a reference that is not a vault reference", map: "DATABASE_URL=/etc/passwd" }
+  ])("rejects $case before touching the vault", async ({ map }) => {
+    const keychain = new EmptyBackend();
+    const runner = new RecordingRunner();
+
+    await expect(
+      runVaultCli(
+        ["migrate", "dotenv", "--source", "/nonexistent/.env", "--backup", "/nonexistent/out.json", "--map", map],
+        io("").io,
+        { keychain, runner }
+      )
+    ).rejects.toThrow();
+    // An unusable command line must not leave a freshly minted age identity
+    // behind: the operator would then hold a key no backup was encrypted to.
+    expect(keychain.values.size).toBe(0);
+    expect(runner.invocations).toEqual([]);
+  });
+
+  test("rejects the same name mapped twice", async () => {
+    const keychain = new EmptyBackend();
+    const runner = new RecordingRunner();
+
+    await expect(
+      runVaultCli(
+        [
+          "migrate",
+          "dotenv",
+          "--source",
+          "/nonexistent/.env",
+          "--backup",
+          "/nonexistent/out.json",
+          "--map",
+          "DATABASE_URL=vault://legacy/app/db",
+          "--map",
+          "DATABASE_URL=vault://legacy/app/other"
+        ],
+        io("").io,
+        { keychain, runner }
+      )
+    ).rejects.toThrow("Duplicate migration mapping: DATABASE_URL");
+    expect(keychain.values.size).toBe(0);
+  });
+
+  test("rejects a migration that maps nothing", async () => {
+    const keychain = new EmptyBackend();
+
+    await expect(
+      runVaultCli(
+        ["migrate", "dotenv", "--source", "/nonexistent/.env", "--backup", "/nonexistent/out.json"],
+        io("").io,
+        { keychain, runner: new RecordingRunner() }
+      )
+    ).rejects.toThrow("Dotenv migration requires at least one --map");
+    expect(keychain.values.size).toBe(0);
+  });
+
+  test.each([
+    { case: "no source", argv: ["migrate", "dotenv", "--backup", "/out.json"] },
+    { case: "no backup", argv: ["migrate", "dotenv", "--source", "/.env"] }
+  ])("refuses a migration with $case", async ({ argv }) => {
+    await expect(
+      runVaultCli(argv, io("").io, {
+        keychain: new EmptyBackend(),
+        runner: new RecordingRunner()
+      })
+    ).rejects.toThrow("Dotenv migration requires --source and --backup");
   });
 });
