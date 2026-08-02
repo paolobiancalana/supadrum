@@ -476,6 +476,25 @@ describe("session leases", () => {
     expect(error.retryable).toBe(true);
   });
 
+  test("says a lease is not ready before it says what it does not grant", () => {
+    const { store } = createStore();
+    const session = openMigrationSession(store);
+
+    const error = expectCode(
+      () =>
+        store.submitSessionJob(session.id, {
+          operation: "sql.execute",
+          payload: { statement_name: "health" },
+          idempotency_key: "example-web:session:sql"
+        }),
+      "session_not_active"
+    );
+
+    // Answering capability_denied here would be non-retryable, and would
+    // send an agent away from a lease that was only waiting to be granted.
+    expect(error.retryable).toBe(true);
+  });
+
   test("cancels the open job when a lease is closed before it starts", () => {
     const { store } = createStore();
     const session = openMigrationSession(store);
