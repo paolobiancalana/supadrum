@@ -165,7 +165,10 @@ function option(args: readonly string[], name: string): string | undefined {
 }
 
 function requireArgument(value: string | undefined, usage: string): string {
-  if (!value) throw new Error(`Usage: ${usage}`);
+  // A missing positional otherwise swallows the flag that followed it, and
+  // the caller is told their job or project does not exist rather than that
+  // they left an argument out.
+  if (!value || value.startsWith("--")) throw new Error(`Usage: ${usage}`);
   return value;
 }
 
