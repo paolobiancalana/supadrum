@@ -101,6 +101,9 @@ function io(stdin: string) {
 
 const reference = "vault://supabase/example-web/management";
 
+/** Paths for commands that must fail before any file is opened. */
+const unreachablePath = "/supadrum-test/never-opened";
+
 function keychainItem(value: string): string {
   return `supadrum:v1:${Buffer.from(value, "utf8").toString("base64")}`;
 }
@@ -456,7 +459,7 @@ describe("vault operator CLI", () => {
     });
   });
 
-  test("says so when the configured backend has nothing to import from", async () => {
+  test("refuses to import through a backend that cannot import", async () => {
     const streams = io("");
 
     await expect(
@@ -511,7 +514,7 @@ describe("vault operator CLI", () => {
   });
 });
 
-describe("SOPS age backend", () => {
+describe("age-encrypted vault", () => {
   test("names the Keychain item the operator's identity already lives in", () => {
     // Changing this string orphans every age identity stored under the old
     // one, and with it every backup encrypted to that identity.
@@ -1095,7 +1098,7 @@ describe("dotenv migration CLI", () => {
 
     await expect(
       runVaultCli(
-        ["migrate", "dotenv", "--source", "/nonexistent/.env", "--backup", "/nonexistent/out.json", "--map", map],
+        ["migrate", "dotenv", "--source", `${unreachablePath}/.env`, "--backup", `${unreachablePath}/out.json`, "--map", map],
         io("").io,
         { keychain, runner }
       )
@@ -1116,9 +1119,9 @@ describe("dotenv migration CLI", () => {
           "migrate",
           "dotenv",
           "--source",
-          "/nonexistent/.env",
+          `${unreachablePath}/.env`,
           "--backup",
-          "/nonexistent/out.json",
+          `${unreachablePath}/out.json`,
           "--map",
           "DATABASE_URL=vault://legacy/app/db",
           "--map",
@@ -1129,19 +1132,22 @@ describe("dotenv migration CLI", () => {
       )
     ).rejects.toThrow("Duplicate migration mapping: DATABASE_URL");
     expect(keychain.values.size).toBe(0);
+    expect(runner.invocations).toEqual([]);
   });
 
   test("rejects a migration that maps nothing", async () => {
     const keychain = new EmptyBackend();
+    const runner = new RecordingRunner();
 
     await expect(
       runVaultCli(
-        ["migrate", "dotenv", "--source", "/nonexistent/.env", "--backup", "/nonexistent/out.json"],
+        ["migrate", "dotenv", "--source", `${unreachablePath}/.env`, "--backup", `${unreachablePath}/out.json`],
         io("").io,
-        { keychain, runner: new RecordingRunner() }
+        { keychain, runner }
       )
     ).rejects.toThrow("Dotenv migration requires at least one --map");
     expect(keychain.values.size).toBe(0);
+    expect(runner.invocations).toEqual([]);
   });
 
   test.each([
