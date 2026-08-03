@@ -464,6 +464,16 @@ export class LiveSupabaseExecutor implements Executor {
       );
     }
 
+    const databaseCredentials =
+      job.operation === "schema.inspect" ||
+      job.operation === "sql.execute" ||
+      (project.migration_driver === "prisma" &&
+        (job.operation === "migration.plan" ||
+          job.operation === "migration.baseline" ||
+          job.operation === "migration.apply"))
+        ? await this.#routeDirectDatabase(project, credentials)
+        : credentials;
+
     switch (job.operation) {
       case "project.inspect":
         return this.#managementRequest(
@@ -474,7 +484,7 @@ export class LiveSupabaseExecutor implements Executor {
         );
       case "migration.plan":
         return project.migration_driver === "prisma"
-          ? this.#runPrisma("plan", repository, credentials)
+          ? this.#runPrisma("plan", repository, databaseCredentials)
           : this.#runSupabase(
               ["db", "push", "--dry-run", "--linked"],
               repository,
@@ -484,12 +494,12 @@ export class LiveSupabaseExecutor implements Executor {
         return this.#baselinePrisma(
           job,
           project,
-          credentials,
+          databaseCredentials,
           repositoryOid
         );
       case "migration.apply":
         return project.migration_driver === "prisma"
-          ? this.#runPrisma("apply", repository, credentials)
+          ? this.#runPrisma("apply", repository, databaseCredentials)
           : this.#runSupabase(
               ["db", "push", "--linked", "--yes"],
               repository,
@@ -519,15 +529,52 @@ export class LiveSupabaseExecutor implements Executor {
         return this.#inspectSchema(
           job,
           project,
-          credentials
+          databaseCredentials
         );
       case "sql.execute":
-        return this.#executeSql(job, project, credentials);
+        return this.#executeSql(job, project, databaseCredentials);
       case "session.open":
         throw new Error("Session opening is handled by the runner");
       default:
         throw new Error(`No live adapter for ${job.operation}`);
     }
+  }
+
+  async #routeDirectDatabase(
+    project: ProjectConfig,
+    credentials: ResolvedCredentials
+  ): Promise<ResolvedCredentials> {
+    const database = new URL(credentials.database_access);
+    if (
+      database.hostname !==
+      `db.${project.project_ref}.supabase.co`
+    ) {
+      return credentials;
+    }
+    const inspected = await this.#managementRequest(
+      "GET",
+      `/v1/projects/${project.project_ref}`,
+      undefined,
+      credentials
+    );
+    const output = inspected.output;
+    if (
+      output === null ||
+      typeof output !== "object" ||
+      Array.isArray(output) ||
+      !("region" in output) ||
+      typeof output.region !== "string" ||
+      !/^[a-z0-9-]+$/.test(output.region)
+    ) {
+      throw new Error("Project inspection returned no valid region");
+    }
+    database.hostname = `aws-0-${output.region}.pooler.supabase.com`;
+    database.port = "5432";
+    database.username = `postgres.${project.project_ref}`;
+    return {
+      ...credentials,
+      database_access: database.toString()
+    };
   }
 
   async #verifyRepository(

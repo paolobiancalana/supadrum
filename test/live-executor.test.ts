@@ -1104,6 +1104,44 @@ describe("live Supabase executor", () => {
     expect(command?.argv.join(" ")).not.toContain("db-canary");
   });
 
+  test("routes a direct IPv6 database URI through the project session pooler", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-live-sql-"));
+    const sqlDirectory = join(repository, "supabase", "queries");
+    mkdirSync(sqlDirectory, { recursive: true });
+    const sqlPath = join(sqlDirectory, "inspect.sql");
+    const sql = "select 1;\n";
+    writeFileSync(sqlPath, sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+    const project = liveProject(repository);
+    const directCredentials = {
+      ...credentials,
+      database_access:
+        `postgresql://postgres:db-canary@db.${project.project_ref}.supabase.co:5432/postgres`
+    };
+    const process = new RecordingProcess();
+    const fetcher: typeof fetch = async () =>
+      new Response(JSON.stringify({ region: "eu-west-1" }), {
+        status: 200
+      });
+    const executor = new LiveSupabaseExecutor({ process, fetch: fetcher });
+
+    await executor.execute(
+      runningJob("sql.execute", {
+        path: "supabase/queries/inspect.sql",
+        digest
+      }),
+      project,
+      directCredentials
+    );
+
+    expect(process.calls[1]?.env).toMatchObject({
+      PGHOST: "aws-0-eu-west-1.pooler.supabase.com",
+      PGPORT: "5432",
+      PGUSER: `postgres.${project.project_ref}`,
+      PGPASSWORD: "db-canary"
+    });
+  });
+
   test("executes generic schema checks through static read-only psql programs", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-live-schema-"));
     const process = new SchemaInspectionProcess();
