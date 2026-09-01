@@ -456,6 +456,9 @@ export class LiveSupabaseExecutor implements Executor {
           repositoryOid
         );
       }
+      if (job.operation === "sql.execute") {
+        return this.#executeLocalSql(job, repository, repositoryOid);
+      }
       return this.#executeLocalMigration(
         job,
         project,
@@ -614,35 +617,27 @@ export class LiveSupabaseExecutor implements Executor {
     if (args.includes("--linked") || args.includes("--db-url")) {
       throw new Error("Local chamber command contains a remote target flag");
     }
-    let result =
-      job.operation === "migration.plan" && snapRunner
-        ? await this.#runCommand(
-            [snapRunner.executable, "migrate", "--dry-run"],
-            snapRunner.workingDirectory,
-            this.#localEnvironment({
-              NO_COLOR: "1",
-              DATABASE_URL: database.url
-            }),
-            [database.url, database.password]
-          )
-        : await this.#runCommand(
-            [this.#executables.supabase, ...args],
-            repository,
-            this.#localEnvironment({ NO_COLOR: "1" }),
-            []
-          );
-    if (job.operation === "migration.apply") {
-      if (snapRunner) {
-        result = await this.#runCommand(
-          [snapRunner.executable, "migrate"],
+    const result = snapRunner
+      ? await this.#runCommand(
+          [
+            snapRunner.executable,
+            "migrate",
+            ...(job.operation === "migration.plan" ? ["--dry-run"] : [])
+          ],
           snapRunner.workingDirectory,
           this.#localEnvironment({
             NO_COLOR: "1",
             DATABASE_URL: database.url
           }),
           [database.url, database.password]
+        )
+      : await this.#runCommand(
+          [this.#executables.supabase, ...args],
+          repository,
+          this.#localEnvironment({ NO_COLOR: "1" }),
+          []
         );
-      }
+    if (job.operation === "migration.apply") {
       await this.#assertLocalStack(repository);
     }
     return {
@@ -656,6 +651,58 @@ export class LiveSupabaseExecutor implements Executor {
         ...(job.operation === "migration.apply"
           ? { local_postflight: true }
           : {})
+      }
+    };
+  }
+
+  /**
+   * Runs a repository SQL file against the local Supabase stack.
+   *
+   * The local stack has no stored credential — the connection comes from the
+   * running containers — so there is nothing to resolve and nothing to redact
+   * beyond the ephemeral local password. Same file contract as the remote
+   * executor (inside the repo, digest verified): the difference is only where
+   * it runs.
+   */
+  async #executeLocalSql(
+    job: Job,
+    repository: string,
+    repositoryOid: string
+  ): Promise<ExecutionResult> {
+    const absolutePath = this.#resolveSqlFile(job, repository);
+    const database = await this.#assertLocalStack(repository);
+    const result = await this.#process.run({
+      argv: [
+        this.#executables.psql,
+        "--set",
+        "ON_ERROR_STOP=1",
+        "--file",
+        absolutePath
+      ],
+      cwd: repository,
+      env: this.#localEnvironment({
+        PGHOST: database.host,
+        PGPORT: database.port,
+        PGDATABASE: database.database,
+        PGUSER: database.user,
+        PGPASSWORD: database.password,
+        PGSSLMODE: "disable"
+      })
+    });
+    const stdout = redact(result.stdout, [database.url, database.password]);
+    const stderr = redact(result.stderr, [database.url, database.password]);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+      );
+    }
+    return {
+      output: { exit_code: result.exitCode, stdout, stderr },
+      verification: {
+        repo_sha_verified: true,
+        repository_oid: repositoryOid,
+        target: "local",
+        local_preflight: true
       }
     };
   }
@@ -1145,12 +1192,13 @@ export class LiveSupabaseExecutor implements Executor {
     };
   }
 
-  async #executeSql(
-    job: Job,
-    project: ProjectConfig,
-    credentials: ResolvedCredentials
-  ): Promise<ExecutionResult> {
-    const repository = project.repo as string;
+  /**
+   * Resolves the SQL file a job points at, refusing anything outside the
+   * repository or whose content does not match the announced digest. Shared by
+   * the remote and local executors so both enforce the same contract: what runs
+   * is exactly what the caller hashed, and it lives in the repo.
+   */
+  #resolveSqlFile(job: Job, repository: string): string {
     const requestedPath = requiredString(job.payload, "path");
     const digest = requiredString(job.payload, "digest");
     const absolutePath = resolve(repository, requestedPath);
@@ -1173,6 +1221,16 @@ export class LiveSupabaseExecutor implements Executor {
         `SQL file digest mismatch: expected ${digest}, got ${actualDigest}`
       );
     }
+    return absolutePath;
+  }
+
+  async #executeSql(
+    job: Job,
+    project: ProjectConfig,
+    credentials: ResolvedCredentials
+  ): Promise<ExecutionResult> {
+    const repository = project.repo as string;
+    const absolutePath = this.#resolveSqlFile(job, repository);
     const database = databaseParts(credentials.database_access);
     return this.#runCommand(
       [

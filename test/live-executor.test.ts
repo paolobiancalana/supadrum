@@ -510,6 +510,78 @@ describe("live Supabase executor", () => {
     });
   });
 
+  test("runs a repository SQL file against the local stack, never a stored credential", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-sql-"));
+    const sql = "select 1;\n";
+    writeFileSync(join(repository, "probe.sql"), sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    const result = await executor.execute(
+      runningJob("sql.execute", { path: "probe.sql", digest, read_only: true }),
+      localProject(repository),
+      credentials
+    );
+
+    const psql = process.calls.find((call) => call.argv[0] === "psql");
+    expect(psql?.argv).toEqual([
+      "psql",
+      "--set",
+      "ON_ERROR_STOP=1",
+      "--file",
+      join(repository, "probe.sql")
+    ]);
+    // The connection comes from the running containers, not from the vault:
+    // a local stack has no stored credential to resolve.
+    expect(psql?.env.PGHOST).toBe("127.0.0.1");
+    expect(psql?.env.PGPORT).toBe("54322");
+    expect(psql?.env.PGSSLMODE).toBe("disable");
+    expect(psql?.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    expect(result.verification).toMatchObject({
+      repo_sha_verified: true,
+      target: "local",
+      local_preflight: true
+    });
+  });
+
+  test("refuses a local SQL file whose content does not match the announced digest", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-sql-digest-"));
+    writeFileSync(join(repository, "probe.sql"), "delete from users;\n");
+    const executor = new LiveSupabaseExecutor({
+      process: new LocalRecordingProcess()
+    });
+
+    await expect(
+      executor.execute(
+        runningJob("sql.execute", {
+          path: "probe.sql",
+          digest: createHash("sha256").update("select 1;\n").digest("hex")
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/digest mismatch/);
+  });
+
+  test("refuses a local SQL file that lives outside the repository", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-sql-escape-"));
+    const executor = new LiveSupabaseExecutor({
+      process: new LocalRecordingProcess()
+    });
+
+    await expect(
+      executor.execute(
+        runningJob("sql.execute", {
+          path: "../fuori.sql",
+          digest: "0".repeat(64)
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/inside the project repository/);
+  });
+
   test("resets one SNAP password locally without persisting plaintext in the job", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-auth-"));
     const process = new LocalRecordingProcess();
@@ -729,7 +801,7 @@ describe("live Supabase executor", () => {
     });
   });
 
-  test("resets locally then applies framework and app migrations through SNAP", async () => {
+  test("applies SNAP migrations incrementally without resetting the local database", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-apply-"));
     const api = join(repository, "api");
     const snap = join(api, "node_modules", ".bin", "snap");
@@ -751,11 +823,10 @@ describe("live Supabase executor", () => {
     expect(process.calls.map((call) => call.argv)).toEqual([
       ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
       ["supabase", "status", "--output", "json"],
-      ["supabase", "db", "reset", "--local", "--no-seed"],
       [snap, "migrate"],
       ["supabase", "status", "--output", "json"]
     ]);
-    expect(process.calls[3]).toMatchObject({
+    expect(process.calls[2]).toMatchObject({
       cwd: api,
       env: {
         DATABASE_URL:

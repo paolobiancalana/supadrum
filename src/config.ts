@@ -6,6 +6,22 @@ import { z } from "zod";
 import { CapabilitySchema, OperationSchema } from "./domain.js";
 import { BrokerError } from "./errors.js";
 
+/**
+ * Capabilities a local chamber may declare. `sql` is here because a local
+ * Supabase stack is the one place a developer legitimately reads and writes
+ * freely; without it every local inspection has to go around the broker, which
+ * is worse than allowing it through the broker's own audited path.
+ * Deliberately excluded: anything that needs a stored credential (data-api,
+ * storage, edge-functions, secrets, project-management) — a local stack has
+ * none to resolve.
+ */
+const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
+  "migrations",
+  "auth-admin",
+  "sql",
+  "schema-inspection"
+]);
+
 const VaultReferenceSchema = z
   .string()
   .regex(/^vault:\/\/[^\s]+$/, "Expected a vault:// reference");
@@ -230,13 +246,12 @@ export function loadConfig(path: string): SupadrumConfig {
     if (
       chamber.target === "local" &&
       (input.capabilities.some(
-        (capability) =>
-          capability !== "migrations" && capability !== "auth-admin"
+        (capability) => !LOCAL_CAPABILITIES.has(capability)
       ) ||
         input.migration_driver !== "supabase")
     ) {
       throw new Error(
-        `Local chamber ${chamberName} supports only the migrations and auth-admin capabilities with the supabase driver`
+        `Local chamber ${chamberName} supports only the ${[...LOCAL_CAPABILITIES].join(", ")} capabilities with the supabase driver`
       );
     }
   }
