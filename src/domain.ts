@@ -8,6 +8,7 @@ import {
 } from "./catalog.js";
 import { MigrationBaselinePayloadSchema } from "./prisma-baseline.js";
 import { SchemaInspectionPayloadSchema } from "./schema-inspection.js";
+import { TypesGeneratePayloadSchema } from "./types-generate.js";
 
 export const jobStatusNames = [
   "queued",
@@ -95,7 +96,9 @@ export const JobSubmissionSchema = z
         ? SchemaInspectionPayloadSchema
         : submission.operation === "migration.baseline"
           ? MigrationBaselinePayloadSchema
-          : null;
+          : submission.operation === "types.generate"
+            ? TypesGeneratePayloadSchema
+            : null;
     if (!schema) return;
     const parsed = schema.safeParse(submission.payload);
     if (parsed.success) return;

@@ -654,3 +654,27 @@ describe("job boundary", () => {
     ).toThrow(/credential material/i);
   });
 });
+
+describe("types.generate payload", () => {
+  const submission = (payload: Record<string, unknown>) => ({
+    project: "example-web",
+    operation: "types.generate",
+    payload,
+    repo_sha: "abc123",
+    idempotency_key: "example-web:abc123:types"
+  });
+
+  test("defaults the schema to public and keeps the output path", () => {
+    expect(
+      JobSubmissionSchema.parse(submission({ output: "src/types/db.ts" }))
+    ).toMatchObject({ payload: { output: "src/types/db.ts" } });
+  });
+
+  test.each([
+    ["missing output", {}],
+    ["empty output", { output: "" }],
+    ["schema that is not an identifier", { output: "t.ts", schema: "public; drop" }]
+  ])("rejects a payload with %s", (_label, payload) => {
+    expect(JobSubmissionSchema.safeParse(submission(payload)).success).toBe(false);
+  });
+});
