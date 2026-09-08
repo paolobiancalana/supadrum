@@ -26,7 +26,8 @@ export const operationNames = [
   "migration.apply",
   "schema.inspect",
   "sql.execute",
-  "project.manage"
+  "project.manage",
+  "types.generate"
 ] as const;
 
 export type Operation = (typeof operationNames)[number];
@@ -55,5 +56,6 @@ export const operationCatalog = {
     approval: false
   },
   "sql.execute": { capability: "sql", approval: true },
-  "project.manage": { capability: "project-management", approval: true }
+  "project.manage": { capability: "project-management", approval: true },
+  "types.generate": { capability: "schema-inspection", approval: false }
 } as const satisfies Record<Operation, OperationDefinition>;

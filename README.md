@@ -293,6 +293,23 @@ code asks the caller to do something different: `unknown_project`,
 — it means Supadrum rejected its own state transition, and retrying will not
 help. A failure with no code at all is a crash, not a protocol answer.
 
+### Generated types
+
+`types.generate` writes the TypeScript types of one schema into a file inside
+the project repository, through the Supabase CLI and the management token the
+runner already holds. Same `schema-inspection` capability, no approval; the
+generated text stays on disk — the result carries only its path, digest and
+size. Local chambers generate from the running stack after the loopback
+preflight.
+
+```json
+{
+  "project": "example-web",
+  "operation": "types.generate",
+  "payload": { "output": "src/types/supabase.ts", "schema": "public" }
+}
+```
+
 ### Read-only schema contracts
 
 `schema.inspect` lets an agent verify exact database requirements without

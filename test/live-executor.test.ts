@@ -3,6 +3,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -140,6 +141,26 @@ class LocalRecordingProcess implements LiveProcess {
       };
     }
     return { exitCode: 0, stdout: "ok", stderr: "" };
+  }
+}
+
+class TypesProcess implements LiveProcess {
+  readonly calls: LiveProcessInput[] = [];
+
+  async run(input: LiveProcessInput) {
+    this.calls.push(input);
+    if (input.argv[0] === "git") {
+      return {
+        exitCode: 0,
+        stdout: `${FULL_REPOSITORY_OID}\n${FULL_REPOSITORY_OID}\n`,
+        stderr: ""
+      };
+    }
+    return {
+      exitCode: 0,
+      stdout: "export type Database = { public: { Tables: {} } };\n",
+      stderr: ""
+    };
   }
 }
 
@@ -481,6 +502,80 @@ describe("live Supabase executor", () => {
     );
   });
 
+  test("generates types into the repository with the token in the environment only", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const process = new TypesProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    const result = await executor.execute(
+      runningJob("types.generate", { output: "src/types/db.ts" }),
+      liveProject(repository),
+      credentials
+    );
+
+    const command = process.calls[1];
+    expect(command?.argv).toEqual([
+      "supabase",
+      "gen",
+      "types",
+      "typescript",
+      "--schema",
+      "public",
+      "--project-id",
+      "abcdefghijklmnopqrst"
+    ]);
+    expect(command?.env.SUPABASE_ACCESS_TOKEN).toBe("management-canary");
+    expect(command?.argv.join(" ")).not.toMatch(/management-canary/);
+    const written = readFileSync(join(repository, "src/types/db.ts"), "utf8");
+    expect(written).toContain("export type Database");
+    expect(result).toMatchObject({
+      output: { exit_code: 0, stdout: "" },
+      verification: {
+        repo_sha_verified: true,
+        output: join("src", "types", "db.ts"),
+        bytes: Buffer.byteLength(written),
+        digest: createHash("sha256").update(written).digest("hex")
+      }
+    });
+    expect(JSON.stringify(result)).not.toMatch(/management-canary|Database/);
+  });
+
+  test("refuses a types output path outside the repository", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const executor = new LiveSupabaseExecutor({ process: new TypesProcess() });
+
+    await expect(
+      executor.execute(
+        runningJob("types.generate", { output: "../escaped.ts" }),
+        liveProject(repository),
+        credentials
+      )
+    ).rejects.toThrow("Types output file must be inside the project repository");
+  });
+
+  test("generates types from a local chamber after the loopback preflight", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-types-local-"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    const result = await executor.execute(
+      runningJob("types.generate", { output: "types.ts", schema: "app" }),
+      localProject(repository),
+      credentials
+    );
+
+    expect(process.calls.map((call) => call.argv)).toEqual([
+      ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
+      ["supabase", "status", "--output", "json"],
+      ["supabase", "gen", "types", "typescript", "--schema", "app", "--local"]
+    ]);
+    expect(process.calls[2]?.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    expect(readFileSync(join(repository, "types.ts"), "utf8")).toBe("ok");
+    expect(result).toMatchObject({
+      verification: { target: "local", local_preflight: true, bytes: 2 }
+    });
+  });
+
   test("plans a local chamber only after a loopback preflight", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-"));
     const process = new LocalRecordingProcess();
@@ -734,7 +829,12 @@ describe("live Supabase executor", () => {
     expect(process.calls).toHaveLength(1);
   });
 
-  test("resets a local chamber with preflight and postflight checks", async () => {
+  test("applies to a local chamber without ever resetting it", async () => {
+    // A payload without `migration_runner` is the plain "apply the pending
+    // migrations" call, and it used to run `db reset --no-seed`. Against a
+    // repository whose CLI migrations are disabled that rebuilt an EMPTY
+    // database and wiped a shared local chamber. Apply advances a database;
+    // rebuilding one is a different operation with a different name.
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-"));
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
@@ -748,9 +848,12 @@ describe("live Supabase executor", () => {
     expect(process.calls.map((call) => call.argv)).toEqual([
       ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
       ["supabase", "status", "--output", "json"],
-      ["supabase", "db", "reset", "--local", "--no-seed"],
+      ["supabase", "db", "push", "--local"],
       ["supabase", "status", "--output", "json"]
     ]);
+    expect(
+      process.calls.some((call) => call.argv.includes("reset"))
+    ).toBe(false);
     expect(result.verification).toMatchObject({
       repo_sha_verified: true,
       target: "local",

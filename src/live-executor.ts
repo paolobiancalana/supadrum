@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
-  readFileSync
+  mkdirSync,
+  readFileSync,
+  writeFileSync
 } from "node:fs";
 import {
   delimiter,
@@ -28,6 +30,7 @@ import {
   parseSchemaInspectionPayload,
   schemaInspectionPsqlInput
 } from "./schema-inspection.js";
+import { parseTypesGeneratePayload } from "./types-generate.js";
 import {
   analyzeMigrationHistory,
   parseMigrationBaselinePayload,
@@ -459,6 +462,9 @@ export class LiveSupabaseExecutor implements Executor {
       if (job.operation === "sql.execute") {
         return this.#executeLocalSql(job, repository, repositoryOid);
       }
+      if (job.operation === "types.generate") {
+        return this.#generateTypes(job, project, repository, repositoryOid, null);
+      }
       return this.#executeLocalMigration(
         job,
         project,
@@ -493,6 +499,14 @@ export class LiveSupabaseExecutor implements Executor {
               repository,
               credentials
             );
+      case "types.generate":
+        return this.#generateTypes(
+          job,
+          project,
+          repository,
+          repositoryOid,
+          credentials
+        );
       case "migration.baseline":
         return this.#baselinePrisma(
           job,
@@ -660,9 +674,17 @@ export class LiveSupabaseExecutor implements Executor {
     const args =
       job.operation === "migration.plan"
         ? ["db", "push", "--dry-run", "--local"]
-        : ["db", "reset", "--local", "--no-seed"];
+        : ["db", "push", "--local"];
     if (args.includes("--linked") || args.includes("--db-url")) {
       throw new Error("Local chamber command contains a remote target flag");
+    }
+    // `migration.apply` used to fall back to `db reset --no-seed`, which drops
+    // the schema instead of applying anything. On a repository whose CLI
+    // migrations are disabled (the schema is applied by another runner) that
+    // reset rebuilt an EMPTY database and destroyed a shared local chamber.
+    // Apply advances a database; it never rebuilds one.
+    if (args.includes("reset")) {
+      throw new Error("Local chamber command must not reset the database");
     }
     const result = snapRunner
       ? await this.#runCommand(
@@ -1248,17 +1270,7 @@ export class LiveSupabaseExecutor implements Executor {
   #resolveSqlFile(job: Job, repository: string): string {
     const requestedPath = requiredString(job.payload, "path");
     const digest = requiredString(job.payload, "digest");
-    const absolutePath = resolve(repository, requestedPath);
-    const relativePath = relative(resolve(repository), absolutePath);
-    if (
-      isAbsolute(relativePath) ||
-      relativePath === ".." ||
-      relativePath.startsWith(`..${sep}`)
-    ) {
-      throw new Error(
-        "SQL file must be inside the project repository"
-      );
-    }
+    const absolutePath = this.#repositoryPath(repository, requestedPath, "SQL file");
     const source = readFileSync(absolutePath);
     const actualDigest = createHash("sha256")
       .update(source)
@@ -1269,6 +1281,95 @@ export class LiveSupabaseExecutor implements Executor {
       );
     }
     return absolutePath;
+  }
+
+  /** Resolves a path a job points at, refusing anything outside the repository. */
+  #repositoryPath(repository: string, requested: string, what: string): string {
+    const absolutePath = resolve(repository, requested);
+    const relativePath = relative(resolve(repository), absolutePath);
+    if (
+      isAbsolute(relativePath) ||
+      relativePath === ".." ||
+      relativePath.startsWith(`..${sep}`)
+    ) {
+      throw new Error(`${what} must be inside the project repository`);
+    }
+    return absolutePath;
+  }
+
+  /**
+   * Generates the TypeScript types of one schema with the Supabase CLI and
+   * writes them to a file inside the repository. Remote chambers read the
+   * linked project through the management token; local chambers read the
+   * running stack after the usual loopback preflight. The generated text never
+   * travels in the job result — it can run to hundreds of kilobytes — only its
+   * digest and size do, so the caller can verify what landed on disk.
+   */
+  async #generateTypes(
+    job: Job,
+    project: ProjectConfig,
+    repository: string,
+    repositoryOid: string,
+    credentials: ResolvedCredentials | null
+  ): Promise<ExecutionResult> {
+    const { output, schema } = parseTypesGeneratePayload(job.payload);
+    const absolutePath = this.#repositoryPath(
+      repository,
+      output,
+      "Types output file"
+    );
+    if (credentials && !project.project_ref) {
+      throw new Error(`Project ${job.project} has no project_ref`);
+    }
+    if (!credentials) {
+      await this.#assertLocalStack(repository);
+    }
+    const argv = [
+      this.#executables.supabase,
+      "gen",
+      "types",
+      "typescript",
+      "--schema",
+      schema,
+      ...(credentials
+        ? ["--project-id", project.project_ref as string]
+        : ["--local"])
+    ];
+    const secrets = credentials ? Object.values(credentials) : [];
+    const result = await this.#process.run({
+      argv,
+      cwd: repository,
+      env: credentials
+        ? {
+            ...process.env,
+            NO_COLOR: "1",
+            SUPABASE_ACCESS_TOKEN: credentials.management_token
+          }
+        : this.#localEnvironment({ NO_COLOR: "1" })
+    });
+    const stderr = redact(result.stderr, secrets);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+      );
+    }
+    const generated = redact(result.stdout, secrets);
+    if (!generated.trim()) {
+      throw new Error("Type generation produced no output");
+    }
+    mkdirSync(dirname(absolutePath), { recursive: true });
+    writeFileSync(absolutePath, generated);
+    return {
+      output: { exit_code: 0, stdout: "", stderr },
+      verification: {
+        repo_sha_verified: true,
+        repository_oid: repositoryOid,
+        output: relative(resolve(repository), absolutePath),
+        digest: createHash("sha256").update(generated).digest("hex"),
+        bytes: Buffer.byteLength(generated),
+        ...(credentials ? {} : { target: "local", local_preflight: true })
+      }
+    };
   }
 
   async #executeSql(
