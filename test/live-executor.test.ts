@@ -184,6 +184,32 @@ class RecordingProcess implements LiveProcess {
   }
 }
 
+/** Fails the way the Supabase CLI does: a message on stdout, stderr empty. */
+class SilentFailureProcess implements LiveProcess {
+  readonly calls: LiveProcessInput[] = [];
+
+  async run(input: LiveProcessInput) {
+    this.calls.push(input);
+    if (input.argv[0] === "git") {
+      return {
+        exitCode: 0,
+        stdout: `${FULL_REPOSITORY_OID}\n${FULL_REPOSITORY_OID}\n`,
+        stderr: ""
+      };
+    }
+    return {
+      exitCode: 1,
+      stdout: JSON.stringify({
+        error: {
+          code: "LegacyDbConfigIpv6Error",
+          message: "IPv6 is not supported on your current network"
+        }
+      }),
+      stderr: ""
+    };
+  }
+}
+
 class PendingPrismaProcess implements LiveProcess {
   readonly calls: LiveProcessInput[] = [];
 
@@ -482,7 +508,19 @@ describe("live Supabase executor", () => {
       "abc123^{commit}",
       "HEAD"
     ]);
-    const command = process.calls[1];
+    // The link comes first: `db push --linked` takes no connection string
+    // and reads the CLI's own `.temp` state, which a previous link may have
+    // pinned to the IPv6-only direct host. Relinking targets the session
+    // pooler, which answers on IPv4.
+    const link = process.calls[1];
+    expect(link?.argv).toEqual([
+      "supabase",
+      "link",
+      "--project-ref",
+      "abcdefghijklmnopqrst"
+    ]);
+    expect(link?.argv).not.toContain("--skip-pooler");
+    const command = process.calls[2];
     expect(command?.argv).toEqual([
       "supabase",
       "db",
@@ -490,16 +528,39 @@ describe("live Supabase executor", () => {
       "--dry-run",
       "--linked"
     ]);
-    expect(command?.env.SUPABASE_ACCESS_TOKEN).toBe(
-      "management-canary"
-    );
-    expect(command?.env.SUPABASE_DB_PASSWORD).toBe("db-canary");
-    expect(command?.argv.join(" ")).not.toMatch(
-      /management-canary|db-canary|postgresql:\/\//
-    );
+    for (const call of [link, command]) {
+      expect(call?.env.SUPABASE_ACCESS_TOKEN).toBe(
+        "management-canary"
+      );
+      expect(call?.env.SUPABASE_DB_PASSWORD).toBe("db-canary");
+      // The whole point of relinking instead of passing `--db-url`: a
+      // connection string in argv is readable by any process on the machine.
+      expect(call?.argv.join(" ")).not.toMatch(
+        /management-canary|db-canary|postgresql:\/\//
+      );
+    }
     expect(JSON.stringify(result)).not.toMatch(
       /management-canary|db-canary/
     );
+  });
+
+  test("carries a command failure that spoke only on stdout", async () => {
+    // The CLI reports some failures on stdout and exits 1 with stderr empty.
+    // Reported as `exit code 1: ` it says nothing at all, and the reader is
+    // left guessing at network, credentials or SQL — which is exactly what
+    // happened with LegacyDbConfigIpv6Error.
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-live-"));
+    const executor = new LiveSupabaseExecutor({
+      process: new SilentFailureProcess()
+    });
+
+    await expect(
+      executor.execute(
+        runningJob("migration.apply", {}),
+        liveProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/LegacyDbConfigIpv6Error/);
   });
 
   test("generates types into the repository with the token in the environment only", async () => {

@@ -494,8 +494,9 @@ export class LiveSupabaseExecutor implements Executor {
       case "migration.plan":
         return project.migration_driver === "prisma"
           ? this.#runPrisma("plan", repository, databaseCredentials)
-          : this.#runSupabase(
+          : this.#pushMigrations(
               ["db", "push", "--dry-run", "--linked"],
+              project,
               repository,
               credentials
             );
@@ -517,8 +518,9 @@ export class LiveSupabaseExecutor implements Executor {
       case "migration.apply":
         return project.migration_driver === "prisma"
           ? this.#runPrisma("apply", repository, databaseCredentials)
-          : this.#runSupabase(
+          : this.#pushMigrations(
               ["db", "push", "--linked", "--yes"],
+              project,
               repository,
               credentials
             );
@@ -592,6 +594,42 @@ export class LiveSupabaseExecutor implements Executor {
       ...credentials,
       database_access: database.toString()
     };
+  }
+
+  /**
+   * Pushes repository migrations after refreshing the CLI's own link.
+   *
+   * `db push --linked` does not take a connection string: it reads one from
+   * the CLI's `.temp` state inside the repository, written once by whoever
+   * linked last. A link made on a machine that had IPv6 pins the DIRECT host,
+   * `db.<ref>.supabase.co`, which publishes an AAAA record and nothing else.
+   * From a network without IPv6 every push then dies with
+   * `LegacyDbConfigIpv6Error` before it opens a connection — and the same
+   * repository, on the same commit, works from one network and not from
+   * another. The stored state is the bug; nothing in the job says which host
+   * to use.
+   *
+   * Relinking first is the CLI's own remedy, and its default target is the
+   * session pooler, which answers on IPv4. That is the same session pooler
+   * `#routeDirectDatabase` already sends schema.inspect and sql.execute to:
+   * the migration driver was the one leg left on the direct host.
+   *
+   * `--project-ref` is a public identifier and the connection never becomes a
+   * `--db-url` argument: the password stays in the environment, where `ps`
+   * cannot read it off the command line.
+   */
+  async #pushMigrations(
+    args: readonly string[],
+    project: ProjectConfig,
+    repository: string,
+    credentials: ResolvedCredentials
+  ): Promise<ExecutionResult> {
+    await this.#runSupabase(
+      ["link", "--project-ref", project.project_ref],
+      repository,
+      credentials
+    );
+    return this.#runSupabase(args, repository, credentials);
   }
 
   async #verifyRepository(
@@ -761,8 +799,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, [database.url, database.password]);
     const stderr = redact(result.stderr, [database.url, database.password]);
     if (result.exitCode !== 0) {
+      // Take whichever stream said something. The Supabase CLI reports part
+      // of its failures on stdout — the IPv6 one among them — and a thrown
+      // error whose message is empty costs whoever reads it the entire
+      // diagnosis: the job says only that something exited 1.
+      const detail = stderr.trim() || stdout.trim();
       throw new Error(
-        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+        `Command failed with exit code ${result.exitCode}: ${detail}`
       );
     }
     return {
@@ -809,8 +852,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, [database.url, database.password]);
     const stderr = redact(result.stderr, [database.url, database.password]);
     if (result.exitCode !== 0) {
+      // Take whichever stream said something. The Supabase CLI reports part
+      // of its failures on stdout — the IPv6 one among them — and a thrown
+      // error whose message is empty costs whoever reads it the entire
+      // diagnosis: the job says only that something exited 1.
+      const detail = stderr.trim() || stdout.trim();
       throw new Error(
-        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+        `Command failed with exit code ${result.exitCode}: ${detail}`
       );
     }
     return {
@@ -1349,6 +1397,8 @@ export class LiveSupabaseExecutor implements Executor {
     });
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {
+      // stderr only here: this command's stdout is the generated type file,
+      // not a message, and putting it in an exception explains nothing.
       throw new Error(
         `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
       );
@@ -1496,8 +1546,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, secrets);
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {
+      // Take whichever stream said something. The Supabase CLI reports part
+      // of its failures on stdout — the IPv6 one among them — and a thrown
+      // error whose message is empty costs whoever reads it the entire
+      // diagnosis: the job says only that something exited 1.
+      const detail = stderr.trim() || stdout.trim();
       throw new Error(
-        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+        `Command failed with exit code ${result.exitCode}: ${detail}`
       );
     }
     return stdout;
@@ -1587,8 +1642,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, secrets);
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {
+      // Take whichever stream said something. The Supabase CLI reports part
+      // of its failures on stdout — the IPv6 one among them — and a thrown
+      // error whose message is empty costs whoever reads it the entire
+      // diagnosis: the job says only that something exited 1.
+      const detail = stderr.trim() || stdout.trim();
       throw new Error(
-        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+        `Command failed with exit code ${result.exitCode}: ${detail}`
       );
     }
     return {

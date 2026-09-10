@@ -545,7 +545,13 @@ broker never guesses a tenant.
 `migration_driver` accepts `supabase` or `prisma` and defaults to `supabase`
 for backward compatibility. The Supabase driver plans with
 `supabase db push --dry-run --linked` and applies with
-`supabase db push --linked --yes`. The Prisma driver plans with
+`supabase db push --linked --yes`, each preceded by `supabase link
+--project-ref <ref>`. `--linked` takes no connection string: it reads the
+CLI's own `.temp` state in the repository, and a link made on a machine that
+had IPv6 pins the direct host, which publishes an AAAA record and nothing
+else. Relinking targets the session pooler — the same one the direct database
+route uses — so the push works on a network without IPv6, and the connection
+stays in the environment instead of becoming a `--db-url` argument. The Prisma driver plans with
 `prisma migrate status`, applies versioned production migrations with
 `prisma migrate deploy`, and inspects `public._prisma_migrations`. Prisma is
 resolved from the repository's installed `node_modules/.bin` first, then from
