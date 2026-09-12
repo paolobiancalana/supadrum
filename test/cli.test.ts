@@ -1176,7 +1176,7 @@ describe("operator CLI: input validation and prompting", () => {
         harness.runtime
       )
     ).rejects.toThrow(
-      "Credential must be secret_key, management_token, or database_access"
+      "Credential must be secret_key, management_token, database_access, or deploy_token"
     );
   });
 

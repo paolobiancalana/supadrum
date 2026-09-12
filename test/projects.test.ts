@@ -51,7 +51,9 @@ describe("project discovery", () => {
       repository: realpathSync(repository),
       project_ref: "abcdefghijklmnopqrst",
       repository_source: "sibling",
-      project_ref_source: "supabase/.temp/project-ref"
+      project_ref_source: "supabase/.temp/project-ref",
+      deploy_target: null,
+      deploy_target_source: null
     });
   });
 
@@ -311,7 +313,8 @@ projects:
       config_path: configPath,
       repository: realpathSync(repository),
       project_ref: "abcdefghijklmnopqrst",
-      profile: "development"
+      profile: "development",
+      deploy_target: null
     });
     expect(config.executor).toBe("dry-run");
     expect(config.projects["example-ios"]).toMatchObject({
@@ -458,5 +461,157 @@ describe("project doctor", () => {
       executor: "dry-run"
     });
     expect(JSON.stringify(report)).not.toContain("vault://");
+  });
+});
+
+describe("deploy target discovery", () => {
+  function repositoryWithVercel(
+    entries: ReadonlyArray<{ path: string; body: string }>
+  ): { root: string; cwd: string; repository: string } {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-deploy-"));
+    const cwd = join(root, "supadrum");
+    const repository = join(root, "example-web");
+    mkdirSync(cwd);
+    createGitRepository(repository);
+    for (const entry of entries) {
+      const full = join(repository, entry.path);
+      mkdirSync(join(full, ".."), { recursive: true });
+      writeFileSync(full, entry.body);
+    }
+    return { root, cwd, repository };
+  }
+
+  const linked = (projectId: string, orgId: string): string =>
+    JSON.stringify({ projectId, orgId });
+
+  test("reads the target the Vercel CLI already wrote", () => {
+    const { root, cwd } = repositoryWithVercel([
+      { path: ".vercel/project.json", body: linked("prj_abc", "team_xyz") }
+    ]);
+
+    const discovery = discoverProject({
+      alias: "example-web",
+      cwd,
+      homeDirectory: join(root, "home")
+    });
+
+    // Gli id non sono segreti: stanno in un file che il repository committa.
+    // Chiederli all'operatore sarebbe chiedergli di ripetere cio' che c'e' gia'.
+    expect(discovery.deploy_target).toEqual({
+      provider: "vercel",
+      project_id: "prj_abc",
+      org_id: "team_xyz"
+    });
+    expect(discovery.deploy_target_source).toBe(".vercel/project.json");
+  });
+
+  test("accepts a root and a subdirectory that agree", () => {
+    const { root, cwd } = repositoryWithVercel([
+      { path: ".vercel/project.json", body: linked("prj_abc", "team_xyz") },
+      {
+        path: "frontend/.vercel/project.json",
+        body: linked("prj_abc", "team_xyz")
+      }
+    ]);
+
+    // E' la forma di playbook-x: due file, stesso target. Trattarla come
+    // conflitto bloccherebbe la registrazione di un monorepo normale.
+    expect(
+      discoverProject({
+        alias: "example-web",
+        cwd,
+        homeDirectory: join(root, "home")
+      }).deploy_target
+    ).toEqual({
+      provider: "vercel",
+      project_id: "prj_abc",
+      org_id: "team_xyz"
+    });
+  });
+
+  test("refuses to guess between two different targets", () => {
+    const { root, cwd } = repositoryWithVercel([
+      { path: ".vercel/project.json", body: linked("prj_abc", "team_xyz") },
+      {
+        path: "frontend/.vercel/project.json",
+        body: linked("prj_altro", "team_xyz")
+      }
+    ]);
+
+    // Sceglierne uno significherebbe spedire in produzione al progetto
+    // sbagliato senza che nessuno lo abbia chiesto.
+    expect(() =>
+      discoverProject({
+        alias: "example-web",
+        cwd,
+        homeDirectory: join(root, "home")
+      })
+    ).toThrow("Conflicting Vercel deploy targets");
+  });
+
+  test("survives a malformed project.json instead of failing registration", () => {
+    const { root, cwd } = repositoryWithVercel([
+      { path: ".vercel/project.json", body: "{ non json" }
+    ]);
+
+    expect(
+      discoverProject({
+        alias: "example-web",
+        cwd,
+        homeDirectory: join(root, "home")
+      }).deploy_target
+    ).toBeNull();
+  });
+
+  test("a discovered target brings its credential and its capability", () => {
+    const { root, repository } = repositoryWithVercel([
+      { path: ".vercel/project.json", body: linked("prj_abc", "team_xyz") }
+    ]);
+    const configPath = join(root, "config", "config.yml");
+
+    addProject({
+      alias: "example-web",
+      repository,
+      project_ref: "abcdefghijklmnopqrst",
+      profile: "development",
+      config_path: configPath,
+      deploy_target: {
+        provider: "vercel",
+        project_id: "prj_abc",
+        org_id: "team_xyz"
+      }
+    });
+
+    const config = loadConfig(configPath);
+    const project = config.projects["example-web"];
+    // Il riferimento al vault, non il token: il segreto lo mette l'operatore
+    // con `project credentials set`, e supadrum lo richiama da li'.
+    expect(project?.credentials.deploy_token).toBe(
+      "vault://vercel/example-web/token"
+    );
+    expect(project?.capabilities).toContain("deploy");
+    expect(project?.deploy_target).toEqual({
+      provider: "vercel",
+      project_id: "prj_abc",
+      org_id: "team_xyz"
+    });
+  });
+
+  test("a project without a target gets neither the credential nor the capability", () => {
+    const { root, repository } = repositoryWithVercel([]);
+    const configPath = join(root, "config", "config.yml");
+
+    addProject({
+      alias: "example-web",
+      repository,
+      project_ref: "abcdefghijklmnopqrst",
+      profile: "development",
+      config_path: configPath
+    });
+
+    const project = loadConfig(configPath).projects["example-web"];
+    // Una camera che non spedisce niente non deve possedere un token di deploy.
+    expect(project?.credentials.deploy_token).toBeUndefined();
+    expect(project?.capabilities).not.toContain("deploy");
   });
 });

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import type {
   CredentialBundle,
@@ -128,10 +128,10 @@ export class VaultCommandCredentialProvider implements CredentialProvider {
     for (const name of Object.keys(config.credentials) as Array<
       keyof CredentialBundle
     >) {
+      const reference = config.credentials[name];
+      if (reference === undefined) continue;
       try {
-        resolved[name] = await this.resolveReference(
-          config.credentials[name]
-        );
+        resolved[name] = await this.resolveReference(reference);
       } catch {
         throw new MissingCredentialsError([name]);
       }
@@ -229,37 +229,78 @@ export class CommandExecutor implements Executor {
       repositoryVerified = true;
     }
 
-    const argv = template.argv.map((argument) =>
-      renderArgument(argument, job, config)
-    );
     const childEnvironment: NodeJS.ProcessEnv = { ...process.env };
+
+    // Chi decide verso quale progetto si spedisce e' la config del broker, non
+    // un file nel repository. Senza queste due variabili la CLI Vercel leggerebbe
+    // `.vercel/project.json` dalla cartella di lavoro: il target dichiarato qui
+    // sarebbe decorativo, e un repository collegato altrove spedirebbe altrove
+    // senza che nulla lo segnali. La CLI dà loro la precedenza sulla cartella.
+    const deployTarget = config.deploy_target;
+    if (deployTarget?.provider === "vercel") {
+      childEnvironment.VERCEL_ORG_ID = deployTarget.org_id;
+      childEnvironment.VERCEL_PROJECT_ID = deployTarget.project_id;
+    }
+
     for (const [environmentName, credentialName] of Object.entries(
       template.env
     )) {
-      childEnvironment[environmentName] = credentials[credentialName];
+      const value = credentials[credentialName];
+      // A chamber that does not carry this credential must stop here and say
+      // which one is missing. Passing an unset variable through would fail
+      // inside the tool instead, where the reason is unrecognisable.
+      if (value === undefined) {
+        throw new MissingCredentialsError([credentialName]);
+      }
+      childEnvironment[environmentName] = value;
     }
 
-    const result = await runProcess(argv, {
-      cwd,
-      env: childEnvironment
-    });
-    const values = Object.values(credentials);
-    const stdout = redactSecrets(result.stdout, values);
-    const stderr = redactSecrets(result.stderr, values);
-    if (result.exitCode !== 0) {
+    const steps = template.steps ?? [{ argv: template.argv ?? [] }];
+    const values = Object.values(credentials).filter(
+      (value): value is string => typeof value === "string"
+    );
+
+    let lastExitCode = 0;
+    const stdoutParts: string[] = [];
+    const stderrParts: string[] = [];
+
+    for (const step of steps) {
+      const argv = step.argv.map((argument) =>
+        renderArgument(argument, job, config)
+      );
+      const stepCwd = step.cwd
+        ? resolve(this.#baseDirectory, step.cwd)
+        : cwd;
+      const result = await runProcess(argv, {
+        cwd: stepCwd,
+        env: childEnvironment
+      });
+      // Steps are labelled so a three-command deploy reads as three commands
+      // in the job output, not as one undifferentiated wall of text.
+      const label = steps.length > 1 ? `$ ${argv.join(" ")}\n` : "";
+      stdoutParts.push(`${label}${result.stdout}`);
+      if (result.stderr) stderrParts.push(`${label}${result.stderr}`);
+      lastExitCode = result.exitCode;
+      // Stop at the first failure: a deploy whose build failed must not ship.
+      if (result.exitCode !== 0) break;
+    }
+
+    const stdout = redactSecrets(stdoutParts.join(""), values);
+    const stderr = redactSecrets(stderrParts.join(""), values);
+    if (lastExitCode !== 0) {
       throw new Error(
-        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+        `Command failed with exit code ${lastExitCode}: ${stderr.trim()}`
       );
     }
 
     return {
       output: {
-        exit_code: result.exitCode,
+        exit_code: lastExitCode,
         stdout,
         stderr
       },
       verification: {
-        exit_code: result.exitCode,
+        exit_code: lastExitCode,
         repo_sha_verified: repositoryVerified
       }
     };
@@ -269,15 +310,35 @@ export class CommandExecutor implements Executor {
 export class ProjectModeExecutor implements Executor {
   readonly #dryRun: Executor;
   readonly #live: Executor;
+  readonly #command: Executor | null;
   #mounted: Executor | null = null;
 
-  constructor(dryRun: Executor, live: Executor) {
+  constructor(dryRun: Executor, live: Executor, command?: Executor) {
     this.#dryRun = dryRun;
     this.#live = live;
+    this.#command = command ?? null;
   }
 
   #for(config: ProjectConfig): Executor {
     return config.mode === "live" ? this.#live : this.#dryRun;
+  }
+
+  /**
+   * Deploys have no built-in adapter, deliberately: the broker does not embed a
+   * hosting client, it runs the argv the operator declared. So a live
+   * `deploy.*` job goes to the command path instead of the Supabase one, which
+   * would only answer "no live adapter" — and the Supabase executor stays what
+   * its name says it is.
+   */
+  #executorFor(job: Job, config: ProjectConfig): Executor {
+    if (
+      config.mode === "live" &&
+      job.operation.startsWith("deploy.") &&
+      this.#command
+    ) {
+      return this.#command;
+    }
+    return this.#for(config);
   }
 
   async mount(
@@ -304,7 +365,11 @@ export class ProjectModeExecutor implements Executor {
     config: ProjectConfig,
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
-    return this.#for(config).execute(job, config, credentials);
+    return this.#executorFor(job, config).execute(
+      job,
+      config,
+      credentials
+    );
   }
 }
 
@@ -314,10 +379,26 @@ function renderArgument(
   config: ProjectConfig
 ): string {
   return argument.replace(
-    /\{\{(project_ref|repo_sha|payload\.[a-zA-Z0-9_.-]+)\}\}/g,
+    /\{\{(project_ref|deploy_project_id|deploy_org_id|repo_sha|payload\.[a-zA-Z0-9_.-]+)\}\}/g,
     (_match, variable: string) => {
       if (variable === "project_ref") return config.project_ref;
       if (variable === "repo_sha") return job.repo_sha;
+      // Gli id di deploy vengono dalla config, non dal payload: un job non deve
+      // poter scegliere verso quale progetto Vercel spedire.
+      if (
+        variable === "deploy_project_id" ||
+        variable === "deploy_org_id"
+      ) {
+        const target = config.deploy_target;
+        if (!target) {
+          throw new Error(
+            `Project has no deploy target for ${variable}`
+          );
+        }
+        return variable === "deploy_project_id"
+          ? target.project_id
+          : target.org_id;
+      }
       const path = variable.slice("payload.".length).split(".");
       let value: unknown = job.payload;
       for (const part of path) {
@@ -367,7 +448,8 @@ export function createRuntime(config: SupadrumConfig): {
     credentials: new ProjectModeCredentialProvider(liveCredentials),
     executor: new ProjectModeExecutor(
       new DryRunExecutor(),
-      liveExecutor
+      liveExecutor,
+      new CommandExecutor(dirname(config.config_path))
     )
   };
 }

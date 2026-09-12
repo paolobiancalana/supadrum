@@ -5,6 +5,11 @@ projects. Agents declare a project and an atomic intent; the runner owns
 credentials, chamber rotation, execution, and verification. By default it does
 not add a second human decision gate after a capability has been granted.
 
+Projects that ship code can also declare the `deploy` capability: `deploy.plan`
+rehearses (pull, build) and `deploy.apply` ships, both through operator-owned
+argv and an optional `deploy_token` credential, so a production deploy leaves
+the same audited trail as a migration.
+
 No resolved credential—and no `vault://` reference—enters a job payload or the
 durable queue.
 

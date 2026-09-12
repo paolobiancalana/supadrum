@@ -25,16 +25,23 @@ export interface CredentialSetupReport {
   readonly ready: true;
 }
 
+/**
+ * Every credential a chamber may carry, in the order the wizard asks for them.
+ * Only the ones a project actually declares are visited: `deploy_token` is
+ * optional, so a chamber that never ships anything is never asked for one.
+ */
 const credentialOrder: readonly CredentialName[] = [
   "secret_key",
   "management_token",
-  "database_access"
+  "database_access",
+  "deploy_token"
 ];
 
 const credentialLabels: Readonly<Record<CredentialName, string>> = {
   secret_key: "Secret key",
   management_token: "Management token",
-  database_access: "Database access"
+  database_access: "Database access",
+  deploy_token: "Deploy token"
 };
 
 function valuesMatch(left: string, right: string): boolean {
@@ -75,13 +82,19 @@ export async function setupProjectCredentials(input: {
   const existing: CredentialName[] = [];
   const missing: CredentialName[] = [];
   const replace = new Set(input.replace ?? []);
-  for (const name of credentialOrder) {
+  const declared = credentialOrder.filter(
+    (name) => project.credentials[name] !== undefined
+  );
+
+  for (const name of declared) {
+    const declaredReference = project.credentials[name];
+    if (declaredReference === undefined) continue;
     if (replace.has(name)) {
       missing.push(name);
       continue;
     }
     try {
-      await input.vault.get(project.credentials[name]);
+      await input.vault.get(declaredReference);
       existing.push(name);
     } catch (error) {
       if (!(error instanceof MissingVaultValueError)) throw error;
@@ -105,6 +118,7 @@ export async function setupProjectCredentials(input: {
       }
     }
     const reference = project.credentials[name];
+    if (reference === undefined) continue;
     await input.vault.put(reference, value);
     const resolved = await input.vault.get(reference);
     if (!valuesMatch(value, resolved)) {

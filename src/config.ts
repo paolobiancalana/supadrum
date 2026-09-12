@@ -26,23 +26,70 @@ const VaultReferenceSchema = z
   .string()
   .regex(/^vault:\/\/[^\s]+$/, "Expected a vault:// reference");
 
+/**
+ * The three Supabase credentials are required because every chamber was built
+ * around them. `deploy_token` is optional: a chamber that never ships anything
+ * has no reason to hold one, and a job that asks for a credential the chamber
+ * does not carry stops at `waiting_credentials` naming it, rather than running
+ * with the variable unset and failing somewhere less legible.
+ */
 const CredentialBundleSchema = z.object({
   secret_key: VaultReferenceSchema,
   management_token: VaultReferenceSchema,
-  database_access: VaultReferenceSchema
+  database_access: VaultReferenceSchema,
+  deploy_token: VaultReferenceSchema.optional()
 });
 
 const CredentialNameSchema = z.enum([
   "secret_key",
   "management_token",
-  "database_access"
+  "database_access",
+  "deploy_token"
 ]);
 
-const CommandTemplateSchema = z.object({
+/**
+ * One command, or a sequence of them.
+ *
+ * A sequence exists because some real operations are irreducibly multi-step:
+ * a Vercel production deploy is `pull`, then `build`, then `deploy --prebuilt`,
+ * and collapsing them into a repository script would move the steps out of the
+ * operator-owned config and into something the repository can rewrite.
+ *
+ * Steps share the template's cwd, credentials and repo verification, and stop
+ * at the first non-zero exit.
+ */
+const CommandStepSchema = z.object({
   argv: z.array(z.string().min(1)).min(1),
-  cwd: z.string().min(1).optional(),
-  env: z.record(z.string().min(1), CredentialNameSchema).default({}),
-  verify_repo_sha: z.boolean().default(true)
+  cwd: z.string().min(1).optional()
+});
+
+const CommandTemplateSchema = z
+  .object({
+    argv: z.array(z.string().min(1)).min(1).optional(),
+    steps: z.array(CommandStepSchema).min(1).optional(),
+    cwd: z.string().min(1).optional(),
+    env: z.record(z.string().min(1), CredentialNameSchema).default({}),
+    verify_repo_sha: z.boolean().default(true)
+  })
+  .superRefine((value, context) => {
+    if (Boolean(value.argv) === Boolean(value.steps)) {
+      context.addIssue({
+        code: "custom",
+        message: "A command needs exactly one of argv or steps"
+      });
+    }
+  });
+
+/**
+ * Where a project ships to. Discovered from the repository the same way the
+ * Supabase project ref is, so an operator never types an id: the ids are not
+ * secret, only the token that acts on them is, and that one lives in the vault
+ * like every other credential.
+ */
+const DeployTargetSchema = z.object({
+  provider: z.literal("vercel").default("vercel"),
+  project_id: z.string().min(1),
+  org_id: z.string().min(1)
 });
 
 const ProjectFields = {
@@ -67,6 +114,7 @@ const ProjectFields = {
 const LegacyProjectSchema = z.object({
   ...ProjectFields,
   project_ref: z.string().min(1),
+  deploy_target: DeployTargetSchema.optional(),
   credentials: CredentialBundleSchema,
   chamber: z.never().optional()
 });
@@ -86,6 +134,7 @@ const InputProjectSchema = z.union([
 const RemoteChamberSchema = z.object({
   target: z.literal("remote").default("remote"),
   project_ref: z.string().min(1),
+  deploy_target: DeployTargetSchema.optional(),
   credentials: CredentialBundleSchema,
   managed_secrets: z
     .record(
@@ -118,9 +167,12 @@ const ConfigSchema = z.object({
 
 export type CredentialBundle = z.infer<typeof CredentialBundleSchema>;
 export type CommandTemplate = z.infer<typeof CommandTemplateSchema>;
+export type DeployTarget = z.infer<typeof DeployTargetSchema>;
+
 export interface ChamberConfig {
   readonly target?: "remote" | "local";
   readonly project_ref: string;
+  readonly deploy_target?: DeployTarget | undefined;
   readonly credentials: CredentialBundle;
   readonly managed_secrets?: Record<string, string>;
 }
@@ -200,6 +252,9 @@ export function loadConfig(path: string): SupadrumConfig {
         ? {
             target: "remote" as const,
             project_ref: input.project_ref,
+            ...(input.deploy_target
+              ? { deploy_target: input.deploy_target }
+              : {}),
             credentials: input.credentials
           }
         : undefined;
@@ -229,6 +284,9 @@ export function loadConfig(path: string): SupadrumConfig {
       chamber: chamberName,
       ...(chamber.target ? { target: chamber.target } : {}),
       project_ref: chamber.project_ref,
+      ...(chamber.deploy_target
+        ? { deploy_target: chamber.deploy_target }
+        : {}),
       credentials: chamber.credentials,
       managed_secrets: chamber.managed_secrets ?? {},
       capabilities: input.capabilities,

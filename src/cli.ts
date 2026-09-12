@@ -288,12 +288,13 @@ function credentialName(value: string): CredentialName {
   if (
     value === "secret_key" ||
     value === "management_token" ||
-    value === "database_access"
+    value === "database_access" ||
+    value === "deploy_token"
   ) {
     return value;
   }
   throw new Error(
-    "Credential must be secret_key, management_token, or database_access"
+    "Credential must be secret_key, management_token, database_access, or deploy_token"
   );
 }
 
@@ -570,6 +571,9 @@ export async function runCli(
         project_ref: projectRef,
         profile,
         config_path: configPath,
+        ...(discovery.deploy_target
+          ? { deploy_target: discovery.deploy_target }
+          : {}),
         ...(runtime.defaultVaultCommand
           ? { vault_command: runtime.defaultVaultCommand }
           : {})

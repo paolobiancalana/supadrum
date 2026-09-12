@@ -8,7 +8,8 @@ export const capabilityNames = [
   "migrations",
   "schema-inspection",
   "sql",
-  "project-management"
+  "project-management",
+  "deploy"
 ] as const;
 
 export type Capability = (typeof capabilityNames)[number];
@@ -27,7 +28,10 @@ export const operationNames = [
   "schema.inspect",
   "sql.execute",
   "project.manage",
-  "types.generate"
+  "types.generate",
+  "deploy.inspect",
+  "deploy.plan",
+  "deploy.apply"
 ] as const;
 
 export type Operation = (typeof operationNames)[number];
@@ -57,5 +61,10 @@ export const operationCatalog = {
   },
   "sql.execute": { capability: "sql", approval: true },
   "project.manage": { capability: "project-management", approval: true },
-  "types.generate": { capability: "schema-inspection", approval: false }
+  "types.generate": { capability: "schema-inspection", approval: false },
+  // Deploying is the one operation whose blast radius is the public internet:
+  // reading and rehearsing are free, shipping is gated like every other write.
+  "deploy.inspect": { capability: "deploy", approval: false },
+  "deploy.plan": { capability: "deploy", approval: false },
+  "deploy.apply": { capability: "deploy", approval: true }
 } as const satisfies Record<Operation, OperationDefinition>;

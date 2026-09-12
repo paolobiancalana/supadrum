@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdtempSync,
   realpathSync,
   writeFileSync
@@ -8,13 +9,15 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 
 import type { ProjectConfig } from "../src/config.js";
-import type { Job } from "../src/domain.js";
+import type { ExecutionResult, Job } from "../src/domain.js";
 import {
   CommandExecutor,
+  ProjectModeExecutor,
   VaultCommandCredentialProvider,
   createRuntime,
   redactSecrets
 } from "../src/executors.js";
+import { MissingCredentialsError, type Executor } from "../src/runner.js";
 import type { SupadrumConfig } from "../src/config.js";
 
 const project: ProjectConfig = {
@@ -212,5 +215,312 @@ process.stdin.on("end", () => {
     expect(result.output).toMatchObject({
       stdout: realpathSync(repository)
     });
+  });
+});
+
+describe("multi-step commands", () => {
+  const stepProject = (
+    steps: Array<{ argv: string[] }>
+  ): ProjectConfig => ({
+    ...project,
+    commands: {
+      "migration.plan": {
+        steps,
+        env: {},
+        verify_repo_sha: false
+      }
+    }
+  });
+
+  const credentials = {
+    secret_key: "secret",
+    management_token: "management",
+    database_access: "postgres"
+  };
+
+  test("runs every step in order and keeps each one legible", async () => {
+    const executor = new CommandExecutor(process.cwd());
+
+    const result = await executor.execute(
+      job,
+      stepProject([
+        { argv: [process.execPath, "-e", "process.stdout.write('uno')"] },
+        { argv: [process.execPath, "-e", "process.stdout.write('due')"] }
+      ]),
+      credentials
+    );
+
+    // Order is the whole point: a Vercel deploy that builds before it pulls
+    // ships the wrong settings. 'uno' must precede 'due'.
+    const stdout = (result.output as { stdout: string }).stdout;
+    expect(stdout.indexOf("uno")).toBeGreaterThanOrEqual(0);
+    expect(stdout.indexOf("uno")).toBeLessThan(stdout.indexOf("due"));
+    // Each command is labelled, so three steps read as three commands.
+    expect(stdout).toContain("$ ");
+  });
+
+  test("a failing step stops the ones after it", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const marker = join(mkdtempSync(join(tmpdir(), "supadrum-step-")), "ran");
+
+    await expect(
+      executor.execute(
+        job,
+        stepProject([
+          {
+            argv: [
+              process.execPath,
+              "-e",
+              "process.stderr.write('build rotto'); process.exit(3)"
+            ]
+          },
+          {
+            argv: [
+              process.execPath,
+              "-e",
+              `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x')`
+            ]
+          }
+        ]),
+        credentials
+      )
+    ).rejects.toThrow("exit code 3");
+
+    // Il file esiste solo se il secondo passo e' partito: e' la differenza fra
+    // "build fallito" e "build fallito e spedito lo stesso".
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("stops at waiting_credentials when the chamber lacks the token", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const deployProject: ProjectConfig = {
+      ...project,
+      commands: {
+        "migration.plan": {
+          argv: [process.execPath, "-e", "process.stdout.write('ok')"],
+          env: { VERCEL_TOKEN: "deploy_token" },
+          verify_repo_sha: false
+        }
+      }
+    };
+
+    // Senza guardia la variabile resterebbe non impostata e il fallimento
+    // arriverebbe da dentro l'utensile, dove la ragione non si riconosce.
+    await expect(
+      executor.execute(job, deployProject, credentials)
+    ).rejects.toThrow(MissingCredentialsError);
+    await expect(
+      executor.execute(job, deployProject, credentials)
+    ).rejects.toThrow("deploy_token");
+  });
+
+  test("passes the deploy token through when the chamber carries it", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const deployProject: ProjectConfig = {
+      ...project,
+      commands: {
+        "migration.plan": {
+          argv: [
+            process.execPath,
+            "-e",
+            "process.stdout.write(process.env.VERCEL_TOKEN ?? 'assente')"
+          ],
+          env: { VERCEL_TOKEN: "deploy_token" },
+          verify_repo_sha: false
+        }
+      }
+    };
+
+    const result = await executor.execute(job, deployProject, {
+      ...credentials,
+      deploy_token: "token-di-deploy"
+    });
+
+    // Redatto, non in chiaro: un token di deploy non deve comparire nei log
+    // di un job piu' di quanto ci compaia una service key.
+    expect((result.output as { stdout: string }).stdout).toBe("[REDACTED]");
+  });
+});
+
+describe("deploy routing", () => {
+  const liveProject: ProjectConfig = {
+    ...project,
+    mode: "live",
+    capabilities: ["deploy"],
+    deploy_target: {
+      provider: "vercel",
+      project_id: "prj_abc",
+      org_id: "team_xyz"
+    },
+    commands: {
+      "deploy.apply": {
+        argv: [
+          process.execPath,
+          "-e",
+          "process.stdout.write(process.argv[1] + '|' + process.argv[2])",
+          "{{deploy_project_id}}",
+          "{{deploy_org_id}}"
+        ],
+        env: {},
+        verify_repo_sha: false
+      }
+    }
+  };
+
+  const deployJob: Job = {
+    ...job,
+    operation: "deploy.apply",
+    capability: "deploy",
+    requires_approval: true
+  };
+
+  const credentials = {
+    secret_key: "secret",
+    management_token: "management",
+    database_access: "postgres"
+  };
+
+  class RefusingExecutor implements Executor {
+    async mount(): Promise<void> {}
+    async drain(): Promise<void> {}
+    async unmount(): Promise<void> {}
+    async execute(): Promise<ExecutionResult> {
+      throw new Error("No live adapter for deploy.apply");
+    }
+  }
+
+  test("a live deploy runs the operator argv, not the Supabase adapter", async () => {
+    const executor = new ProjectModeExecutor(
+      new RefusingExecutor(),
+      new RefusingExecutor(),
+      new CommandExecutor(process.cwd())
+    );
+
+    const result = await executor.execute(
+      deployJob,
+      liveProject,
+      credentials
+    );
+
+    // Senza l'instradamento questo job finirebbe nell'adattatore Supabase, che
+    // per deploy.apply sa solo rispondere "no live adapter".
+    expect((result.output as { stdout: string }).stdout).toBe(
+      "prj_abc|team_xyz"
+    );
+  });
+
+  test("the deploy ids come from the config, never from the payload", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const spoofed: Job = {
+      ...deployJob,
+      payload: { deploy_project_id: "prj_di_un_altro" }
+    };
+
+    const result = await executor.execute(
+      spoofed,
+      liveProject,
+      credentials
+    );
+
+    // Un job non deve poter scegliere verso quale progetto Vercel spedire.
+    expect((result.output as { stdout: string }).stdout).toBe(
+      "prj_abc|team_xyz"
+    );
+  });
+
+  test("a project without a target cannot render deploy ids", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const { deploy_target: _omitted, ...withoutTarget } = liveProject;
+
+    await expect(
+      executor.execute(deployJob, withoutTarget as ProjectConfig, credentials)
+    ).rejects.toThrow("no deploy target");
+  });
+
+  test("a non-deploy live job still goes to the Supabase adapter", async () => {
+    const executor = new ProjectModeExecutor(
+      new RefusingExecutor(),
+      new RefusingExecutor(),
+      new CommandExecutor(process.cwd())
+    );
+
+    // L'instradamento deve essere stretto: dirottare anche le migrazioni sul
+    // percorso comandi toglierebbe a ogni progetto il suo adattatore Supabase.
+    await expect(
+      executor.execute({ ...job, operation: "migration.apply" }, liveProject, credentials)
+    ).rejects.toThrow("No live adapter");
+  });
+});
+
+describe("deploy target authority", () => {
+  const credentials = {
+    secret_key: "secret",
+    management_token: "management",
+    database_access: "postgres"
+  };
+
+  const echoEnv = (projectConfig: Partial<ProjectConfig>): ProjectConfig => ({
+    ...project,
+    mode: "live",
+    capabilities: ["deploy"],
+    ...projectConfig,
+    commands: {
+      "deploy.apply": {
+        argv: [
+          process.execPath,
+          "-e",
+          "process.stdout.write((process.env.VERCEL_ORG_ID ?? 'assente') + '|' + (process.env.VERCEL_PROJECT_ID ?? 'assente'))"
+        ],
+        env: {},
+        verify_repo_sha: false
+      }
+    }
+  });
+
+  const deployJob: Job = {
+    ...job,
+    operation: "deploy.apply",
+    capability: "deploy",
+    requires_approval: true
+  };
+
+  test("tells the CLI which project to ship to, instead of trusting the folder", async () => {
+    const executor = new CommandExecutor(process.cwd());
+
+    const result = await executor.execute(
+      deployJob,
+      echoEnv({
+        deploy_target: {
+          provider: "vercel",
+          project_id: "prj_abc",
+          org_id: "team_xyz"
+        }
+      }),
+      credentials
+    );
+
+    // Senza queste variabili la CLI leggerebbe .vercel/project.json dal
+    // repository: un repo collegato a un altro progetto spedirebbe altrove
+    // senza che il broker lo sappia.
+    expect((result.output as { stdout: string }).stdout).toBe(
+      "team_xyz|prj_abc"
+    );
+  });
+
+  test("injects nothing when the project has no deploy target", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const config = echoEnv({});
+    const { deploy_target: _none, ...withoutTarget } = config;
+
+    const result = await executor.execute(
+      deployJob,
+      withoutTarget as ProjectConfig,
+      credentials
+    );
+
+    // Un progetto che non spedisce non deve ereditare il target di nessun altro.
+    expect((result.output as { stdout: string }).stdout).toBe(
+      "assente|assente"
+    );
   });
 });

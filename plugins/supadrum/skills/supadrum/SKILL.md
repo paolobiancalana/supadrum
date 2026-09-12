@@ -1,12 +1,13 @@
 ---
 name: supadrum
-description: Route every Supabase inspection, SQL query, migration, Auth Admin, Storage, Realtime, Edge Function, secret, or project-management task through the Supadrum MCP broker. Use whenever work targets a Supabase project managed by Supadrum, including read-only work.
+description: Route every Supabase inspection, SQL query, migration, Auth Admin, Storage, Realtime, Edge Function, secret, or project-management task, and every deploy of a project Supadrum manages, through the Supadrum MCP broker. Use whenever work targets a project managed by Supadrum, including read-only work.
 ---
 
 # Supadrum
 
-Use the broker as the only Supabase access path. Declare project and intent;
-never acquire or handle its credentials.
+Use the broker as the only access path to a managed project — Supabase and
+deploys alike. Declare project and intent; never acquire or handle its
+credentials.
 
 ## Required workflow
 
@@ -38,9 +39,15 @@ must share one chamber.
 
 ## Prohibitions
 
-- Never run `supabase login`.
+- Never run `supabase login` or `vercel login`.
 - Never use Supabase CLI, Management API, Postgres, or the official Supabase
   MCP directly.
+- Never use the Vercel CLI, Management API, or a Vercel MCP directly for a
+  project that declares the `deploy` capability. A deploy is `deploy.plan`
+  (pull and build, no approval) then `deploy.apply` (ship, approval-gated);
+  `deploy.inspect` reads deployments and logs. If the chamber has no
+  `deploy_token`, the job stops at `waiting_credentials` naming it — report
+  that and stop, exactly as for any other missing credential.
 - Never read local credential files or ask for database URLs, tokens, secret
   keys, service-role keys, passwords, or vault values.
 - Never put credentials or `vault://` references in job payloads.

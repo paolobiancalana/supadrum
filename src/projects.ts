@@ -49,12 +49,20 @@ export const projectProfiles = {
 
 export type ProjectProfile = keyof typeof projectProfiles;
 
+export interface DiscoveredDeployTarget {
+  readonly provider: "vercel";
+  readonly project_id: string;
+  readonly org_id: string;
+}
+
 export interface ProjectDiscovery {
   readonly alias: string;
   readonly repository: string | null;
   readonly project_ref: string | null;
   readonly repository_source: string | null;
   readonly project_ref_source: string | null;
+  readonly deploy_target: DiscoveredDeployTarget | null;
+  readonly deploy_target_source: string | null;
 }
 
 function validAlias(alias: string): string {
@@ -178,6 +186,67 @@ function publicUrlProjectRef(
   return matches[0] ?? null;
 }
 
+/**
+ * Where this repository ships to, read the same way the Supabase ref is: from
+ * metadata the tooling already wrote, never typed by hand.
+ *
+ * `.vercel/project.json` is written by the Vercel CLI when a directory is
+ * linked. A monorepo often carries one at the root and one under the deployed
+ * subdirectory; when they agree that is one target, and when they disagree the
+ * repository has two and picking one would be a guess — so registration stops,
+ * exactly as it does for conflicting Supabase refs.
+ *
+ * The ids are not secrets: they sit in a file the repository commits. Only the
+ * token that acts on them is a secret, and that one lives in the vault.
+ */
+function discoverDeployTarget(
+  repository: string
+): {
+  readonly target: DiscoveredDeployTarget | null;
+  readonly source: string | null;
+} {
+  const candidates = [
+    ".vercel/project.json",
+    "frontend/.vercel/project.json"
+  ];
+  const found: Array<{
+    target: DiscoveredDeployTarget;
+    source: string;
+  }> = [];
+
+  for (const relativePath of candidates) {
+    const path = join(repository, relativePath);
+    if (!existsSync(path)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      continue;
+    }
+    if (parsed === null || typeof parsed !== "object") continue;
+    const record = parsed as Record<string, unknown>;
+    const projectId = record.projectId;
+    const orgId = record.orgId;
+    if (typeof projectId !== "string" || projectId.length === 0) continue;
+    if (typeof orgId !== "string" || orgId.length === 0) continue;
+    found.push({
+      target: { provider: "vercel", project_id: projectId, org_id: orgId },
+      source: relativePath
+    });
+  }
+
+  const distinct = new Set(
+    found.map(({ target }) => `${target.org_id}/${target.project_id}`)
+  );
+  if (distinct.size > 1) {
+    throw new Error("Conflicting Vercel deploy targets in repository metadata");
+  }
+  const first = found[0];
+  return first
+    ? { target: first.target, source: first.source }
+    : { target: null, source: null };
+}
+
 function discoverProjectRef(
   repository: string
 ): {
@@ -247,12 +316,18 @@ export function discoverProject(input: {
     );
   }
 
+  const deploy = repository.path
+    ? discoverDeployTarget(repository.path)
+    : { target: null, source: null };
+
   return {
     alias,
     repository: repository.path,
     project_ref: explicitRef ?? discoveredRef.ref,
     repository_source: repository.source,
-    project_ref_source: explicitRef ? "explicit" : discoveredRef.source
+    project_ref_source: explicitRef ? "explicit" : discoveredRef.source,
+    deploy_target: deploy.target,
+    deploy_target_source: deploy.source
   };
 }
 
@@ -510,6 +585,7 @@ export function addProject(input: {
   readonly profile: ProjectProfile;
   readonly config_path: string;
   readonly vault_command?: readonly string[];
+  readonly deploy_target?: DiscoveredDeployTarget | null;
 }): {
   readonly added: true;
   readonly alias: string;
@@ -517,6 +593,7 @@ export function addProject(input: {
   readonly repository: string;
   readonly project_ref: string;
   readonly profile: ProjectProfile;
+  readonly deploy_target: DiscoveredDeployTarget | null;
 } {
   const alias = validAlias(input.alias);
   const repository = gitRoot(input.repository);
@@ -541,15 +618,28 @@ export function addProject(input: {
   ) {
     document.set("vault_command", [...input.vault_command]);
   }
+  // Un target di deploy scoperto porta con se' la sua credenziale e la sua
+  // capability: se il repository sa gia' dove spedisce, chiedere all'operatore
+  // di dichiararlo a mano sarebbe chiedergli di ripetere cio' che e' scritto.
+  const deployTarget = input.deploy_target ?? null;
+  const capabilities = [...projectProfiles[profile]];
+  if (deployTarget && !capabilities.includes("deploy")) {
+    capabilities.push("deploy");
+  }
+
   document.setIn(["projects", alias], {
     repo: repository,
     project_ref: projectRef,
+    ...(deployTarget ? { deploy_target: deployTarget } : {}),
     credentials: {
       secret_key: `vault://supabase/${alias}/secret`,
       management_token: `vault://supabase/${alias}/management`,
-      database_access: `vault://supabase/${alias}/postgres`
+      database_access: `vault://supabase/${alias}/postgres`,
+      ...(deployTarget
+        ? { deploy_token: `vault://vercel/${alias}/token` }
+        : {})
     },
-    capabilities: [...projectProfiles[profile]]
+    capabilities
   });
   atomicWriteConfig(configPath, document);
 
@@ -559,7 +649,8 @@ export function addProject(input: {
     config_path: configPath,
     repository,
     project_ref: projectRef,
-    profile
+    profile,
+    deploy_target: deployTarget
   };
 }
 

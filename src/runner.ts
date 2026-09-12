@@ -6,7 +6,17 @@ import type {
 import type { ExecutionResult, Job, Session } from "./domain.js";
 import { SqliteStore } from "./store.js";
 
-export type ResolvedCredentials = Record<keyof CredentialBundle, string>;
+/**
+ * The three Supabase credentials stay required: every chamber carries them and
+ * the Supabase executor reads them directly. `deploy_token` is optional, so it
+ * is the one name a consumer must check before use — which is the point, since
+ * a chamber that never ships anything has no reason to hold a deploy token.
+ */
+export type ResolvedCredentials = Record<
+  "secret_key" | "management_token" | "database_access",
+  string
+> &
+  Partial<Record<"deploy_token", string>>;
 
 export interface CredentialProvider {
   resolve(
