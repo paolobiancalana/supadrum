@@ -21,6 +21,7 @@ export const operationNames = [
   "realtime.admin",
   "functions.deploy",
   "secrets.set",
+  "migration.diff",
   "migration.plan",
   "migration.baseline",
   "migration.apply",
@@ -48,6 +49,9 @@ export const operationCatalog = {
   "realtime.admin": { capability: "realtime", approval: true },
   "functions.deploy": { capability: "edge-functions", approval: true },
   "secrets.set": { capability: "secrets", approval: true },
+  // Writing a migration file into the repository is the same blast radius as
+  // types.generate: reviewable, reversible, and nowhere near a database write.
+  "migration.diff": { capability: "migrations", approval: false },
   "migration.plan": { capability: "migrations", approval: false },
   "migration.baseline": { capability: "migrations", approval: true },
   "migration.apply": { capability: "migrations", approval: true },

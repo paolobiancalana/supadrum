@@ -374,6 +374,21 @@ function requiredString(
   return value;
 }
 
+/**
+ * A migration name reaches the CLI as a filename, so it is validated instead of
+ * trusted: anything outside this alphabet could climb out of the migrations
+ * directory or be read as a flag. Same alphabet the CLI itself generates.
+ */
+function migrationFileName(payload: Record<string, unknown>): string {
+  const name = requiredString(payload, "name");
+  if (!/^[a-z0-9_]+$/.test(name)) {
+    throw new Error(
+      "Migration name must use only lowercase letters, digits and underscores"
+    );
+  }
+  return name;
+}
+
 export function databasePassword(databaseAccess: string): string {
   let parsed: URL;
   try {
@@ -495,6 +510,13 @@ export class LiveSupabaseExecutor implements Executor {
               repository,
               credentials
             );
+      // A diff reads the declarative schema through the shadow database, and the
+      // migration it writes exists to be reviewed before anything reaches a
+      // remote project. Diffing a linked project directly inverts that order.
+      case "migration.diff":
+        throw new Error(
+          "migration.diff runs only on a local chamber: generate the migration there, review it, then apply it"
+        );
       case "types.generate":
         return this.#generateTypes(
           job,
@@ -621,7 +643,8 @@ export class LiveSupabaseExecutor implements Executor {
     }
     if (
       job.operation !== "migration.plan" &&
-      job.operation !== "migration.apply"
+      job.operation !== "migration.apply" &&
+      job.operation !== "migration.diff"
     ) {
       throw new Error(
         `Operation ${job.operation} is not supported for a local chamber`
@@ -629,14 +652,24 @@ export class LiveSupabaseExecutor implements Executor {
     }
 
     const snapRunner = this.#localSnapRunner(job, repository);
+    if (snapRunner && job.operation === "migration.diff") {
+      throw new Error(
+        "SNAP has no diff: migration.diff needs the supabase CLI to read the declarative schema"
+      );
+    }
     const database = await this.#assertLocalStack(
       repository,
       project.supabase_dir
     );
+    // `db diff` is the only one of the three that reads the declarative schema
+    // in `schema_paths` and writes a migration; push only ever replays files
+    // that already exist.
     const args =
-      job.operation === "migration.plan"
-        ? ["db", "push", "--dry-run", "--local"]
-        : ["db", "push", "--local"];
+      job.operation === "migration.diff"
+        ? ["db", "diff", "--local", "-f", migrationFileName(job.payload)]
+        : job.operation === "migration.plan"
+          ? ["db", "push", "--dry-run", "--local"]
+          : ["db", "push", "--local"];
     if (args.includes("--linked") || args.includes("--db-url")) {
       throw new Error("Local chamber command contains a remote target flag");
     }
