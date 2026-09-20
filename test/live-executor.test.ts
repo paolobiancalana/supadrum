@@ -693,6 +693,87 @@ describe("live Supabase executor", () => {
     }
   });
 
+  test("generates a migration from the declarative schema, inside supabase_dir", async () => {
+    // Without a diff the declarative workflow has no exit: `db push` only
+    // replays migration files that already exist, so a schema change could
+    // reach the database only by hand-writing the migration it should have
+    // produced — and a hand-written one is free to drift from schemas/.
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-diff-"));
+    const supabaseDir = join(repository, "database");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+    const project = Object.assign(localProject(repository), {
+      supabase_dir: supabaseDir
+    });
+
+    const result = await executor.execute(
+      runningJob("migration.diff", { name: "atlas_01_schema_rls" }),
+      project,
+      credentials
+    );
+
+    expect(process.calls.map((call) => call.argv)).toEqual([
+      ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
+      ["supabase", "status", "--output", "json"],
+      ["supabase", "db", "diff", "--local", "-f", "atlas_01_schema_rls"]
+    ]);
+    for (const call of process.calls.filter(
+      (candidate) => candidate.argv[0] === "supabase"
+    )) {
+      expect(call.cwd).toBe(supabaseDir);
+      expect(call.argv).not.toContain("--linked");
+      expect(call.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    }
+    expect(result.verification).toMatchObject({
+      target: "local",
+      local_preflight: true
+    });
+  });
+
+  test("refuses a migration name that could leave the directory or pass as a flag", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-diff-name-"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    for (const name of [
+      "../../../etc/passwd",
+      "--linked",
+      "schema rls",
+      "Schema",
+      "atlas;drop"
+    ]) {
+      await expect(
+        executor.execute(
+          runningJob("migration.diff", { name }),
+          localProject(repository),
+          credentials
+        )
+      ).rejects.toThrow(/lowercase letters, digits and underscores/);
+    }
+
+    expect(
+      process.calls.filter((call) => call.argv.includes("diff"))
+    ).toEqual([]);
+  });
+
+  test("refuses to diff a linked project, naming why", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-remote-diff-"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    await expect(
+      executor.execute(
+        runningJob("migration.diff", { name: "atlas_01_schema_rls" }),
+        liveProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/only on a local chamber/);
+
+    expect(
+      process.calls.filter((call) => call.argv.includes("diff"))
+    ).toEqual([]);
+  });
+
   test("runs a repository SQL file against the local stack, never a stored credential", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-sql-"));
     const sql = "select 1;\n";
