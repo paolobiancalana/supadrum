@@ -712,10 +712,25 @@ describe("live Supabase executor", () => {
       credentials
     );
 
+    // The argv is asserted exactly, flag for flag, because two of them carry
+    // the operation's guarantees rather than its mechanics: `--no-apply` keeps
+    // an approval-free operation away from the database (and out of an
+    // interactive prompt that would hang the runner), and `--strict-coverage`
+    // makes it refuse rather than silently skip what it cannot manage.
     expect(process.calls.map((call) => call.argv)).toEqual([
       ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
       ["supabase", "status", "--output", "json"],
-      ["supabase", "db", "diff", "--local", "-f", "atlas_01_schema_rls"]
+      [
+        "supabase",
+        "db",
+        "schema",
+        "declarative",
+        "sync",
+        "--no-apply",
+        "--strict-coverage",
+        "--name",
+        "atlas_01_schema_rls"
+      ]
     ]);
     for (const call of process.calls.filter(
       (candidate) => candidate.argv[0] === "supabase"
