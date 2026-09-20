@@ -94,6 +94,7 @@ const DeployTargetSchema = z.object({
 
 const ProjectFields = {
   repo: z.string().min(1).optional(),
+  supabase_dir: z.string().min(1).optional(),
   capabilities: z
     .array(CapabilitySchema)
     .min(1)
@@ -178,6 +179,16 @@ export interface ChamberConfig {
 }
 export interface ProjectConfig extends ChamberConfig {
   readonly repo?: string;
+  /**
+   * Where `supabase/config.toml` actually lives, when it is not at the
+   * repository root. Every local-chamber operation shells out to the
+   * `supabase` CLI, which resolves "the current project" from its working
+   * directory alone — given the repository root instead, it does not error,
+   * it silently picks up whatever OTHER local Supabase stack happens to be
+   * running on the machine. Resolved against `repo`; setting it without
+   * `repo` is a config error.
+   */
+  readonly supabase_dir?: string;
   readonly chamber: string;
   readonly capabilities: z.infer<typeof CapabilitySchema>[];
   readonly commands?: Partial<
@@ -277,9 +288,16 @@ export function loadConfig(path: string): SupadrumConfig {
       }
       chambers[chamberName] = chamber;
     }
+    const resolvedRepo = input.repo
+      ? resolve(baseDirectory, input.repo)
+      : undefined;
+    if (input.supabase_dir && !resolvedRepo) {
+      throw new Error(`Project ${name} sets supabase_dir without repo`);
+    }
     projects[name] = {
-      ...(input.repo
-        ? { repo: resolve(baseDirectory, input.repo) }
+      ...(resolvedRepo ? { repo: resolvedRepo } : {}),
+      ...(resolvedRepo && input.supabase_dir
+        ? { supabase_dir: resolve(resolvedRepo, input.supabase_dir) }
         : {}),
       chamber: chamberName,
       ...(chamber.target ? { target: chamber.target } : {}),
@@ -354,6 +372,7 @@ export function inspectProject(name: string, config: SupadrumConfig) {
   return {
     name,
     ...(project.repo ? { repo: project.repo } : {}),
+    ...(project.supabase_dir ? { supabase_dir: project.supabase_dir } : {}),
     ...(project.target === "local"
       ? { target: "local" }
       : { project_ref: project.project_ref }),
