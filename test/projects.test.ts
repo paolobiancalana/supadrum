@@ -460,3 +460,82 @@ describe("project doctor", () => {
     expect(JSON.stringify(report)).not.toContain("vault://");
   });
 });
+
+describe("supabase_dir", () => {
+  test("resolves relative to the repository, not the operator config", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-"));
+    const repository = join(root, "project-atlas");
+    createGitRepository(repository);
+    const configPath = join(root, "config", "config.yml");
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(
+      configPath,
+      `
+version: 1
+chambers:
+  project-atlas:
+    target: local
+projects:
+  project-atlas:
+    repo: ${repository}
+    supabase_dir: database
+    chamber: project-atlas
+    capabilities: [migrations, sql]
+`
+    );
+
+    const project = loadConfig(configPath).projects["project-atlas"];
+
+    expect(project?.supabase_dir).toBe(join(repository, "database"));
+  });
+
+  test("without supabase_dir, projects behave exactly as before", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-default-"));
+    const repository = join(root, "presnap");
+    createGitRepository(repository);
+    const configPath = join(root, "config", "config.yml");
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(
+      configPath,
+      `
+version: 1
+chambers:
+  presnap-local:
+    target: local
+projects:
+  presnap-local:
+    repo: ${repository}
+    chamber: presnap-local
+    capabilities: [migrations, sql]
+`
+    );
+
+    const project = loadConfig(configPath).projects["presnap-local"];
+
+    expect(project?.supabase_dir).toBeUndefined();
+  });
+
+  test("refuses supabase_dir without a repo to resolve it against", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-orphan-"));
+    const configPath = join(root, "config", "config.yml");
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(
+      configPath,
+      `
+version: 1
+chambers:
+  example-service:
+    target: local
+projects:
+  example-service:
+    supabase_dir: database
+    chamber: example-service
+    capabilities: [migrations, sql]
+`
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(
+      "Project example-service sets supabase_dir without repo"
+    );
+  });
+});

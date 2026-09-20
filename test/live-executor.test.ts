@@ -605,6 +605,33 @@ describe("live Supabase executor", () => {
     });
   });
 
+  test("targets supabase_dir, not the repository root, when the project isn't there", async () => {
+    // A repository whose `supabase/config.toml` lives in a subdirectory: the
+    // Supabase CLI resolves "the current project" from its cwd alone, and
+    // given the repository root instead it does not error — it silently picks
+    // up whatever OTHER local Supabase stack is running on the machine. Every
+    // `supabase` invocation for a local chamber must run inside supabase_dir.
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-subdir-"));
+    const supabaseDir = join(repository, "database");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+    const project = Object.assign(localProject(repository), { supabase_dir: supabaseDir });
+
+    await executor.execute(
+      runningJob("migration.plan", {}),
+      project,
+      credentials
+    );
+
+    const supabaseCalls = process.calls.filter(
+      (call) => call.argv[0] === "supabase"
+    );
+    expect(supabaseCalls.length).toBeGreaterThan(0);
+    for (const call of supabaseCalls) {
+      expect(call.cwd).toBe(supabaseDir);
+    }
+  });
+
   test("runs a repository SQL file against the local stack, never a stored credential", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-sql-"));
     const sql = "select 1;\n";

@@ -456,11 +456,17 @@ export class LiveSupabaseExecutor implements Executor {
         return this.#executeLocalAuthAdmin(
           job,
           repository,
-          repositoryOid
+          repositoryOid,
+          project.supabase_dir
         );
       }
       if (job.operation === "sql.execute") {
-        return this.#executeLocalSql(job, repository, repositoryOid);
+        return this.#executeLocalSql(
+          job,
+          repository,
+          repositoryOid,
+          project.supabase_dir
+        );
       }
       if (job.operation === "types.generate") {
         return this.#generateTypes(job, project, repository, repositoryOid, null);
@@ -623,7 +629,10 @@ export class LiveSupabaseExecutor implements Executor {
     }
 
     const snapRunner = this.#localSnapRunner(job, repository);
-    const database = await this.#assertLocalStack(repository);
+    const database = await this.#assertLocalStack(
+      repository,
+      project.supabase_dir
+    );
     const args =
       job.operation === "migration.plan"
         ? ["db", "push", "--dry-run", "--local"]
@@ -655,12 +664,12 @@ export class LiveSupabaseExecutor implements Executor {
         )
       : await this.#runCommand(
           [this.#executables.supabase, ...args],
-          repository,
+          project.supabase_dir ?? repository,
           this.#localEnvironment({ NO_COLOR: "1" }),
           []
         );
     if (job.operation === "migration.apply") {
-      await this.#assertLocalStack(repository);
+      await this.#assertLocalStack(repository, project.supabase_dir);
     }
     return {
       output: result.output,
@@ -689,10 +698,11 @@ export class LiveSupabaseExecutor implements Executor {
   async #executeLocalSql(
     job: Job,
     repository: string,
-    repositoryOid: string
+    repositoryOid: string,
+    supabaseDir: string | undefined
   ): Promise<ExecutionResult> {
     const absolutePath = this.#resolveSqlFile(job, repository);
-    const database = await this.#assertLocalStack(repository);
+    const database = await this.#assertLocalStack(repository, supabaseDir);
     const result = await this.#process.run({
       argv: [
         this.#executables.psql,
@@ -732,10 +742,11 @@ export class LiveSupabaseExecutor implements Executor {
   async #executeLocalAuthAdmin(
     job: Job,
     repository: string,
-    repositoryOid: string
+    repositoryOid: string,
+    supabaseDir: string | undefined
   ): Promise<ExecutionResult> {
     const request = localSnapAuthAdmin(job.payload);
-    const database = await this.#assertLocalStack(repository);
+    const database = await this.#assertLocalStack(repository, supabaseDir);
     const result = await this.#process.run({
       argv: [
         this.#executables.psql,
@@ -858,7 +869,8 @@ export class LiveSupabaseExecutor implements Executor {
   }
 
   async #assertLocalStack(
-    repository: string
+    repository: string,
+    supabaseDir?: string
   ): Promise<ReturnType<typeof databaseParts> & { readonly url: string }> {
     const status = await this.#process.run({
       argv: [
@@ -867,7 +879,7 @@ export class LiveSupabaseExecutor implements Executor {
         "--output",
         "json"
       ],
-      cwd: repository,
+      cwd: supabaseDir ?? repository,
       env: this.#localEnvironment({ NO_COLOR: "1" })
     });
     if (status.exitCode !== 0) {
@@ -1275,7 +1287,7 @@ export class LiveSupabaseExecutor implements Executor {
       throw new Error(`Project ${job.project} has no project_ref`);
     }
     if (!credentials) {
-      await this.#assertLocalStack(repository);
+      await this.#assertLocalStack(repository, project.supabase_dir);
     }
     const argv = [
       this.#executables.supabase,
@@ -1291,7 +1303,7 @@ export class LiveSupabaseExecutor implements Executor {
     const secrets = credentials ? Object.values(credentials) : [];
     const result = await this.#process.run({
       argv,
-      cwd: repository,
+      cwd: credentials ? repository : project.supabase_dir ?? repository,
       env: credentials
         ? {
             ...process.env,
