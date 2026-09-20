@@ -661,12 +661,28 @@ export class LiveSupabaseExecutor implements Executor {
       repository,
       project.supabase_dir
     );
-    // `db diff` is the only one of the three that reads the declarative schema
-    // in `schema_paths` and writes a migration; push only ever replays files
-    // that already exist.
+    // `db schema declarative sync` is the one command that reads the
+    // declarative schema tree; `db diff` explicitly no longer does — it
+    // compares the migrations baseline with the database, and the CLI warns as
+    // much. `--no-apply` is not optional here: without it the command prompts,
+    // which in a runner means hanging until the lease expires, and `--apply`
+    // would make an operation named "diff" write to the database.
+    // `--strict-coverage` because the default leaves objects pg-delta cannot
+    // manage silently unmanaged, and an unmanaged object is precisely where a
+    // migration drifts from the schema without anyone being told. A diff that
+    // omits what it does not understand is worse than one that refuses.
     const args =
       job.operation === "migration.diff"
-        ? ["db", "diff", "--local", "-f", migrationFileName(job.payload)]
+        ? [
+            "db",
+            "schema",
+            "declarative",
+            "sync",
+            "--no-apply",
+            "--strict-coverage",
+            "--name",
+            migrationFileName(job.payload)
+          ]
         : job.operation === "migration.plan"
           ? ["db", "push", "--dry-run", "--local"]
           : ["db", "push", "--local"];
