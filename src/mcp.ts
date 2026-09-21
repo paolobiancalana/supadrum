@@ -9,7 +9,8 @@ import { z } from "zod";
 import {
   capabilityNames,
   operationCatalog,
-  operationNames
+  operationNames,
+  operationTargetRefusal
 } from "./catalog.js";
 import {
   configMtime,
@@ -95,15 +96,14 @@ export function createHandlers(
         parsed.project,
         definition.capability
       );
-      // `schema-inspection` e' legittima per un chamber locale, perche'
-      // types.generate la usa. L'altra sua operazione passa invece dalla
-      // Management API, che in locale non esiste: accettarla qui significava
-      // mettere in coda un job che l'executor avrebbe poi rifiutato a meta'
-      // strada, con un errore generico al posto di un codice.
-      if (submitProject.target === "local" && parsed.operation === "schema.inspect") {
+      const refusal = operationTargetRefusal(
+        parsed.operation,
+        submitProject.target
+      );
+      if (refusal) {
         throw new BrokerError(
           "capability_denied",
-          `Project ${parsed.project} is a local chamber: schema.inspect needs the Management API. Use sql.execute against the local stack.`
+          `Project ${parsed.project}: ${refusal}`
         );
       }
       let job = store.submit(parsed);
@@ -176,6 +176,20 @@ export function createHandlers(
       payload: Record<string, unknown>;
       idempotency_key: string;
     }) {
+      // La stessa politica di jobs.submit. Senza, una sessione e' un modo per
+      // chiedere un'operazione che il submit diretto rifiuta.
+      const session = store.getSession(input.session_id);
+      const sessionProject = getConfig().projects[session.project];
+      const sessionRefusal = operationTargetRefusal(
+        input.operation,
+        sessionProject?.target
+      );
+      if (sessionRefusal) {
+        throw new BrokerError(
+          "capability_denied",
+          `Project ${session.project}: ${sessionRefusal}`
+        );
+      }
       const job = store.submitSessionJob(input.session_id, input);
       return publicJob(store, job.id);
     },

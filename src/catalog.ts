@@ -66,3 +66,24 @@ export const operationCatalog = {
   "project.manage": { capability: "project-management", approval: true },
   "types.generate": { capability: "schema-inspection", approval: false }
 } as const satisfies Record<Operation, OperationDefinition>;
+
+/**
+ * Perche' un'operazione puo' non girare su un certo tipo di chamber.
+ *
+ * Sta qui, accanto al catalogo, e non dentro un handler: la stessa politica
+ * serve a `jobs.submit` e a `sessions.exec`, e scritta in uno solo dei due la
+ * sessione diventa il modo per aggirarla. Restituisce il motivo, non un
+ * booleano, perche' chi la riceve deve poter leggere cosa fare invece.
+ */
+export function operationTargetRefusal(
+  operation: Operation,
+  target: "local" | "remote" | undefined
+): string | null {
+  if (target === "local" && operation === "schema.inspect") {
+    return "schema.inspect needs the Management API, which a local stack does not have. Use sql.execute against the local stack.";
+  }
+  if (target !== "local" && operation === "migration.diff") {
+    return "migration.diff needs the shadow database of a local stack: generate the migration locally, review it, then apply it.";
+  }
+  return null;
+}

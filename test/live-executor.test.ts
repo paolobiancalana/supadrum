@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -359,13 +360,13 @@ class SchemaInspectionProcess implements LiveProcess {
         stderr: ""
       };
     }
-    const firstLine = input.stdin?.split("\n", 1)[0] ?? "";
+    const firstLine = input.stdin?.toString().split("\n", 1)[0] ?? "";
     const encodedChecks = firstLine.split(" ", 3)[2] ?? "";
     const requestedChecks = JSON.parse(
       Buffer.from(encodedChecks, "base64").toString("utf8")
     ) as Array<Record<string, unknown>>;
     if (
-      input.stdin?.endsWith(CATALOG_INSPECTION_SQL) ||
+      input.stdin?.toString().endsWith(CATALOG_INSPECTION_SQL) ||
       input.stdin?.includes("'public._prisma_migrations'")
     ) {
       return {
@@ -421,7 +422,7 @@ class SchemaInspectionProcess implements LiveProcess {
       };
     }
     if (
-      input.stdin?.endsWith(MIGRATION_INSPECTION_SQL) ||
+      input.stdin?.toString().endsWith(MIGRATION_INSPECTION_SQL) ||
       input.stdin?.includes("from public._prisma_migrations history")
     ) {
       return {
@@ -572,6 +573,65 @@ describe("live Supabase executor", () => {
         credentials
       )
     ).rejects.toThrow("Types output file must be inside the project repository");
+  });
+
+  test("does not write through a symlink that appears while the CLI runs", async () => {
+    // Il percorso viene verificato prima di lanciare il CLI, che dura: e' la
+    // stessa finestra del digest SQL, su un'altra operazione. Qui il symlink
+    // compare esattamente durante `gen types`.
+    const repository = localRepository("supadrum-types-toctou-");
+    const outside = join(
+      mkdtempSync(join(tmpdir(), "supadrum-types-outside-")),
+      "target.ts"
+    );
+    writeFileSync(outside, "non mi devi toccare");
+    const target = join(repository, "types.ts");
+    class PlantsASymlinkDuringGeneration extends LocalRecordingProcess {
+      override async run(input: LiveProcessInput) {
+        if (input.argv.includes("gen")) symlinkSync(outside, target);
+        return super.run(input);
+      }
+    }
+    const process = new PlantsASymlinkDuringGeneration();
+
+    await new LiveSupabaseExecutor({ process }).execute(
+      runningJob("types.generate", { output: "types.ts", schema: "app" }),
+      localProject(repository),
+      credentials
+    );
+
+    expect(readFileSync(outside, "utf8")).toBe("non mi devi toccare");
+    expect(lstatSync(target).isSymbolicLink()).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe("ok");
+  });
+
+  test("refuses a local chamber whose supabase directory is a symlink outside", async () => {
+    // `supabase_dir` puo' essere una directory vera e contenere
+    // `supabase -> /altro-progetto/supabase`: validare la directory non dice
+    // niente su dove stia il config.toml che il CLI legge davvero.
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-linked-"));
+    const elsewhere = mkdtempSync(join(tmpdir(), "supadrum-altro-"));
+    mkdirSync(join(elsewhere, "supabase"), { recursive: true });
+    writeFileSync(
+      join(elsewhere, "supabase", "config.toml"),
+      'project_id = "altro"\n'
+    );
+    symlinkSync(join(elsewhere, "supabase"), join(repository, "supabase"));
+    const sql = "select 1;\n";
+    writeFileSync(join(repository, "probe.sql"), sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+
+    await expect(
+      new LiveSupabaseExecutor({ process: new LocalRecordingProcess() }).execute(
+        runningJob("sql.execute", {
+          path: "probe.sql",
+          digest,
+          read_only: true
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/resolves outside/);
   });
 
   test("generates types from a local chamber after the loopback preflight", async () => {
@@ -896,7 +956,7 @@ describe("live Supabase executor", () => {
     expect(psql?.argv).toEqual(["psql", "--set", "ON_ERROR_STOP=1"]);
     // Il percorso non deve comparire: se psql lo riceve, rilegge dal disco.
     expect(psql?.argv).not.toContain(join(repository, "probe.sql"));
-    expect(psql?.stdin).toBe(sql);
+    expect(psql?.stdin).toEqual(Buffer.from(sql));
     // The connection comes from the running containers, not from the vault:
     // a local stack has no stored credential to resolve.
     expect(psql?.env.PGHOST).toBe("127.0.0.1");
@@ -937,9 +997,36 @@ describe("live Supabase executor", () => {
     );
 
     const psql = process.calls.find((call) => call.argv[0] === "psql");
-    expect(psql?.stdin).toBe(sql);
-    expect(psql?.stdin).not.toContain("delete from users");
+    expect(psql?.stdin).toEqual(Buffer.from(sql));
+    expect(psql?.stdin?.toString()).not.toContain("delete from users");
     expect(readFileSync(file, "utf8")).toBe("delete from users;\n");
+  });
+
+  test("delivers the hashed bytes even when they are not valid UTF-8", async () => {
+    // Decodificare in UTF-8 sostituisce ogni byte invalido con U+FFFD: il
+    // digest coprirebbe `ff` e a psql arriverebbe `ef bf bd`. Sono gli stessi
+    // byte solo se non si passa mai da una stringa.
+    const repository = localRepository("supadrum-local-sql-bytes-");
+    const bytes = Buffer.concat([
+      Buffer.from("select '"),
+      Buffer.from([0xff]),
+      Buffer.from("';\n")
+    ]);
+    writeFileSync(join(repository, "probe.sql"), bytes);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const process = new LocalRecordingProcess();
+
+    await new LiveSupabaseExecutor({ process }).execute(
+      runningJob("sql.execute", { path: "probe.sql", digest, read_only: true }),
+      localProject(repository),
+      credentials
+    );
+
+    const psql = process.calls.find((call) => call.argv[0] === "psql");
+    expect(psql?.stdin).toEqual(bytes);
+    expect(createHash("sha256").update(psql?.stdin ?? "").digest("hex")).toBe(
+      digest
+    );
   });
 
   test("refuses a local SQL file whose content does not match the announced digest", async () => {
@@ -1571,7 +1658,7 @@ describe("live Supabase executor", () => {
     const command = process.calls[1];
     expect(command?.argv).toEqual(["psql", "--set", "ON_ERROR_STOP=1"]);
     expect(command?.argv).not.toContain(sqlPath);
-    expect(command?.stdin).toBe("select 1;\n");
+    expect(command?.stdin).toEqual(Buffer.from("select 1;\n"));
     expect(command?.env.PGPASSWORD).toBe("db-canary");
     expect(command?.argv.join(" ")).not.toContain("db-canary");
   });

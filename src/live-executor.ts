@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
   constants,
@@ -9,17 +9,11 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  rmSync,
   writeFileSync
 } from "node:fs";
-import {
-  delimiter,
-  dirname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-  sep
-} from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectConfig } from "./config.js";
 import { containedPath } from "./contained-path.js";
@@ -58,16 +52,11 @@ import {
   SCHEMA_INSPECTION_PSQL_ARGS
 } from "./schema-inspection-sql.js";
 
-interface VerifiedSql {
-  readonly path: string;
-  readonly sql: string;
-}
-
 export interface LiveProcessInput {
   readonly argv: readonly string[];
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
-  readonly stdin?: string;
+  readonly stdin?: string | Buffer;
 }
 
 export interface LiveProcessResult {
@@ -795,7 +784,7 @@ export class LiveSupabaseExecutor implements Executor {
     const verified = this.#resolveSqlFile(job, repository);
     const database = await this.#assertLocalStack(repository, supabaseDir);
     const result = await this.#process.run({
-      stdin: verified.sql,
+      stdin: verified,
       argv: [
         this.#executables.psql,
         "--set",
@@ -974,6 +963,16 @@ export class LiveSupabaseExecutor implements Executor {
     if (!existsSync(project)) {
       throw new Error(
         `No Supabase project at ${cwd}: expected ${project}. Set supabase_dir for this project if config.toml lives in a subdirectory.`
+      );
+    }
+    // `existsSync` segue i symlink, quindi trovare il file non dice dove sta.
+    // Validare `supabase_dir` non basta: la directory puo' essere reale e
+    // contenere `supabase -> /altro-progetto/supabase`, e senza supabase_dir
+    // lo stesso vale per `repo/supabase`. Cio' che conta e' dove finisce il
+    // file che il CLI legge davvero, sul percorso dove sta per girare.
+    if (!containedPath(repository, project)) {
+      throw new Error(
+        `The Supabase project at ${project} resolves outside ${repository}: a local chamber runs against its own repository, not one a symlink points at.`
       );
     }
     const status = await this.#process.run({
@@ -1336,7 +1335,7 @@ export class LiveSupabaseExecutor implements Executor {
    * the remote and local executors so both enforce the same contract: what runs
    * is exactly what the caller hashed, and it lives in the repo.
    */
-  #resolveSqlFile(job: Job, repository: string): VerifiedSql {
+  #resolveSqlFile(job: Job, repository: string): Buffer {
     const requestedPath = requiredString(job.payload, "path");
     const digest = requiredString(job.payload, "digest");
     const absolutePath = this.#repositoryPath(repository, requestedPath, "SQL file");
@@ -1355,7 +1354,12 @@ export class LiveSupabaseExecutor implements Executor {
     // repository sostituisce il file in quella finestra e il digest certifica
     // byte che non sono mai stati eseguiti. Cio' che gira e' esattamente cio'
     // che e' stato hashato solo se non torna piu' sul disco.
-    return { path: absolutePath, sql: source.toString("utf8") };
+    //
+    // E resta un Buffer: convertirlo in stringa UTF-8 sostituisce ogni byte non
+    // valido con U+FFFD, quindi il digest coprirebbe `ff` mentre a psql
+    // arriverebbe `ef bf bd`. Sono gli stessi byte solo se non si passa da una
+    // decodifica.
+    return source;
   }
 
   /**
@@ -1445,8 +1449,29 @@ export class LiveSupabaseExecutor implements Executor {
     if (!generated.trim()) {
       throw new Error("Type generation produced no output");
     }
-    mkdirSync(dirname(absolutePath), { recursive: true });
-    writeFileSync(absolutePath, generated);
+    const directory = dirname(absolutePath);
+    mkdirSync(directory, { recursive: true });
+    // Fra la verifica del percorso e questa riga c'e' stato il CLI, che dura:
+    // la stessa finestra del digest SQL. Un symlink comparso nel frattempo
+    // verrebbe seguito da writeFileSync, quindi si ricontrolla la directory e
+    // si scrive un file nuovo accanto, spostandolo poi sopra: rename sostituisce
+    // la voce di directory e non scrive mai attraverso cio' che c'era.
+    if (!containedPath(repository, directory)) {
+      throw new Error(
+        `Types output directory ${directory} resolves outside the project repository`
+      );
+    }
+    const temporary = join(
+      directory,
+      `.${basename(absolutePath)}.${randomUUID()}.tmp`
+    );
+    writeFileSync(temporary, generated, { flag: "wx" });
+    try {
+      renameSync(temporary, absolutePath);
+    } catch (error) {
+      rmSync(temporary, { force: true });
+      throw error;
+    }
     return {
       output: { exit_code: 0, stdout: "", stderr },
       verification: {
@@ -1485,7 +1510,7 @@ export class LiveSupabaseExecutor implements Executor {
         PGSSLMODE: "require"
       },
       [...Object.values(credentials), database.password],
-      verified.sql
+      verified
     );
   }
 
@@ -1669,7 +1694,7 @@ export class LiveSupabaseExecutor implements Executor {
     cwd: string,
     env: NodeJS.ProcessEnv,
     secrets: readonly string[],
-    stdin?: string
+    stdin?: string | Buffer
   ): Promise<ExecutionResult> {
     const result = await this.#process.run({ argv, cwd, env, ...(stdin === undefined ? {} : { stdin }) });
     const stdout = redact(result.stdout, secrets);

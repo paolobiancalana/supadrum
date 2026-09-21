@@ -501,8 +501,12 @@ repository and credential bundle before enabling only that alias. Consecutive
 aliases on one chamber reuse its mounted credentials. A different chamber
 causes drain and rotation. The global FIFO still grants only one job at a time.
 
-Credential-free local chambers may grant `auth-admin` in addition to
-`migrations`. The supported local action resets one active SNAP password
+Credential-free local chambers may grant `auth-admin`, `sql` and
+`schema-inspection` in addition to `migrations`. Two operations are refused
+there regardless of the capability, and refused when the job is submitted
+rather than halfway through it: `schema.inspect`, which needs a Management API
+a local stack does not have, and `migration.diff`, which needs a local shadow
+database. The supported local auth action resets one active SNAP password
 credential to the public development profile without putting a password or
 hash in the queued payload:
 

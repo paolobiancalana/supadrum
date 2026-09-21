@@ -979,6 +979,67 @@ projects:
     });
   });
 
+  test("refuses the same operation through a session, not only through submit", async () => {
+    // Una politica scritta in un handler solo fa della sessione il modo per
+    // aggirarla: sessions.exec accoda un job esattamente come jobs.submit.
+    await using connected = await connect(loadConfig(localConfig()));
+
+    const opened = await connected.client.callTool({
+      name: "sessions.open",
+      arguments: {
+        project: "web",
+        capability: "schema-inspection",
+        repo_sha: "abc123",
+        idempotency_key: "web:lease",
+        ttl_ms: 60_000
+      }
+    });
+    const { session } = structured(
+      opened,
+      z.object({ session: z.object({ id: z.string().uuid() }) })
+    );
+
+    const refused = await connected.client.callTool({
+      name: "sessions.exec",
+      arguments: {
+        session_id: session.id,
+        operation: "schema.inspect",
+        payload: {
+          checks: [{ kind: "relation", schema: "public", name: "users" }]
+        },
+        idempotency_key: "web:lease:inspect"
+      }
+    });
+
+    expect(structured(refused, ERROR_RESULT).error).toMatchObject({
+      code: "capability_denied",
+      retryable: false
+    });
+  });
+
+  test("refuses migration.diff on a chamber that is not local", async () => {
+    // Local-only e' una promessa della PR: accettarla, accodarla e magari
+    // approvarla per farla fallire nell'executor la rende una bugia con un
+    // ritardo.
+    await using connected = await connect(setup().config);
+
+    const refused = await connected.client.callTool({
+      name: "jobs.submit",
+      arguments: {
+        project: "alpha",
+        operation: "migration.diff",
+        payload: { name: "atlas_schema" },
+        repo_sha: "abc123",
+        idempotency_key: "alpha:diff-remote"
+      }
+    });
+
+    expect(structured(refused, ERROR_RESULT).error).toMatchObject({
+      code: "capability_denied",
+      retryable: false
+    });
+  });
+
   test("refuses a migration name that would not be a filename", async () => {
     await using connected = await connect(loadConfig(localConfig()));
 
