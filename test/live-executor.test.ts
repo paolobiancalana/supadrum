@@ -893,13 +893,10 @@ describe("live Supabase executor", () => {
     );
 
     const psql = process.calls.find((call) => call.argv[0] === "psql");
-    expect(psql?.argv).toEqual([
-      "psql",
-      "--set",
-      "ON_ERROR_STOP=1",
-      "--file",
-      join(repository, "probe.sql")
-    ]);
+    expect(psql?.argv).toEqual(["psql", "--set", "ON_ERROR_STOP=1"]);
+    // Il percorso non deve comparire: se psql lo riceve, rilegge dal disco.
+    expect(psql?.argv).not.toContain(join(repository, "probe.sql"));
+    expect(psql?.stdin).toBe(sql);
     // The connection comes from the running containers, not from the vault:
     // a local stack has no stored credential to resolve.
     expect(psql?.env.PGHOST).toBe("127.0.0.1");
@@ -911,6 +908,38 @@ describe("live Supabase executor", () => {
       target: "local",
       local_preflight: true
     });
+  });
+
+  test("runs the bytes it hashed even when the file changes before psql starts", async () => {
+    const repository = localRepository("supadrum-local-sql-toctou-");
+    const file = join(repository, "probe.sql");
+    const sql = "select 1;\n";
+    writeFileSync(file, sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+    // Fra la verifica del digest e l'avvio di psql c'e' almeno uno
+    // `supabase status`, che e' un processo vero e dura. Chiunque possa
+    // scrivere nella repository ha quella finestra: qui la sostituzione
+    // avviene esattamente li' dentro.
+    class SwapsTheFileDuringStatus extends LocalRecordingProcess {
+      override async run(input: LiveProcessInput) {
+        if (input.argv.includes("status")) {
+          writeFileSync(file, "delete from users;\n");
+        }
+        return super.run(input);
+      }
+    }
+    const process = new SwapsTheFileDuringStatus();
+
+    await new LiveSupabaseExecutor({ process }).execute(
+      runningJob("sql.execute", { path: "probe.sql", digest, read_only: true }),
+      localProject(repository),
+      credentials
+    );
+
+    const psql = process.calls.find((call) => call.argv[0] === "psql");
+    expect(psql?.stdin).toBe(sql);
+    expect(psql?.stdin).not.toContain("delete from users");
+    expect(readFileSync(file, "utf8")).toBe("delete from users;\n");
   });
 
   test("refuses a local SQL file whose content does not match the announced digest", async () => {
@@ -1540,13 +1569,9 @@ describe("live Supabase executor", () => {
     );
 
     const command = process.calls[1];
-    expect(command?.argv).toEqual([
-      "psql",
-      "--set",
-      "ON_ERROR_STOP=1",
-      "--file",
-      sqlPath
-    ]);
+    expect(command?.argv).toEqual(["psql", "--set", "ON_ERROR_STOP=1"]);
+    expect(command?.argv).not.toContain(sqlPath);
+    expect(command?.stdin).toBe("select 1;\n");
     expect(command?.env.PGPASSWORD).toBe("db-canary");
     expect(command?.argv.join(" ")).not.toContain("db-canary");
   });

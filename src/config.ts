@@ -1,13 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
-import {
-  basename,
-  dirname,
-  isAbsolute,
-  relative,
-  resolve,
-  sep
-} from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { parse } from "yaml";
+import { containedPath } from "./contained-path.js";
 import { z } from "zod";
 
 import { CapabilitySchema, OperationSchema } from "./domain.js";
@@ -254,13 +248,14 @@ export function loadConfig(path: string): SupadrumConfig {
       resolvedRepo && input.supabase_dir
         ? resolve(resolvedRepo, input.supabase_dir)
         : undefined;
-    if (resolvedSupabaseDir && resolvedRepo) {
-      const inside = relative(resolvedRepo, resolvedSupabaseDir);
-      if (isAbsolute(inside) || inside === ".." || inside.startsWith(`..${sep}`)) {
-        throw new Error(
-          `Project ${name} sets supabase_dir outside its repository`
-        );
-      }
+    if (
+      resolvedSupabaseDir &&
+      resolvedRepo &&
+      !containedPath(resolvedRepo, resolvedSupabaseDir)
+    ) {
+      throw new Error(
+        `Project ${name} sets supabase_dir outside its repository`
+      );
     }
     projects[name] = {
       ...(resolvedRepo ? { repo: resolvedRepo } : {}),

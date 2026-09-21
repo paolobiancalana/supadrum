@@ -90,7 +90,22 @@ export function createHandlers(
           }
         >
       )[parsed.operation];
-      assertProjectCapability(getConfig(), parsed.project, definition.capability);
+      const submitProject = assertProjectCapability(
+        getConfig(),
+        parsed.project,
+        definition.capability
+      );
+      // `schema-inspection` e' legittima per un chamber locale, perche'
+      // types.generate la usa. L'altra sua operazione passa invece dalla
+      // Management API, che in locale non esiste: accettarla qui significava
+      // mettere in coda un job che l'executor avrebbe poi rifiutato a meta'
+      // strada, con un errore generico al posto di un codice.
+      if (submitProject.target === "local" && parsed.operation === "schema.inspect") {
+        throw new BrokerError(
+          "capability_denied",
+          `Project ${parsed.project} is a local chamber: schema.inspect needs the Management API. Use sql.execute against the local stack.`
+        );
+      }
       let job = store.submit(parsed);
       if (job.requires_approval && job.approved_at === null) {
         job = store.transition(job.id, "waiting_approval");

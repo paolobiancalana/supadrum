@@ -113,7 +113,9 @@ function submit(
     payload:
       operation === "migration.baseline"
         ? { migrations: ["001_init"] }
-        : { migration: `${suffix}.sql` },
+        : operation === "migration.diff"
+          ? { name: "atlas_schema" }
+          : { migration: `${suffix}.sql` },
     repo_sha: "abc123",
     idempotency_key: `${project}:abc123:${suffix}`
   });
@@ -221,6 +223,11 @@ describe("global scheduler", () => {
   });
 
   test.each([
+    // migration.diff genera una migrazione nella repository: e' una scrittura
+    // di migrazione come le altre, quindi il gate owner-only vale anche per
+    // lei. La `store.approve` qui sotto la prova anche richiesta ad approvazione:
+    // su un'operazione approval-free solleverebbe approval_not_required.
+    "migration.diff",
     "migration.apply",
     "migration.baseline"
   ] as const)("rejects %s from a chamber consumer before credential resolution", async (operation) => {

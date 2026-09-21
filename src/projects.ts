@@ -581,8 +581,14 @@ export function addProject(input: {
  * una registrazione che non funziona.
  */
 function nestedSupabaseDirectory(repository: string): string | undefined {
-  if (existsSync(join(repository, "supabase", "config.toml"))) return undefined;
-  const candidates = readdirSync(repository, { withFileTypes: true })
+  // La radice non vince per posizione. Se esistono sia `supabase/config.toml`
+  // alla radice sia un progetto annidato, quale dei due sia quello giusto e'
+  // una domanda, non un dettaglio: sceglierne uno in silenzio e' esattamente
+  // come si finisce a parlare con lo stack sbagliato.
+  const root = existsSync(join(repository, "supabase", "config.toml"))
+    ? [""]
+    : [];
+  const candidates = root.concat(readdirSync(repository, { withFileTypes: true })
     .filter(
       (entry) =>
         entry.isDirectory() &&
@@ -592,16 +598,18 @@ function nestedSupabaseDirectory(repository: string): string | undefined {
     .map((entry) => entry.name)
     .filter((name) =>
       existsSync(join(repository, name, "supabase", "config.toml"))
-    );
+    ));
   const [only] = candidates;
-  if (candidates.length === 1 && only) return only;
+  if (candidates.length === 1 && only !== undefined) {
+    return only === "" ? undefined : only;
+  }
   if (candidates.length === 0) {
     throw new Error(
       `No supabase/config.toml in ${repository} or its immediate subdirectories: a local chamber needs one. Add the project by hand with supabase_dir if it lives deeper.`
     );
   }
   throw new Error(
-    `Several Supabase projects in ${repository} (${candidates.join(", ")}): add the project by hand with supabase_dir to say which one.`
+    `Several Supabase projects in ${repository} (${candidates.map((name) => name === "" ? "." : name).join(", ")}): add the project by hand with supabase_dir to say which one.`
   );
 }
 

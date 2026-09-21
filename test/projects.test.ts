@@ -5,6 +5,7 @@ import {
   readFileSync,
   realpathSync,
   statSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -461,6 +462,28 @@ projects:
     ).toThrow(/Several Supabase projects/);
   });
 
+  test("si ferma anche quando uno dei due progetti sta alla radice", () => {
+    // La radice non vince per posizione: se ce ne sono due, quale sia quello
+    // giusto e' una domanda. Sceglierne uno in silenzio e' come si finisce a
+    // parlare con lo stack sbagliato, che e' il bug da cui nasce supabase_dir.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-ambiguous-root-"));
+    const repository = join(root, "monorepo");
+    createGitRepository(repository);
+    mkdirSync(join(repository, "database", "supabase"), { recursive: true });
+    writeFileSync(
+      join(repository, "database", "supabase", "config.toml"),
+      'project_id = "nested"\n'
+    );
+
+    expect(() =>
+      addLocalProject({
+        alias: "monorepo",
+        repository,
+        config_path: join(root, "config", "config.yml")
+      })
+    ).toThrow(/Several Supabase projects/);
+  });
+
   test("creates a credential-free live chamber for a local Supabase stack", () => {
     const root = mkdtempSync(join(tmpdir(), "supadrum-local-add-"));
     const repository = join(root, "materic-ai");
@@ -637,6 +660,44 @@ projects:
     const project = loadConfig(configPath).projects["presnap-local"];
 
     expect(project?.supabase_dir).toBeUndefined();
+  });
+
+  test("refuses a supabase_dir that reaches another project through a symlink", () => {
+    // Il controllo lessicale legge `repo/database` come interno: e' il percorso
+    // scritto nella config. Ma se e' un symlink, lo stack che il broker
+    // interroga sta in un'altra repository, che e' esattamente il bug per cui
+    // questo campo esiste.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-symlink-"));
+    const repository = join(root, "example-web");
+    const sibling = join(root, "altro-progetto", "database");
+    createGitRepository(repository);
+    mkdirSync(join(sibling, "supabase"), { recursive: true });
+    writeFileSync(
+      join(sibling, "supabase", "config.toml"),
+      'project_id = "altro"\n'
+    );
+    symlinkSync(sibling, join(repository, "database"));
+    const configPath = join(root, "config.yml");
+    writeFileSync(
+      configPath,
+      `
+version: 1
+database: queue.sqlite
+chambers:
+  local:
+    target: local
+projects:
+  example-web:
+    repo: ${repository}
+    supabase_dir: database
+    chamber: local
+    capabilities: [migrations]
+`
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(
+      /supabase_dir outside its repository/
+    );
   });
 
   test("refuses a supabase_dir that points outside the repository", () => {

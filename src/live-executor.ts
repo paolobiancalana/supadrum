@@ -22,6 +22,8 @@ import {
 } from "node:path";
 
 import type { ProjectConfig } from "./config.js";
+import { containedPath } from "./contained-path.js";
+import { parseMigrationDiffPayload } from "./migration-diff.js";
 import type { ExecutionResult, Job } from "./domain.js";
 import type {
   Executor,
@@ -55,6 +57,11 @@ import {
   PRISMA_MIGRATION_INSPECTION_SQL,
   SCHEMA_INSPECTION_PSQL_ARGS
 } from "./schema-inspection-sql.js";
+
+interface VerifiedSql {
+  readonly path: string;
+  readonly sql: string;
+}
 
 export interface LiveProcessInput {
   readonly argv: readonly string[];
@@ -378,21 +385,6 @@ function requiredString(
   return value;
 }
 
-/**
- * A migration name reaches the CLI as a filename, so it is validated instead of
- * trusted: anything outside this alphabet could climb out of the migrations
- * directory or be read as a flag. Same alphabet the CLI itself generates.
- */
-function migrationFileName(payload: Record<string, unknown>): string {
-  const name = requiredString(payload, "name");
-  if (!/^[a-z0-9_]+$/.test(name)) {
-    throw new Error(
-      "Migration name must use only lowercase letters, digits and underscores"
-    );
-  }
-  return name;
-}
-
 export function databasePassword(databaseAccess: string): string {
   let parsed: URL;
   try {
@@ -685,7 +677,7 @@ export class LiveSupabaseExecutor implements Executor {
             "--no-apply",
             "--strict-coverage",
             "--name",
-            migrationFileName(job.payload)
+            parseMigrationDiffPayload(job.payload)
           ]
         : job.operation === "migration.plan"
           ? ["db", "push", "--dry-run", "--local"]
@@ -800,15 +792,14 @@ export class LiveSupabaseExecutor implements Executor {
     repositoryOid: string,
     supabaseDir: string | undefined
   ): Promise<ExecutionResult> {
-    const absolutePath = this.#resolveSqlFile(job, repository);
+    const verified = this.#resolveSqlFile(job, repository);
     const database = await this.#assertLocalStack(repository, supabaseDir);
     const result = await this.#process.run({
+      stdin: verified.sql,
       argv: [
         this.#executables.psql,
         "--set",
-        "ON_ERROR_STOP=1",
-        "--file",
-        absolutePath
+        "ON_ERROR_STOP=1"
       ],
       cwd: repository,
       env: this.#localEnvironment({
@@ -1345,7 +1336,7 @@ export class LiveSupabaseExecutor implements Executor {
    * the remote and local executors so both enforce the same contract: what runs
    * is exactly what the caller hashed, and it lives in the repo.
    */
-  #resolveSqlFile(job: Job, repository: string): string {
+  #resolveSqlFile(job: Job, repository: string): VerifiedSql {
     const requestedPath = requiredString(job.payload, "path");
     const digest = requiredString(job.payload, "digest");
     const absolutePath = this.#repositoryPath(repository, requestedPath, "SQL file");
@@ -1358,7 +1349,13 @@ export class LiveSupabaseExecutor implements Executor {
         `SQL file digest mismatch: expected ${digest}, got ${actualDigest}`
       );
     }
-    return absolutePath;
+    // Si restituisce il CONTENUTO, non il percorso. Passare il percorso a psql
+    // significava rileggere il file dopo averlo verificato, e fra le due letture
+    // c'e' almeno uno `supabase status`: chiunque possa scrivere nella
+    // repository sostituisce il file in quella finestra e il digest certifica
+    // byte che non sono mai stati eseguiti. Cio' che gira e' esattamente cio'
+    // che e' stato hashato solo se non torna piu' sul disco.
+    return { path: absolutePath, sql: source.toString("utf8") };
   }
 
   /**
@@ -1371,25 +1368,8 @@ export class LiveSupabaseExecutor implements Executor {
    * che sia a sua volta un symlink invece di scriverci attraverso.
    */
   #repositoryPath(repository: string, requested: string, what: string): string {
-    const absolutePath = resolve(repository, requested);
-    const outside = (from: string, to: string): boolean => {
-      const step = relative(from, to);
-      return (
-        isAbsolute(step) || step === ".." || step.startsWith(`..${sep}`)
-      );
-    };
-    if (outside(resolve(repository), absolutePath)) {
-      throw new Error(`${what} must be inside the project repository`);
-    }
-
-    const realRepository = realpathSync(resolve(repository));
-    let ancestor = absolutePath;
-    while (!existsSync(ancestor)) {
-      const parent = dirname(ancestor);
-      if (parent === ancestor) break;
-      ancestor = parent;
-    }
-    if (outside(realRepository, realpathSync(ancestor))) {
+    const absolutePath = containedPath(repository, requested);
+    if (!absolutePath) {
       throw new Error(`${what} must be inside the project repository`);
     }
 
@@ -1486,15 +1466,13 @@ export class LiveSupabaseExecutor implements Executor {
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
     const repository = project.repo as string;
-    const absolutePath = this.#resolveSqlFile(job, repository);
+    const verified = this.#resolveSqlFile(job, repository);
     const database = databaseParts(credentials.database_access);
     return this.#runCommand(
       [
         this.#executables.psql,
         "--set",
-        "ON_ERROR_STOP=1",
-        "--file",
-        absolutePath
+        "ON_ERROR_STOP=1"
       ],
       repository,
       {
@@ -1506,7 +1484,8 @@ export class LiveSupabaseExecutor implements Executor {
         PGPASSWORD: database.password,
         PGSSLMODE: "require"
       },
-      [...Object.values(credentials), database.password]
+      [...Object.values(credentials), database.password],
+      verified.sql
     );
   }
 
@@ -1689,9 +1668,10 @@ export class LiveSupabaseExecutor implements Executor {
     argv: readonly string[],
     cwd: string,
     env: NodeJS.ProcessEnv,
-    secrets: readonly string[]
+    secrets: readonly string[],
+    stdin?: string
   ): Promise<ExecutionResult> {
-    const result = await this.#process.run({ argv, cwd, env });
+    const result = await this.#process.run({ argv, cwd, env, ...(stdin === undefined ? {} : { stdin }) });
     const stdout = redact(result.stdout, secrets);
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {

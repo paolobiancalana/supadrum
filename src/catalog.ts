@@ -49,9 +49,12 @@ export const operationCatalog = {
   "realtime.admin": { capability: "realtime", approval: true },
   "functions.deploy": { capability: "edge-functions", approval: true },
   "secrets.set": { capability: "secrets", approval: true },
-  // Writing a migration file into the repository is the same blast radius as
-  // types.generate: reviewable, reversible, and nowhere near a database write.
-  "migration.diff": { capability: "migrations", approval: false },
+  // Not the same blast radius as types.generate, which this used to claim: a
+  // generated types file mirrors a database that already exists, while a
+  // generated migration is executable intent that someone will later apply to
+  // one. The artifact is the whole point of the operation, so it gets the gate
+  // that every other repository mutation gets.
+  "migration.diff": { capability: "migrations", approval: true },
   "migration.plan": { capability: "migrations", approval: false },
   "migration.baseline": { capability: "migrations", approval: true },
   "migration.apply": { capability: "migrations", approval: true },
