@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -111,6 +115,25 @@ function localProject(repository: string): ProjectConfig {
   });
 }
 
+/**
+ * Una repository che e' davvero un progetto Supabase. L'executor rifiuta un
+ * chamber locale senza `supabase/config.toml`, perche' il CLI, non trovando un
+ * progetto nella cwd, riporterebbe in silenzio lo stato di un altro stack in
+ * esecuzione sulla macchina: le fixture devono avere cio' che un repo vero ha.
+ */
+function localRepository(prefix: string, supabaseDir?: string): string {
+  const repository = mkdtempSync(join(tmpdir(), prefix));
+  const projectDirectory = supabaseDir
+    ? join(repository, supabaseDir)
+    : repository;
+  mkdirSync(join(projectDirectory, "supabase"), { recursive: true });
+  writeFileSync(
+    join(projectDirectory, "supabase", "config.toml"),
+    'project_id = "fixture"\n'
+  );
+  return repository;
+}
+
 class LocalRecordingProcess implements LiveProcess {
   readonly calls: LiveProcessInput[] = [];
 
@@ -140,6 +163,26 @@ class LocalRecordingProcess implements LiveProcess {
       };
     }
     return { exitCode: 0, stdout: "ok", stderr: "" };
+  }
+}
+
+class TypesProcess implements LiveProcess {
+  readonly calls: LiveProcessInput[] = [];
+
+  async run(input: LiveProcessInput) {
+    this.calls.push(input);
+    if (input.argv[0] === "git") {
+      return {
+        exitCode: 0,
+        stdout: `${FULL_REPOSITORY_OID}\n${FULL_REPOSITORY_OID}\n`,
+        stderr: ""
+      };
+    }
+    return {
+      exitCode: 0,
+      stdout: "export type Database = { public: { Tables: {} } };\n",
+      stderr: ""
+    };
   }
 }
 
@@ -317,13 +360,13 @@ class SchemaInspectionProcess implements LiveProcess {
         stderr: ""
       };
     }
-    const firstLine = input.stdin?.split("\n", 1)[0] ?? "";
+    const firstLine = input.stdin?.toString().split("\n", 1)[0] ?? "";
     const encodedChecks = firstLine.split(" ", 3)[2] ?? "";
     const requestedChecks = JSON.parse(
       Buffer.from(encodedChecks, "base64").toString("utf8")
     ) as Array<Record<string, unknown>>;
     if (
-      input.stdin?.endsWith(CATALOG_INSPECTION_SQL) ||
+      input.stdin?.toString().endsWith(CATALOG_INSPECTION_SQL) ||
       input.stdin?.includes("'public._prisma_migrations'")
     ) {
       return {
@@ -379,7 +422,7 @@ class SchemaInspectionProcess implements LiveProcess {
       };
     }
     if (
-      input.stdin?.endsWith(MIGRATION_INSPECTION_SQL) ||
+      input.stdin?.toString().endsWith(MIGRATION_INSPECTION_SQL) ||
       input.stdin?.includes("from public._prisma_migrations history")
     ) {
       return {
@@ -481,8 +524,141 @@ describe("live Supabase executor", () => {
     );
   });
 
+  test("generates types into the repository with the token in the environment only", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const process = new TypesProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    const result = await executor.execute(
+      runningJob("types.generate", { output: "src/types/db.ts" }),
+      liveProject(repository),
+      credentials
+    );
+
+    const command = process.calls[1];
+    expect(command?.argv).toEqual([
+      "supabase",
+      "gen",
+      "types",
+      "typescript",
+      "--schema",
+      "public",
+      "--project-id",
+      "abcdefghijklmnopqrst"
+    ]);
+    expect(command?.env.SUPABASE_ACCESS_TOKEN).toBe("management-canary");
+    expect(command?.argv.join(" ")).not.toMatch(/management-canary/);
+    const written = readFileSync(join(repository, "src/types/db.ts"), "utf8");
+    expect(written).toContain("export type Database");
+    expect(result).toMatchObject({
+      output: { exit_code: 0, stdout: "" },
+      verification: {
+        repo_sha_verified: true,
+        output: join("src", "types", "db.ts"),
+        bytes: Buffer.byteLength(written),
+        digest: createHash("sha256").update(written).digest("hex")
+      }
+    });
+    expect(JSON.stringify(result)).not.toMatch(/management-canary|Database/);
+  });
+
+  test("refuses a types output path outside the repository", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const executor = new LiveSupabaseExecutor({ process: new TypesProcess() });
+
+    await expect(
+      executor.execute(
+        runningJob("types.generate", { output: "../escaped.ts" }),
+        liveProject(repository),
+        credentials
+      )
+    ).rejects.toThrow("Types output file must be inside the project repository");
+  });
+
+  test("does not write through a symlink that appears while the CLI runs", async () => {
+    // Il percorso viene verificato prima di lanciare il CLI, che dura: e' la
+    // stessa finestra del digest SQL, su un'altra operazione. Qui il symlink
+    // compare esattamente durante `gen types`.
+    const repository = localRepository("supadrum-types-toctou-");
+    const outside = join(
+      mkdtempSync(join(tmpdir(), "supadrum-types-outside-")),
+      "target.ts"
+    );
+    writeFileSync(outside, "non mi devi toccare");
+    const target = join(repository, "types.ts");
+    class PlantsASymlinkDuringGeneration extends LocalRecordingProcess {
+      override async run(input: LiveProcessInput) {
+        if (input.argv.includes("gen")) symlinkSync(outside, target);
+        return super.run(input);
+      }
+    }
+    const process = new PlantsASymlinkDuringGeneration();
+
+    await new LiveSupabaseExecutor({ process }).execute(
+      runningJob("types.generate", { output: "types.ts", schema: "app" }),
+      localProject(repository),
+      credentials
+    );
+
+    expect(readFileSync(outside, "utf8")).toBe("non mi devi toccare");
+    expect(lstatSync(target).isSymbolicLink()).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe("ok");
+  });
+
+  test("refuses a local chamber whose supabase directory is a symlink outside", async () => {
+    // `supabase_dir` puo' essere una directory vera e contenere
+    // `supabase -> /altro-progetto/supabase`: validare la directory non dice
+    // niente su dove stia il config.toml che il CLI legge davvero.
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-linked-"));
+    const elsewhere = mkdtempSync(join(tmpdir(), "supadrum-altro-"));
+    mkdirSync(join(elsewhere, "supabase"), { recursive: true });
+    writeFileSync(
+      join(elsewhere, "supabase", "config.toml"),
+      'project_id = "altro"\n'
+    );
+    symlinkSync(join(elsewhere, "supabase"), join(repository, "supabase"));
+    const sql = "select 1;\n";
+    writeFileSync(join(repository, "probe.sql"), sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+
+    await expect(
+      new LiveSupabaseExecutor({ process: new LocalRecordingProcess() }).execute(
+        runningJob("sql.execute", {
+          path: "probe.sql",
+          digest,
+          read_only: true
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/resolves outside/);
+  });
+
+  test("generates types from a local chamber after the loopback preflight", async () => {
+    const repository = localRepository("supadrum-types-local-");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    const result = await executor.execute(
+      runningJob("types.generate", { output: "types.ts", schema: "app" }),
+      localProject(repository),
+      credentials
+    );
+
+    expect(process.calls.map((call) => call.argv)).toEqual([
+      ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
+      ["supabase", "status", "--output", "json"],
+      ["supabase", "gen", "types", "typescript", "--schema", "app", "--local"]
+    ]);
+    expect(process.calls[2]?.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    expect(readFileSync(join(repository, "types.ts"), "utf8")).toBe("ok");
+    expect(result).toMatchObject({
+      verification: { target: "local", local_preflight: true, bytes: 2 }
+    });
+  });
+
   test("plans a local chamber only after a loopback preflight", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-"));
+    const repository = localRepository("supadrum-local-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -510,8 +686,388 @@ describe("live Supabase executor", () => {
     });
   });
 
+  test("targets supabase_dir, not the repository root, when the project isn't there", async () => {
+    // A repository whose `supabase/config.toml` lives in a subdirectory: the
+    // Supabase CLI resolves "the current project" from its cwd alone, and
+    // given the repository root instead it does not error — it silently picks
+    // up whatever OTHER local Supabase stack is running on the machine. Every
+    // `supabase` invocation for a local chamber must run inside supabase_dir.
+    const repository = localRepository("supadrum-local-subdir-", "database");
+    const supabaseDir = join(repository, "database");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+    const project = Object.assign(localProject(repository), { supabase_dir: supabaseDir });
+
+    await executor.execute(
+      runningJob("migration.plan", {}),
+      project,
+      credentials
+    );
+
+    const supabaseCalls = process.calls.filter(
+      (call) => call.argv[0] === "supabase"
+    );
+    expect(supabaseCalls.length).toBeGreaterThan(0);
+    for (const call of supabaseCalls) {
+      expect(call.cwd).toBe(supabaseDir);
+    }
+  });
+
+  test("generates a migration from the declarative schema, inside supabase_dir", async () => {
+    // Without a diff the declarative workflow has no exit: `db push` only
+    // replays migration files that already exist, so a schema change could
+    // reach the database only by hand-writing the migration it should have
+    // produced — and a hand-written one is free to drift from schemas/.
+    const repository = localRepository("supadrum-local-diff-", "database");
+    const supabaseDir = join(repository, "database");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+    const project = Object.assign(localProject(repository), {
+      supabase_dir: supabaseDir
+    });
+
+    const result = await executor.execute(
+      runningJob("migration.diff", { name: "atlas_01_schema_rls" }),
+      project,
+      credentials
+    );
+
+    // The argv is asserted exactly, flag for flag, because two of them carry
+    // the operation's guarantees rather than its mechanics: `--no-apply` keeps
+    // an approval-free operation away from the database (and out of an
+    // interactive prompt that would hang the runner), and `--strict-coverage`
+    // makes it refuse rather than silently skip what it cannot manage.
+    expect(process.calls.map((call) => call.argv)).toEqual([
+      ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
+      ["supabase", "status", "--output", "json"],
+      [
+        "supabase",
+        "db",
+        "schema",
+        "declarative",
+        "sync",
+        "--no-apply",
+        "--strict-coverage",
+        "--name",
+        "atlas_01_schema_rls"
+      ]
+    ]);
+    for (const call of process.calls.filter(
+      (candidate) => candidate.argv[0] === "supabase"
+    )) {
+      expect(call.cwd).toBe(supabaseDir);
+      expect(call.argv).not.toContain("--linked");
+      expect(call.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    }
+    expect(result.verification).toMatchObject({
+      target: "local",
+      local_preflight: true
+    });
+  });
+
+  test("refuses a local chamber whose directory holds no Supabase project", async () => {
+    // Fail-closed: il CLI, non trovando un progetto nella cwd, riporta lo stato
+    // di qualunque altro stack stia girando sulla macchina. Senza questo
+    // controllo il job non falliva — veniva dirottato in silenzio.
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-noproject-"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    await expect(
+      executor.execute(
+        runningJob("migration.plan", {}),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/No Supabase project at .*expected .*config\.toml/s);
+
+    expect(
+      process.calls.filter((call) => call.argv[0] === "supabase")
+    ).toEqual([]);
+  });
+
+  test("refuses to write types through a symlink that leaves the repository", async () => {
+    // Il controllo lessicale diceva "dentro la repository" e `writeFileSync`
+    // seguiva comunque il link: la garanzia era falsa proprio dove serviva.
+    const repository = localRepository("supadrum-symlink-");
+    const outside = mkdtempSync(join(tmpdir(), "supadrum-outside-"));
+    writeFileSync(join(outside, "target.ts"), "preesistente\n");
+    symlinkSync(join(outside, "target.ts"), join(repository, "types.ts"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    await expect(
+      executor.execute(
+        runningJob("types.generate", { output: "types.ts", schema: "app" }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/must be inside the project repository/);
+
+    // La prova che conta: il file fuori dalla repository non e' stato toccato.
+    expect(readFileSync(join(outside, "target.ts"), "utf8")).toBe(
+      "preesistente\n"
+    );
+  });
+
+  test("refuses to write through a symlink even when it stays inside", async () => {
+    // Resta dentro, quindi il controllo sugli antenati lo lascerebbe passare,
+    // ma i byte finirebbero in un file diverso da quello dichiarato: il path
+    // riportato nel risultato non sarebbe dove il contenuto e' atterrato.
+    const repository = localRepository("supadrum-symlink-inside-");
+    writeFileSync(join(repository, "reale.ts"), "preesistente\n");
+    symlinkSync(join(repository, "reale.ts"), join(repository, "types.ts"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    await expect(
+      executor.execute(
+        runningJob("types.generate", { output: "types.ts", schema: "app" }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/must not be a symbolic link/);
+
+    expect(readFileSync(join(repository, "reale.ts"), "utf8")).toBe(
+      "preesistente\n"
+    );
+  });
+
+  test("refuses a path whose real ancestor leaves the repository", async () => {
+    const repository = localRepository("supadrum-symlink-dir-");
+    const outside = mkdtempSync(join(tmpdir(), "supadrum-outside-dir-"));
+    symlinkSync(outside, join(repository, "generated"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    await expect(
+      executor.execute(
+        runningJob("types.generate", {
+          output: "generated/types.ts",
+          schema: "app"
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/must be inside the project repository/);
+
+    expect(existsSync(join(outside, "types.ts"))).toBe(false);
+  });
+
+  test("reports the migration a diff produced, or that there was none", async () => {
+    // Un diff che non dice cosa ha prodotto non e' revisionabile: chi lo riceve
+    // non sa se rileggere un file o se non c'era niente da cambiare.
+    const repository = localRepository("supadrum-diff-artifact-", "database");
+    const migrations = join(repository, "database", "supabase", "migrations");
+    mkdirSync(migrations, { recursive: true });
+    const body = "create table public.t ();\n";
+    const project = Object.assign(localProject(repository), {
+      supabase_dir: join(repository, "database")
+    });
+
+    class WritingProcess extends LocalRecordingProcess {
+      override async run(input: LiveProcessInput) {
+        if (input.argv.includes("sync")) {
+          writeFileSync(join(migrations, "20260921000000_x.sql"), body);
+        }
+        return super.run(input);
+      }
+    }
+
+    const produced = await new LiveSupabaseExecutor({
+      process: new WritingProcess()
+    }).execute(runningJob("migration.diff", { name: "x" }), project, credentials);
+
+    expect(produced.verification).toMatchObject({
+      changed: true,
+      output: join("database", "supabase", "migrations", "20260921000000_x.sql"),
+      digest: createHash("sha256").update(body).digest("hex"),
+      bytes: body.length
+    });
+
+    // Nessun file nuovo: "nessuna differenza", non un silenzio ambiguo.
+    const quiet = await new LiveSupabaseExecutor({
+      process: new LocalRecordingProcess()
+    }).execute(runningJob("migration.diff", { name: "y" }), project, credentials);
+
+    expect(quiet.verification).toMatchObject({ changed: false });
+    expect(quiet.verification).not.toHaveProperty("digest");
+  });
+
+  test("refuses a migration name that could leave the directory or pass as a flag", async () => {
+    const repository = localRepository("supadrum-local-diff-name-");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    for (const name of [
+      "../../../etc/passwd",
+      "--linked",
+      "schema rls",
+      "Schema",
+      "atlas;drop"
+    ]) {
+      await expect(
+        executor.execute(
+          runningJob("migration.diff", { name }),
+          localProject(repository),
+          credentials
+        )
+      ).rejects.toThrow(/lowercase letters, digits and underscores/);
+    }
+
+    expect(
+      process.calls.filter((call) => call.argv.includes("diff"))
+    ).toEqual([]);
+  });
+
+  test("refuses to diff a linked project, naming why", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-remote-diff-"));
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    await expect(
+      executor.execute(
+        runningJob("migration.diff", { name: "atlas_01_schema_rls" }),
+        liveProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/only on a local chamber/);
+
+    expect(
+      process.calls.filter((call) => call.argv.includes("diff"))
+    ).toEqual([]);
+  });
+
+  test("runs a repository SQL file against the local stack, never a stored credential", async () => {
+    const repository = localRepository("supadrum-local-sql-");
+    const sql = "select 1;\n";
+    writeFileSync(join(repository, "probe.sql"), sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+    const process = new LocalRecordingProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+
+    const result = await executor.execute(
+      runningJob("sql.execute", { path: "probe.sql", digest, read_only: true }),
+      localProject(repository),
+      credentials
+    );
+
+    const psql = process.calls.find((call) => call.argv[0] === "psql");
+    expect(psql?.argv).toEqual(["psql", "--set", "ON_ERROR_STOP=1"]);
+    // Il percorso non deve comparire: se psql lo riceve, rilegge dal disco.
+    expect(psql?.argv).not.toContain(join(repository, "probe.sql"));
+    expect(psql?.stdin).toEqual(Buffer.from(sql));
+    // The connection comes from the running containers, not from the vault:
+    // a local stack has no stored credential to resolve.
+    expect(psql?.env.PGHOST).toBe("127.0.0.1");
+    expect(psql?.env.PGPORT).toBe("54322");
+    expect(psql?.env.PGSSLMODE).toBe("disable");
+    expect(psql?.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    expect(result.verification).toMatchObject({
+      repo_sha_verified: true,
+      target: "local",
+      local_preflight: true
+    });
+  });
+
+  test("runs the bytes it hashed even when the file changes before psql starts", async () => {
+    const repository = localRepository("supadrum-local-sql-toctou-");
+    const file = join(repository, "probe.sql");
+    const sql = "select 1;\n";
+    writeFileSync(file, sql);
+    const digest = createHash("sha256").update(sql).digest("hex");
+    // Fra la verifica del digest e l'avvio di psql c'e' almeno uno
+    // `supabase status`, che e' un processo vero e dura. Chiunque possa
+    // scrivere nella repository ha quella finestra: qui la sostituzione
+    // avviene esattamente li' dentro.
+    class SwapsTheFileDuringStatus extends LocalRecordingProcess {
+      override async run(input: LiveProcessInput) {
+        if (input.argv.includes("status")) {
+          writeFileSync(file, "delete from users;\n");
+        }
+        return super.run(input);
+      }
+    }
+    const process = new SwapsTheFileDuringStatus();
+
+    await new LiveSupabaseExecutor({ process }).execute(
+      runningJob("sql.execute", { path: "probe.sql", digest, read_only: true }),
+      localProject(repository),
+      credentials
+    );
+
+    const psql = process.calls.find((call) => call.argv[0] === "psql");
+    expect(psql?.stdin).toEqual(Buffer.from(sql));
+    expect(psql?.stdin?.toString()).not.toContain("delete from users");
+    expect(readFileSync(file, "utf8")).toBe("delete from users;\n");
+  });
+
+  test("delivers the hashed bytes even when they are not valid UTF-8", async () => {
+    // Decodificare in UTF-8 sostituisce ogni byte invalido con U+FFFD: il
+    // digest coprirebbe `ff` e a psql arriverebbe `ef bf bd`. Sono gli stessi
+    // byte solo se non si passa mai da una stringa.
+    const repository = localRepository("supadrum-local-sql-bytes-");
+    const bytes = Buffer.concat([
+      Buffer.from("select '"),
+      Buffer.from([0xff]),
+      Buffer.from("';\n")
+    ]);
+    writeFileSync(join(repository, "probe.sql"), bytes);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const process = new LocalRecordingProcess();
+
+    await new LiveSupabaseExecutor({ process }).execute(
+      runningJob("sql.execute", { path: "probe.sql", digest, read_only: true }),
+      localProject(repository),
+      credentials
+    );
+
+    const psql = process.calls.find((call) => call.argv[0] === "psql");
+    expect(psql?.stdin).toEqual(bytes);
+    expect(createHash("sha256").update(psql?.stdin ?? "").digest("hex")).toBe(
+      digest
+    );
+  });
+
+  test("refuses a local SQL file whose content does not match the announced digest", async () => {
+    const repository = localRepository("supadrum-local-sql-digest-");
+    writeFileSync(join(repository, "probe.sql"), "delete from users;\n");
+    const executor = new LiveSupabaseExecutor({
+      process: new LocalRecordingProcess()
+    });
+
+    await expect(
+      executor.execute(
+        runningJob("sql.execute", {
+          path: "probe.sql",
+          digest: createHash("sha256").update("select 1;\n").digest("hex")
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/digest mismatch/);
+  });
+
+  test("refuses a local SQL file that lives outside the repository", async () => {
+    const repository = localRepository("supadrum-local-sql-escape-");
+    const executor = new LiveSupabaseExecutor({
+      process: new LocalRecordingProcess()
+    });
+
+    await expect(
+      executor.execute(
+        runningJob("sql.execute", {
+          path: "../fuori.sql",
+          digest: "0".repeat(64)
+        }),
+        localProject(repository),
+        credentials
+      )
+    ).rejects.toThrow(/inside the project repository/);
+  });
+
   test("resets one SNAP password locally without persisting plaintext in the job", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-auth-"));
+    const repository = localRepository("supadrum-local-auth-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -556,7 +1112,7 @@ describe("live Supabase executor", () => {
   });
 
   test("inspects local organizations without returning fiscal or credential data", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-auth-"));
+    const repository = localRepository("supadrum-local-auth-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -594,7 +1150,7 @@ describe("live Supabase executor", () => {
   });
 
   test("recreates a local test user in the ready SNAP Dev organization", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-auth-"));
+    const repository = localRepository("supadrum-local-auth-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -640,7 +1196,7 @@ describe("live Supabase executor", () => {
   });
 
   test("rejects unsupported local password profiles before touching the database", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-auth-"));
+    const repository = localRepository("supadrum-local-auth-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -662,8 +1218,13 @@ describe("live Supabase executor", () => {
     expect(process.calls).toHaveLength(1);
   });
 
-  test("resets a local chamber with preflight and postflight checks", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-"));
+  test("applies to a local chamber without ever resetting it", async () => {
+    // A payload without `migration_runner` is the plain "apply the pending
+    // migrations" call, and it used to run `db reset --no-seed`. Against a
+    // repository whose CLI migrations are disabled that rebuilt an EMPTY
+    // database and wiped a shared local chamber. Apply advances a database;
+    // rebuilding one is a different operation with a different name.
+    const repository = localRepository("supadrum-local-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -676,9 +1237,12 @@ describe("live Supabase executor", () => {
     expect(process.calls.map((call) => call.argv)).toEqual([
       ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
       ["supabase", "status", "--output", "json"],
-      ["supabase", "db", "reset", "--local", "--no-seed"],
+      ["supabase", "db", "push", "--local"],
       ["supabase", "status", "--output", "json"]
     ]);
+    expect(
+      process.calls.some((call) => call.argv.includes("reset"))
+    ).toBe(false);
     expect(result.verification).toMatchObject({
       repo_sha_verified: true,
       target: "local",
@@ -688,7 +1252,7 @@ describe("live Supabase executor", () => {
   });
 
   test("plans local migrations through the repository SNAP runner", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-plan-"));
+    const repository = localRepository("supadrum-local-plan-");
     const api = join(repository, "api");
     const snap = join(api, "node_modules", ".bin", "snap");
     mkdirSync(dirname(snap), { recursive: true });
@@ -729,8 +1293,8 @@ describe("live Supabase executor", () => {
     });
   });
 
-  test("resets locally then applies framework and app migrations through SNAP", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-apply-"));
+  test("applies SNAP migrations incrementally without resetting the local database", async () => {
+    const repository = localRepository("supadrum-local-apply-");
     const api = join(repository, "api");
     const snap = join(api, "node_modules", ".bin", "snap");
     mkdirSync(dirname(snap), { recursive: true });
@@ -751,11 +1315,10 @@ describe("live Supabase executor", () => {
     expect(process.calls.map((call) => call.argv)).toEqual([
       ["git", "-C", repository, "rev-parse", "abc123^{commit}", "HEAD"],
       ["supabase", "status", "--output", "json"],
-      ["supabase", "db", "reset", "--local", "--no-seed"],
       [snap, "migrate"],
       ["supabase", "status", "--output", "json"]
     ]);
-    expect(process.calls[3]).toMatchObject({
+    expect(process.calls[2]).toMatchObject({
       cwd: api,
       env: {
         DATABASE_URL:
@@ -770,7 +1333,7 @@ describe("live Supabase executor", () => {
   });
 
   test("rejects a SNAP working directory outside the repository", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-path-"));
+    const repository = localRepository("supadrum-local-path-");
     const process = new LocalRecordingProcess();
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -789,7 +1352,7 @@ describe("live Supabase executor", () => {
   });
 
   test("refuses a local migration when status resolves to a non-loopback database", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-local-"));
+    const repository = localRepository("supadrum-local-");
     const process = new LocalRecordingProcess(false);
     const executor = new LiveSupabaseExecutor({ process });
 
@@ -1093,13 +1656,9 @@ describe("live Supabase executor", () => {
     );
 
     const command = process.calls[1];
-    expect(command?.argv).toEqual([
-      "psql",
-      "--set",
-      "ON_ERROR_STOP=1",
-      "--file",
-      sqlPath
-    ]);
+    expect(command?.argv).toEqual(["psql", "--set", "ON_ERROR_STOP=1"]);
+    expect(command?.argv).not.toContain(sqlPath);
+    expect(command?.stdin).toEqual(Buffer.from("select 1;\n"));
     expect(command?.env.PGPASSWORD).toBe("db-canary");
     expect(command?.argv.join(" ")).not.toContain("db-canary");
   });

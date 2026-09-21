@@ -9,7 +9,8 @@ import { z } from "zod";
 import {
   capabilityNames,
   operationCatalog,
-  operationNames
+  operationNames,
+  operationTargetRefusal
 } from "./catalog.js";
 import {
   configMtime,
@@ -90,7 +91,21 @@ export function createHandlers(
           }
         >
       )[parsed.operation];
-      assertProjectCapability(getConfig(), parsed.project, definition.capability);
+      const submitProject = assertProjectCapability(
+        getConfig(),
+        parsed.project,
+        definition.capability
+      );
+      const refusal = operationTargetRefusal(
+        parsed.operation,
+        submitProject.target
+      );
+      if (refusal) {
+        throw new BrokerError(
+          "capability_denied",
+          `Project ${parsed.project}: ${refusal}`
+        );
+      }
       let job = store.submit(parsed);
       if (job.requires_approval && job.approved_at === null) {
         job = store.transition(job.id, "waiting_approval");
@@ -161,6 +176,20 @@ export function createHandlers(
       payload: Record<string, unknown>;
       idempotency_key: string;
     }) {
+      // La stessa politica di jobs.submit. Senza, una sessione e' un modo per
+      // chiedere un'operazione che il submit diretto rifiuta.
+      const session = store.getSession(input.session_id);
+      const sessionProject = getConfig().projects[session.project];
+      const sessionRefusal = operationTargetRefusal(
+        input.operation,
+        sessionProject?.target
+      );
+      if (sessionRefusal) {
+        throw new BrokerError(
+          "capability_denied",
+          `Project ${session.project}: ${sessionRefusal}`
+        );
+      }
       const job = store.submitSessionJob(input.session_id, input);
       return publicJob(store, job.id);
     },

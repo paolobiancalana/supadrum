@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -923,6 +924,139 @@ describe("error taxonomy on the tool surface", () => {
     expect(faulted.isError).toBe(true);
     expect(() => structured(faulted, ERROR_RESULT)).toThrow();
   });
+describe("local chambers", () => {
+  function localConfig(): string {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-mcp-local-"));
+    const repository = join(root, "example-web");
+    mkdirSync(repository, { recursive: true });
+    execFileSync("git", ["init", "--quiet", repository]);
+    mkdirSync(join(repository, "supabase"), { recursive: true });
+    writeFileSync(
+      join(repository, "supabase", "config.toml"),
+      'project_id = "fixture"\n'
+    );
+    const configPath = join(root, "supadrum.yml");
+    writeFileSync(
+      configPath,
+      `version: 1
+database: ${join(root, "queue.sqlite")}
+executor: dry-run
+chambers:
+  local:
+    target: local
+projects:
+  web:
+    repo: ${repository}
+    chamber: local
+    capabilities: [migrations, schema-inspection]
+`
+    );
+    return configPath;
+  }
+
+  test("refuses schema.inspect on a local chamber at submit, with a code", async () => {
+    // La capability e' legittima qui, perche' types.generate la usa. L'altra
+    // sua operazione passa dalla Management API, che in locale non esiste:
+    // accettarla metteva in coda un job destinato a fallire a meta' strada.
+    await using connected = await connect(loadConfig(localConfig()));
+
+    const refused = await connected.client.callTool({
+      name: "jobs.submit",
+      arguments: {
+        project: "web",
+        operation: "schema.inspect",
+        payload: {
+          checks: [{ kind: "relation", schema: "public", name: "users" }]
+        },
+        repo_sha: "abc123",
+        idempotency_key: "web:inspect"
+      }
+    });
+
+    expect(structured(refused, ERROR_RESULT).error).toMatchObject({
+      code: "capability_denied",
+      retryable: false
+    });
+  });
+
+  test("refuses the same operation through a session, not only through submit", async () => {
+    // Una politica scritta in un handler solo fa della sessione il modo per
+    // aggirarla: sessions.exec accoda un job esattamente come jobs.submit.
+    await using connected = await connect(loadConfig(localConfig()));
+
+    const opened = await connected.client.callTool({
+      name: "sessions.open",
+      arguments: {
+        project: "web",
+        capability: "schema-inspection",
+        repo_sha: "abc123",
+        idempotency_key: "web:lease",
+        ttl_ms: 60_000
+      }
+    });
+    const { session } = structured(
+      opened,
+      z.object({ session: z.object({ id: z.string().uuid() }) })
+    );
+
+    const refused = await connected.client.callTool({
+      name: "sessions.exec",
+      arguments: {
+        session_id: session.id,
+        operation: "schema.inspect",
+        payload: {
+          checks: [{ kind: "relation", schema: "public", name: "users" }]
+        },
+        idempotency_key: "web:lease:inspect"
+      }
+    });
+
+    expect(structured(refused, ERROR_RESULT).error).toMatchObject({
+      code: "capability_denied",
+      retryable: false
+    });
+  });
+
+  test("refuses migration.diff on a chamber that is not local", async () => {
+    // Local-only e' una promessa della PR: accettarla, accodarla e magari
+    // approvarla per farla fallire nell'executor la rende una bugia con un
+    // ritardo.
+    await using connected = await connect(setup().config);
+
+    const refused = await connected.client.callTool({
+      name: "jobs.submit",
+      arguments: {
+        project: "alpha",
+        operation: "migration.diff",
+        payload: { name: "atlas_schema" },
+        repo_sha: "abc123",
+        idempotency_key: "alpha:diff-remote"
+      }
+    });
+
+    expect(structured(refused, ERROR_RESULT).error).toMatchObject({
+      code: "capability_denied",
+      retryable: false
+    });
+  });
+
+  test("refuses a migration name that would not be a filename", async () => {
+    await using connected = await connect(loadConfig(localConfig()));
+
+    const rejected = await connected.client.callTool({
+      name: "jobs.submit",
+      arguments: {
+        project: "web",
+        operation: "migration.diff",
+        payload: { name: "../../etc/passwd" },
+        repo_sha: "abc123",
+        idempotency_key: "web:diff-bad"
+      }
+    });
+
+    expect(structured(rejected, ERROR_RESULT).error.code).toBe("invalid_input");
+  });
+});
 });
 
 describe("configuration reloading", () => {

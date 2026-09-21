@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -364,6 +365,14 @@ function normalizedConfigDocument(config: SupadrumConfig): Document {
         name,
         {
           ...(project.repo ? { repo: project.repo } : {}),
+          // Ogni riscrittura della config passa da qui, e un campo dimenticato
+          // non si nota: sparisce in silenzio al primo `project live` o cambio
+          // di owner. `supabase_dir` che sparisce riporta il broker a parlare
+          // con lo stack sbagliato, cioe' esattamente il bug che dichiara di
+          // aver chiuso. Il test di round-trip copre ogni campo opzionale.
+          ...(project.supabase_dir
+            ? { supabase_dir: project.supabase_dir }
+            : {}),
           chamber: project.chamber,
           mode: project.mode,
           migrations: project.migrations,
@@ -563,6 +572,47 @@ export function addProject(input: {
   };
 }
 
+/**
+ * Dove sta `supabase/config.toml` dentro la repository, se non e' alla radice.
+ *
+ * Registrare un progetto senza questo dato lo dichiarava pronto e lo lasciava
+ * rompersi al primo job — o, peggio, parlare con lo stack locale di un altro
+ * progetto. Meglio scoprirlo qui, o fermarsi dicendo cosa serve, che scrivere
+ * una registrazione che non funziona.
+ */
+function nestedSupabaseDirectory(repository: string): string | undefined {
+  // La radice non vince per posizione. Se esistono sia `supabase/config.toml`
+  // alla radice sia un progetto annidato, quale dei due sia quello giusto e'
+  // una domanda, non un dettaglio: sceglierne uno in silenzio e' esattamente
+  // come si finisce a parlare con lo stack sbagliato.
+  const root = existsSync(join(repository, "supabase", "config.toml"))
+    ? [""]
+    : [];
+  const candidates = root.concat(readdirSync(repository, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        !entry.name.startsWith(".") &&
+        entry.name !== "node_modules"
+    )
+    .map((entry) => entry.name)
+    .filter((name) =>
+      existsSync(join(repository, name, "supabase", "config.toml"))
+    ));
+  const [only] = candidates;
+  if (candidates.length === 1 && only !== undefined) {
+    return only === "" ? undefined : only;
+  }
+  if (candidates.length === 0) {
+    throw new Error(
+      `No supabase/config.toml in ${repository} or its immediate subdirectories: a local chamber needs one. Add the project by hand with supabase_dir if it lives deeper.`
+    );
+  }
+  throw new Error(
+    `Several Supabase projects in ${repository} (${candidates.map((name) => name === "" ? "." : name).join(", ")}): add the project by hand with supabase_dir to say which one.`
+  );
+}
+
 export function addLocalProject(input: {
   readonly alias: string;
   readonly repository: string;
@@ -572,6 +622,7 @@ export function addLocalProject(input: {
   readonly alias: string;
   readonly config_path: string;
   readonly repository: string;
+  readonly supabase_dir?: string;
   readonly target: "local";
 } {
   const alias = validAlias(input.alias);
@@ -589,9 +640,11 @@ export function addLocalProject(input: {
   if (document.getIn(["chambers", alias]) !== undefined) {
     throw new Error(`Chamber already exists: ${alias}`);
   }
+  const supabaseDir = nestedSupabaseDirectory(repository);
   document.setIn(["chambers", alias], { target: "local" });
   document.setIn(["projects", alias], {
     repo: repository,
+    ...(supabaseDir ? { supabase_dir: supabaseDir } : {}),
     chamber: alias,
     mode: "live",
     migrations: "owner",
@@ -605,6 +658,7 @@ export function addLocalProject(input: {
     alias,
     config_path: configPath,
     repository,
+    ...(supabaseDir ? { supabase_dir: supabaseDir } : {}),
     target: "local"
   };
 }

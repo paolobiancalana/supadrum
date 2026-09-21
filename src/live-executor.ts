@@ -1,21 +1,23 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
   constants,
-  readFileSync
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync
 } from "node:fs";
-import {
-  delimiter,
-  dirname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-  sep
-} from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ProjectConfig } from "./config.js";
+import { containedPath } from "./contained-path.js";
+import { parseMigrationDiffPayload } from "./migration-diff.js";
 import type { ExecutionResult, Job } from "./domain.js";
 import type {
   Executor,
@@ -28,6 +30,7 @@ import {
   parseSchemaInspectionPayload,
   schemaInspectionPsqlInput
 } from "./schema-inspection.js";
+import { parseTypesGeneratePayload } from "./types-generate.js";
 import {
   analyzeMigrationHistory,
   parseMigrationBaselinePayload,
@@ -53,7 +56,7 @@ export interface LiveProcessInput {
   readonly argv: readonly string[];
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
-  readonly stdin?: string;
+  readonly stdin?: string | Buffer;
 }
 
 export interface LiveProcessResult {
@@ -453,8 +456,20 @@ export class LiveSupabaseExecutor implements Executor {
         return this.#executeLocalAuthAdmin(
           job,
           repository,
-          repositoryOid
+          repositoryOid,
+          project.supabase_dir
         );
+      }
+      if (job.operation === "sql.execute") {
+        return this.#executeLocalSql(
+          job,
+          repository,
+          repositoryOid,
+          project.supabase_dir
+        );
+      }
+      if (job.operation === "types.generate") {
+        return this.#generateTypes(job, project, repository, repositoryOid, null);
       }
       return this.#executeLocalMigration(
         job,
@@ -480,6 +495,21 @@ export class LiveSupabaseExecutor implements Executor {
               repository,
               credentials
             );
+      // A diff reads the declarative schema through the shadow database, and the
+      // migration it writes exists to be reviewed before anything reaches a
+      // remote project. Diffing a linked project directly inverts that order.
+      case "migration.diff":
+        throw new Error(
+          "migration.diff runs only on a local chamber: generate the migration there, review it, then apply it"
+        );
+      case "types.generate":
+        return this.#generateTypes(
+          job,
+          project,
+          repository,
+          repositoryOid,
+          credentials
+        );
       case "migration.baseline":
         return this.#baselinePrisma(
           job,
@@ -598,7 +628,8 @@ export class LiveSupabaseExecutor implements Executor {
     }
     if (
       job.operation !== "migration.plan" &&
-      job.operation !== "migration.apply"
+      job.operation !== "migration.apply" &&
+      job.operation !== "migration.diff"
     ) {
       throw new Error(
         `Operation ${job.operation} is not supported for a local chamber`
@@ -606,44 +637,118 @@ export class LiveSupabaseExecutor implements Executor {
     }
 
     const snapRunner = this.#localSnapRunner(job, repository);
-    const database = await this.#assertLocalStack(repository);
+    if (snapRunner && job.operation === "migration.diff") {
+      throw new Error(
+        "SNAP has no diff: migration.diff needs the supabase CLI to read the declarative schema"
+      );
+    }
+    const database = await this.#assertLocalStack(
+      repository,
+      project.supabase_dir
+    );
+    // `db schema declarative sync` is the one command that reads the
+    // declarative schema tree; `db diff` explicitly no longer does — it
+    // compares the migrations baseline with the database, and the CLI warns as
+    // much. `--no-apply` is not optional here: without it the command prompts,
+    // which in a runner means hanging until the lease expires, and `--apply`
+    // would make an operation named "diff" write to the database.
+    // `--strict-coverage` because the default leaves objects pg-delta cannot
+    // manage silently unmanaged, and an unmanaged object is precisely where a
+    // migration drifts from the schema without anyone being told. A diff that
+    // omits what it does not understand is worse than one that refuses.
     const args =
-      job.operation === "migration.plan"
-        ? ["db", "push", "--dry-run", "--local"]
-        : ["db", "reset", "--local", "--no-seed"];
+      job.operation === "migration.diff"
+        ? [
+            "db",
+            "schema",
+            "declarative",
+            "sync",
+            "--no-apply",
+            "--strict-coverage",
+            "--name",
+            parseMigrationDiffPayload(job.payload)
+          ]
+        : job.operation === "migration.plan"
+          ? ["db", "push", "--dry-run", "--local"]
+          : ["db", "push", "--local"];
     if (args.includes("--linked") || args.includes("--db-url")) {
       throw new Error("Local chamber command contains a remote target flag");
     }
-    let result =
-      job.operation === "migration.plan" && snapRunner
-        ? await this.#runCommand(
-            [snapRunner.executable, "migrate", "--dry-run"],
-            snapRunner.workingDirectory,
-            this.#localEnvironment({
-              NO_COLOR: "1",
-              DATABASE_URL: database.url
-            }),
-            [database.url, database.password]
+    // `migration.apply` used to fall back to `db reset --no-seed`, which drops
+    // the schema instead of applying anything. On a repository whose CLI
+    // migrations are disabled (the schema is applied by another runner) that
+    // reset rebuilt an EMPTY database and destroyed a shared local chamber.
+    // Apply advances a database; it never rebuilds one.
+    if (args.includes("reset")) {
+      throw new Error("Local chamber command must not reset the database");
+    }
+    // Un diff che non dice cosa ha prodotto non e' revisionabile: chi lo riceve
+    // non sa se rileggere un file o se non c'era niente da cambiare. Si guarda
+    // la directory prima e dopo, invece di interpretare il testo del CLI, che
+    // cambia fra versioni.
+    const migrationsDirectory = join(
+      project.supabase_dir ?? repository,
+      "supabase",
+      "migrations"
+    );
+    const migrationNames = (): ReadonlySet<string> => {
+      try {
+        return new Set(
+          readdirSync(migrationsDirectory).filter((name) =>
+            name.endsWith(".sql")
           )
-        : await this.#runCommand(
-            [this.#executables.supabase, ...args],
-            repository,
-            this.#localEnvironment({ NO_COLOR: "1" }),
-            []
-          );
-    if (job.operation === "migration.apply") {
-      if (snapRunner) {
-        result = await this.#runCommand(
-          [snapRunner.executable, "migrate"],
+        );
+      } catch {
+        return new Set();
+      }
+    };
+    const before =
+      job.operation === "migration.diff" ? migrationNames() : new Set<string>();
+    const result = snapRunner
+      ? await this.#runCommand(
+          [
+            snapRunner.executable,
+            "migrate",
+            ...(job.operation === "migration.plan" ? ["--dry-run"] : [])
+          ],
           snapRunner.workingDirectory,
           this.#localEnvironment({
             NO_COLOR: "1",
             DATABASE_URL: database.url
           }),
           [database.url, database.password]
+        )
+      : await this.#runCommand(
+          [this.#executables.supabase, ...args],
+          project.supabase_dir ?? repository,
+          this.#localEnvironment({ NO_COLOR: "1" }),
+          []
+        );
+    if (job.operation === "migration.apply") {
+      await this.#assertLocalStack(repository, project.supabase_dir);
+    }
+    let artifact: Record<string, unknown> = {};
+    if (job.operation === "migration.diff") {
+      const created = [...migrationNames()]
+        .filter((name) => !before.has(name))
+        .sort();
+      if (created.length > 1) {
+        throw new Error(
+          `migration.diff produced more than one migration and cannot report a single artifact: ${created.join(", ")}`
         );
       }
-      await this.#assertLocalStack(repository);
+      const [name] = created;
+      if (name) {
+        const body = readFileSync(join(migrationsDirectory, name));
+        artifact = {
+          changed: true,
+          output: relative(repository, join(migrationsDirectory, name)),
+          digest: createHash("sha256").update(body).digest("hex"),
+          bytes: body.byteLength
+        };
+      } else {
+        artifact = { changed: false };
+      }
     }
     return {
       output: result.output,
@@ -652,6 +757,7 @@ export class LiveSupabaseExecutor implements Executor {
         repository_oid: repositoryOid,
         target: "local",
         local_preflight: true,
+        ...artifact,
         ...(snapRunner ? { migration_runner: "snap" } : {}),
         ...(job.operation === "migration.apply"
           ? { local_postflight: true }
@@ -660,13 +766,66 @@ export class LiveSupabaseExecutor implements Executor {
     };
   }
 
+  /**
+   * Runs a repository SQL file against the local Supabase stack.
+   *
+   * The local stack has no stored credential — the connection comes from the
+   * running containers — so there is nothing to resolve and nothing to redact
+   * beyond the ephemeral local password. Same file contract as the remote
+   * executor (inside the repo, digest verified): the difference is only where
+   * it runs.
+   */
+  async #executeLocalSql(
+    job: Job,
+    repository: string,
+    repositoryOid: string,
+    supabaseDir: string | undefined
+  ): Promise<ExecutionResult> {
+    const verified = this.#resolveSqlFile(job, repository);
+    const database = await this.#assertLocalStack(repository, supabaseDir);
+    const result = await this.#process.run({
+      stdin: verified,
+      argv: [
+        this.#executables.psql,
+        "--set",
+        "ON_ERROR_STOP=1"
+      ],
+      cwd: repository,
+      env: this.#localEnvironment({
+        PGHOST: database.host,
+        PGPORT: database.port,
+        PGDATABASE: database.database,
+        PGUSER: database.user,
+        PGPASSWORD: database.password,
+        PGSSLMODE: "disable"
+      })
+    });
+    const stdout = redact(result.stdout, [database.url, database.password]);
+    const stderr = redact(result.stderr, [database.url, database.password]);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+      );
+    }
+    return {
+      output: { exit_code: result.exitCode, stdout, stderr },
+      verification: {
+        repo_sha_verified: true,
+        repository_oid: repositoryOid,
+        target: "local",
+        local_preflight: true
+      }
+    };
+  }
+
   async #executeLocalAuthAdmin(
     job: Job,
     repository: string,
-    repositoryOid: string
+    repositoryOid: string,
+    supabaseDir: string | undefined
   ): Promise<ExecutionResult> {
     const request = localSnapAuthAdmin(job.payload);
-    const database = await this.#assertLocalStack(repository);
+    const database = await this.#assertLocalStack(repository, supabaseDir);
     const result = await this.#process.run({
       argv: [
         this.#executables.psql,
@@ -789,8 +948,33 @@ export class LiveSupabaseExecutor implements Executor {
   }
 
   async #assertLocalStack(
-    repository: string
+    repository: string,
+    supabaseDir?: string
   ): Promise<ReturnType<typeof databaseParts> & { readonly url: string }> {
+    // Fail-closed, non «funzionante sulla root sbagliata». Il CLI `supabase`
+    // deduce «il progetto corrente» dalla sola working directory e, se lì non
+    // trova un progetto, non fallisce: riporta lo stato di qualunque ALTRO
+    // stack locale stia girando sulla macchina, e il broker ne userebbe host,
+    // porta e password. Quindi la directory va verificata prima di fidarsi
+    // della risposta, e un `supabase_dir` mancante o sbagliato deve fermare il
+    // job invece di dirottarlo in silenzio su un altro progetto.
+    const cwd = supabaseDir ?? repository;
+    const project = join(cwd, "supabase", "config.toml");
+    if (!existsSync(project)) {
+      throw new Error(
+        `No Supabase project at ${cwd}: expected ${project}. Set supabase_dir for this project if config.toml lives in a subdirectory.`
+      );
+    }
+    // `existsSync` segue i symlink, quindi trovare il file non dice dove sta.
+    // Validare `supabase_dir` non basta: la directory puo' essere reale e
+    // contenere `supabase -> /altro-progetto/supabase`, e senza supabase_dir
+    // lo stesso vale per `repo/supabase`. Cio' che conta e' dove finisce il
+    // file che il CLI legge davvero, sul percorso dove sta per girare.
+    if (!containedPath(repository, project)) {
+      throw new Error(
+        `The Supabase project at ${project} resolves outside ${repository}: a local chamber runs against its own repository, not one a symlink points at.`
+      );
+    }
     const status = await this.#process.run({
       argv: [
         this.#executables.supabase,
@@ -798,7 +982,7 @@ export class LiveSupabaseExecutor implements Executor {
         "--output",
         "json"
       ],
-      cwd: repository,
+      cwd,
       env: this.#localEnvironment({ NO_COLOR: "1" })
     });
     if (status.exitCode !== 0) {
@@ -1145,25 +1329,16 @@ export class LiveSupabaseExecutor implements Executor {
     };
   }
 
-  async #executeSql(
-    job: Job,
-    project: ProjectConfig,
-    credentials: ResolvedCredentials
-  ): Promise<ExecutionResult> {
-    const repository = project.repo as string;
+  /**
+   * Resolves the SQL file a job points at, refusing anything outside the
+   * repository or whose content does not match the announced digest. Shared by
+   * the remote and local executors so both enforce the same contract: what runs
+   * is exactly what the caller hashed, and it lives in the repo.
+   */
+  #resolveSqlFile(job: Job, repository: string): Buffer {
     const requestedPath = requiredString(job.payload, "path");
     const digest = requiredString(job.payload, "digest");
-    const absolutePath = resolve(repository, requestedPath);
-    const relativePath = relative(resolve(repository), absolutePath);
-    if (
-      isAbsolute(relativePath) ||
-      relativePath === ".." ||
-      relativePath.startsWith(`..${sep}`)
-    ) {
-      throw new Error(
-        "SQL file must be inside the project repository"
-      );
-    }
+    const absolutePath = this.#repositoryPath(repository, requestedPath, "SQL file");
     const source = readFileSync(absolutePath);
     const actualDigest = createHash("sha256")
       .update(source)
@@ -1173,14 +1348,156 @@ export class LiveSupabaseExecutor implements Executor {
         `SQL file digest mismatch: expected ${digest}, got ${actualDigest}`
       );
     }
+    // Si restituisce il CONTENUTO, non il percorso. Passare il percorso a psql
+    // significava rileggere il file dopo averlo verificato, e fra le due letture
+    // c'e' almeno uno `supabase status`: chiunque possa scrivere nella
+    // repository sostituisce il file in quella finestra e il digest certifica
+    // byte che non sono mai stati eseguiti. Cio' che gira e' esattamente cio'
+    // che e' stato hashato solo se non torna piu' sul disco.
+    //
+    // E resta un Buffer: convertirlo in stringa UTF-8 sostituisce ogni byte non
+    // valido con U+FFFD, quindi il digest coprirebbe `ff` mentre a psql
+    // arriverebbe `ef bf bd`. Sono gli stessi byte solo se non si passa da una
+    // decodifica.
+    return source;
+  }
+
+  /**
+   * Resolves a path a job points at, refusing anything outside the repository.
+   *
+   * Il controllo non puo' essere solo lessicale: un symlink *dentro* la
+   * repository puo' puntare fuori, e `readFileSync`/`writeFileSync` lo
+   * seguirebbero senza dire niente. Quindi si confronta il path reale
+   * dell'antenato piu' profondo che esiste, e si rifiuta un componente finale
+   * che sia a sua volta un symlink invece di scriverci attraverso.
+   */
+  #repositoryPath(repository: string, requested: string, what: string): string {
+    const absolutePath = containedPath(repository, requested);
+    if (!absolutePath) {
+      throw new Error(`${what} must be inside the project repository`);
+    }
+
+    let finalIsLink = false;
+    try {
+      finalIsLink = lstatSync(absolutePath).isSymbolicLink();
+    } catch {
+      finalIsLink = false;
+    }
+    if (finalIsLink) {
+      throw new Error(`${what} must not be a symbolic link`);
+    }
+    return absolutePath;
+  }
+
+  /**
+   * Generates the TypeScript types of one schema with the Supabase CLI and
+   * writes them to a file inside the repository. Remote chambers read the
+   * linked project through the management token; local chambers read the
+   * running stack after the usual loopback preflight. The generated text never
+   * travels in the job result — it can run to hundreds of kilobytes — only its
+   * digest and size do, so the caller can verify what landed on disk.
+   */
+  async #generateTypes(
+    job: Job,
+    project: ProjectConfig,
+    repository: string,
+    repositoryOid: string,
+    credentials: ResolvedCredentials | null
+  ): Promise<ExecutionResult> {
+    const { output, schema } = parseTypesGeneratePayload(job.payload);
+    const absolutePath = this.#repositoryPath(
+      repository,
+      output,
+      "Types output file"
+    );
+    if (credentials && !project.project_ref) {
+      throw new Error(`Project ${job.project} has no project_ref`);
+    }
+    if (!credentials) {
+      await this.#assertLocalStack(repository, project.supabase_dir);
+    }
+    const argv = [
+      this.#executables.supabase,
+      "gen",
+      "types",
+      "typescript",
+      "--schema",
+      schema,
+      ...(credentials
+        ? ["--project-id", project.project_ref as string]
+        : ["--local"])
+    ];
+    const secrets = credentials ? Object.values(credentials) : [];
+    const result = await this.#process.run({
+      argv,
+      cwd: credentials ? repository : project.supabase_dir ?? repository,
+      env: credentials
+        ? {
+            ...process.env,
+            NO_COLOR: "1",
+            SUPABASE_ACCESS_TOKEN: credentials.management_token
+          }
+        : this.#localEnvironment({ NO_COLOR: "1" })
+    });
+    const stderr = redact(result.stderr, secrets);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Command failed with exit code ${result.exitCode}: ${stderr.trim()}`
+      );
+    }
+    const generated = redact(result.stdout, secrets);
+    if (!generated.trim()) {
+      throw new Error("Type generation produced no output");
+    }
+    const directory = dirname(absolutePath);
+    mkdirSync(directory, { recursive: true });
+    // Fra la verifica del percorso e questa riga c'e' stato il CLI, che dura:
+    // la stessa finestra del digest SQL. Un symlink comparso nel frattempo
+    // verrebbe seguito da writeFileSync, quindi si ricontrolla la directory e
+    // si scrive un file nuovo accanto, spostandolo poi sopra: rename sostituisce
+    // la voce di directory e non scrive mai attraverso cio' che c'era.
+    if (!containedPath(repository, directory)) {
+      throw new Error(
+        `Types output directory ${directory} resolves outside the project repository`
+      );
+    }
+    const temporary = join(
+      directory,
+      `.${basename(absolutePath)}.${randomUUID()}.tmp`
+    );
+    writeFileSync(temporary, generated, { flag: "wx" });
+    try {
+      renameSync(temporary, absolutePath);
+    } catch (error) {
+      rmSync(temporary, { force: true });
+      throw error;
+    }
+    return {
+      output: { exit_code: 0, stdout: "", stderr },
+      verification: {
+        repo_sha_verified: true,
+        repository_oid: repositoryOid,
+        output: relative(resolve(repository), absolutePath),
+        digest: createHash("sha256").update(generated).digest("hex"),
+        bytes: Buffer.byteLength(generated),
+        ...(credentials ? {} : { target: "local", local_preflight: true })
+      }
+    };
+  }
+
+  async #executeSql(
+    job: Job,
+    project: ProjectConfig,
+    credentials: ResolvedCredentials
+  ): Promise<ExecutionResult> {
+    const repository = project.repo as string;
+    const verified = this.#resolveSqlFile(job, repository);
     const database = databaseParts(credentials.database_access);
     return this.#runCommand(
       [
         this.#executables.psql,
         "--set",
-        "ON_ERROR_STOP=1",
-        "--file",
-        absolutePath
+        "ON_ERROR_STOP=1"
       ],
       repository,
       {
@@ -1192,7 +1509,8 @@ export class LiveSupabaseExecutor implements Executor {
         PGPASSWORD: database.password,
         PGSSLMODE: "require"
       },
-      [...Object.values(credentials), database.password]
+      [...Object.values(credentials), database.password],
+      verified
     );
   }
 
@@ -1375,9 +1693,10 @@ export class LiveSupabaseExecutor implements Executor {
     argv: readonly string[],
     cwd: string,
     env: NodeJS.ProcessEnv,
-    secrets: readonly string[]
+    secrets: readonly string[],
+    stdin?: string | Buffer
   ): Promise<ExecutionResult> {
-    const result = await this.#process.run({ argv, cwd, env });
+    const result = await this.#process.run({ argv, cwd, env, ...(stdin === undefined ? {} : { stdin }) });
     const stdout = redact(result.stdout, secrets);
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {

@@ -293,6 +293,23 @@ code asks the caller to do something different: `unknown_project`,
 — it means Supadrum rejected its own state transition, and retrying will not
 help. A failure with no code at all is a crash, not a protocol answer.
 
+### Generated types
+
+`types.generate` writes the TypeScript types of one schema into a file inside
+the project repository, through the Supabase CLI and the management token the
+runner already holds. Same `schema-inspection` capability, no approval; the
+generated text stays on disk — the result carries only its path, digest and
+size. Local chambers generate from the running stack after the loopback
+preflight.
+
+```json
+{
+  "project": "example-web",
+  "operation": "types.generate",
+  "payload": { "output": "src/types/supabase.ts", "schema": "public" }
+}
+```
+
 ### Read-only schema contracts
 
 `schema.inspect` lets an agent verify exact database requirements without
@@ -484,8 +501,12 @@ repository and credential bundle before enabling only that alias. Consecutive
 aliases on one chamber reuse its mounted credentials. A different chamber
 causes drain and rotation. The global FIFO still grants only one job at a time.
 
-Credential-free local chambers may grant `auth-admin` in addition to
-`migrations`. The supported local action resets one active SNAP password
+Credential-free local chambers may grant `auth-admin`, `sql` and
+`schema-inspection` in addition to `migrations`. Two operations are refused
+there regardless of the capability, and refused when the job is submitted
+rather than halfway through it: `schema.inspect`, which needs a Management API
+a local stack does not have, and `migration.diff`, which needs a local shadow
+database. The supported local auth action resets one active SNAP password
 credential to the public development profile without putting a password or
 hash in the queued payload:
 

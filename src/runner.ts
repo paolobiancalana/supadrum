@@ -94,7 +94,8 @@ export class Runner {
         continue;
       }
       if (
-        (candidate.operation === "migration.plan" ||
+        (candidate.operation === "migration.diff" ||
+          candidate.operation === "migration.plan" ||
           candidate.operation === "migration.baseline" ||
           candidate.operation === "migration.apply" ||
           (candidate.operation === "session.open" &&

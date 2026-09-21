@@ -1,10 +1,27 @@
 import { readFileSync, statSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { parse } from "yaml";
+import { containedPath } from "./contained-path.js";
 import { z } from "zod";
 
 import { CapabilitySchema, OperationSchema } from "./domain.js";
 import { BrokerError } from "./errors.js";
+
+/**
+ * Capabilities a local chamber may declare. `sql` is here because a local
+ * Supabase stack is the one place a developer legitimately reads and writes
+ * freely; without it every local inspection has to go around the broker, which
+ * is worse than allowing it through the broker's own audited path.
+ * Deliberately excluded: anything that needs a stored credential (data-api,
+ * storage, edge-functions, secrets, project-management) — a local stack has
+ * none to resolve.
+ */
+const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
+  "migrations",
+  "auth-admin",
+  "sql",
+  "schema-inspection"
+]);
 
 const VaultReferenceSchema = z
   .string()
@@ -31,6 +48,7 @@ const CommandTemplateSchema = z.object({
 
 const ProjectFields = {
   repo: z.string().min(1).optional(),
+  supabase_dir: z.string().min(1).optional(),
   capabilities: z
     .array(CapabilitySchema)
     .min(1)
@@ -110,6 +128,16 @@ export interface ChamberConfig {
 }
 export interface ProjectConfig extends ChamberConfig {
   readonly repo?: string;
+  /**
+   * Where `supabase/config.toml` actually lives, when it is not at the
+   * repository root. Every local-chamber operation shells out to the
+   * `supabase` CLI, which resolves "the current project" from its working
+   * directory alone — given the repository root instead, it does not error,
+   * it silently picks up whatever OTHER local Supabase stack happens to be
+   * running on the machine. Resolved against `repo`; setting it without
+   * `repo` is a config error.
+   */
+  readonly supabase_dir?: string;
   readonly chamber: string;
   readonly capabilities: z.infer<typeof CapabilitySchema>[];
   readonly commands?: Partial<
@@ -206,10 +234,32 @@ export function loadConfig(path: string): SupadrumConfig {
       }
       chambers[chamberName] = chamber;
     }
+    const resolvedRepo = input.repo
+      ? resolve(baseDirectory, input.repo)
+      : undefined;
+    if (input.supabase_dir && !resolvedRepo) {
+      throw new Error(`Project ${name} sets supabase_dir without repo`);
+    }
+    // `resolve` con un secondo argomento assoluto ignora il primo, quindi senza
+    // questo controllo `supabase_dir: /altro/progetto` puntava fuori dalla
+    // repository e `../` ne usciva comunque: il campo nato per impedire che il
+    // broker parli con lo stack sbagliato diventava il modo per farglielo fare.
+    const resolvedSupabaseDir =
+      resolvedRepo && input.supabase_dir
+        ? resolve(resolvedRepo, input.supabase_dir)
+        : undefined;
+    if (
+      resolvedSupabaseDir &&
+      resolvedRepo &&
+      !containedPath(resolvedRepo, resolvedSupabaseDir)
+    ) {
+      throw new Error(
+        `Project ${name} sets supabase_dir outside its repository`
+      );
+    }
     projects[name] = {
-      ...(input.repo
-        ? { repo: resolve(baseDirectory, input.repo) }
-        : {}),
+      ...(resolvedRepo ? { repo: resolvedRepo } : {}),
+      ...(resolvedSupabaseDir ? { supabase_dir: resolvedSupabaseDir } : {}),
       chamber: chamberName,
       ...(chamber.target ? { target: chamber.target } : {}),
       project_ref: chamber.project_ref,
@@ -230,13 +280,12 @@ export function loadConfig(path: string): SupadrumConfig {
     if (
       chamber.target === "local" &&
       (input.capabilities.some(
-        (capability) =>
-          capability !== "migrations" && capability !== "auth-admin"
+        (capability) => !LOCAL_CAPABILITIES.has(capability)
       ) ||
         input.migration_driver !== "supabase")
     ) {
       throw new Error(
-        `Local chamber ${chamberName} supports only the migrations and auth-admin capabilities with the supabase driver`
+        `Local chamber ${chamberName} supports only the ${[...LOCAL_CAPABILITIES].join(", ")} capabilities with the supabase driver`
       );
     }
   }
@@ -281,6 +330,7 @@ export function inspectProject(name: string, config: SupadrumConfig) {
   return {
     name,
     ...(project.repo ? { repo: project.repo } : {}),
+    ...(project.supabase_dir ? { supabase_dir: project.supabase_dir } : {}),
     ...(project.target === "local"
       ? { target: "local" }
       : { project_ref: project.project_ref }),

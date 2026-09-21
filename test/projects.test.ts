@@ -5,6 +5,7 @@ import {
   readFileSync,
   realpathSync,
   statSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +26,8 @@ import {
 function createGitRepository(path: string): void {
   mkdirSync(path, { recursive: true });
   execFileSync("git", ["init", "--quiet", path]);
+  mkdirSync(join(path, "supabase"), { recursive: true });
+  writeFileSync(join(path, "supabase", "config.toml"), 'project_id = "fixture"\n');
 }
 
 describe("project discovery", () => {
@@ -234,6 +237,64 @@ projects:
     expect(config.projects["example-ios"]?.migrations).toBe("consumer");
   });
 
+  test("una riscrittura non perde nessun campo opzionale del progetto", () => {
+    // Tutti i call site che riscrivono la config passano dallo stesso
+    // serializzatore, quindi provarlo su uno basta. Il confronto e'
+    // sull'oggetto intero e non campo per campo: un campo aggiunto domani e
+    // dimenticato nel serializzatore fa cadere questo test da solo, senza che
+    // nessuno debba ricordarsi di estenderlo. `supabase_dir` era sparito
+    // proprio cosi', e con lui l'isolamento fra stack locali.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-roundtrip-"));
+    const repository = join(root, "example-web");
+    createGitRepository(repository);
+    mkdirSync(join(repository, "database"), { recursive: true });
+    const configPath = join(root, "config.yml");
+    writeFileSync(
+      configPath,
+      `
+version: 1
+database: queue.sqlite
+vault_command: [pass, show]
+chambers:
+  example-platform:
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/example-platform/secret
+      management_token: vault://supabase/example-platform/management
+      database_access: vault://supabase/example-platform/postgres
+    managed_secrets:
+      STRIPE_KEY: vault://supabase/example-platform/functions/STRIPE_KEY
+projects:
+  example-web:
+    repo: ${repository}
+    supabase_dir: database
+    chamber: example-platform
+    mode: live
+    migrations: consumer
+    migration_driver: prisma
+    capabilities: [migrations, sql]
+    commands:
+      sql.execute:
+        argv: [psql, -f, "{{path}}"]
+        cwd: database
+        env:
+          SUPABASE_DB_URL: database_access
+        verify_repo_sha: false
+`
+    );
+
+    const before = loadConfig(configPath);
+    setMigrationOwner(configPath, "example-web");
+    const after = loadConfig(configPath);
+
+    expect(after.projects["example-web"]).toEqual({
+      ...before.projects["example-web"]!,
+      migrations: "owner"
+    });
+    expect(after.vault_command).toEqual(before.vault_command);
+    expect(after.chambers).toEqual(before.chambers);
+  });
+
   test("preserves the migration driver when rewriting project config", () => {
     const root = mkdtempSync(join(tmpdir(), "supadrum-driver-"));
     const configPath = join(root, "config.yml");
@@ -335,6 +396,92 @@ projects:
     expect(readFileSync(configPath, "utf8")).not.toContain(
       "must-not-be-returned"
     );
+  });
+
+  test("registra la directory Supabase annidata invece di lasciarla scoprire al primo job", () => {
+    // Senza questo, registrare una repo il cui config.toml sta in una
+    // sottocartella scriveva una riga che sembra pronta e che al primo job
+    // parla con lo stack locale di un altro progetto.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-nested-add-"));
+    const repository = join(root, "project-atlas");
+    mkdirSync(repository, { recursive: true });
+    execFileSync("git", ["init", "--quiet", repository]);
+    mkdirSync(join(repository, "database", "supabase"), { recursive: true });
+    writeFileSync(
+      join(repository, "database", "supabase", "config.toml"),
+      'project_id = "atlas"\n'
+    );
+    const configPath = join(root, "config", "config.yml");
+
+    const report = addLocalProject({
+      alias: "atlas-local",
+      repository,
+      config_path: configPath
+    });
+
+    expect(report.supabase_dir).toBe("database");
+    expect(
+      loadConfig(configPath).projects["atlas-local"]?.supabase_dir
+    ).toBe(join(realpathSync(repository), "database"));
+  });
+
+  test("si ferma invece di registrare una repo senza progetto Supabase", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-noproject-add-"));
+    const repository = join(root, "senza-supabase");
+    mkdirSync(repository, { recursive: true });
+    execFileSync("git", ["init", "--quiet", repository]);
+
+    expect(() =>
+      addLocalProject({
+        alias: "senza-supabase",
+        repository,
+        config_path: join(root, "config", "config.yml")
+      })
+    ).toThrow(/No supabase\/config\.toml/);
+  });
+
+  test("si ferma invece di indovinare fra due progetti Supabase", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-ambiguous-add-"));
+    const repository = join(root, "monorepo");
+    mkdirSync(repository, { recursive: true });
+    execFileSync("git", ["init", "--quiet", repository]);
+    for (const name of ["api", "web"]) {
+      mkdirSync(join(repository, name, "supabase"), { recursive: true });
+      writeFileSync(
+        join(repository, name, "supabase", "config.toml"),
+        'project_id = "x"\n'
+      );
+    }
+
+    expect(() =>
+      addLocalProject({
+        alias: "monorepo",
+        repository,
+        config_path: join(root, "config", "config.yml")
+      })
+    ).toThrow(/Several Supabase projects/);
+  });
+
+  test("si ferma anche quando uno dei due progetti sta alla radice", () => {
+    // La radice non vince per posizione: se ce ne sono due, quale sia quello
+    // giusto e' una domanda. Sceglierne uno in silenzio e' come si finisce a
+    // parlare con lo stack sbagliato, che e' il bug da cui nasce supabase_dir.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-ambiguous-root-"));
+    const repository = join(root, "monorepo");
+    createGitRepository(repository);
+    mkdirSync(join(repository, "database", "supabase"), { recursive: true });
+    writeFileSync(
+      join(repository, "database", "supabase", "config.toml"),
+      'project_id = "nested"\n'
+    );
+
+    expect(() =>
+      addLocalProject({
+        alias: "monorepo",
+        repository,
+        config_path: join(root, "config", "config.yml")
+      })
+    ).toThrow(/Several Supabase projects/);
   });
 
   test("creates a credential-free live chamber for a local Supabase stack", () => {
@@ -458,5 +605,157 @@ describe("project doctor", () => {
       executor: "dry-run"
     });
     expect(JSON.stringify(report)).not.toContain("vault://");
+  });
+});
+
+describe("supabase_dir", () => {
+  test("resolves relative to the repository, not the operator config", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-"));
+    const repository = join(root, "project-atlas");
+    createGitRepository(repository);
+    const configPath = join(root, "config", "config.yml");
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(
+      configPath,
+      `
+version: 1
+chambers:
+  project-atlas:
+    target: local
+projects:
+  project-atlas:
+    repo: ${repository}
+    supabase_dir: database
+    chamber: project-atlas
+    capabilities: [migrations, sql]
+`
+    );
+
+    const project = loadConfig(configPath).projects["project-atlas"];
+
+    expect(project?.supabase_dir).toBe(join(repository, "database"));
+  });
+
+  test("without supabase_dir, projects behave exactly as before", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-default-"));
+    const repository = join(root, "presnap");
+    createGitRepository(repository);
+    const configPath = join(root, "config", "config.yml");
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(
+      configPath,
+      `
+version: 1
+chambers:
+  presnap-local:
+    target: local
+projects:
+  presnap-local:
+    repo: ${repository}
+    chamber: presnap-local
+    capabilities: [migrations, sql]
+`
+    );
+
+    const project = loadConfig(configPath).projects["presnap-local"];
+
+    expect(project?.supabase_dir).toBeUndefined();
+  });
+
+  test("refuses a supabase_dir that reaches another project through a symlink", () => {
+    // Il controllo lessicale legge `repo/database` come interno: e' il percorso
+    // scritto nella config. Ma se e' un symlink, lo stack che il broker
+    // interroga sta in un'altra repository, che e' esattamente il bug per cui
+    // questo campo esiste.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-symlink-"));
+    const repository = join(root, "example-web");
+    const sibling = join(root, "altro-progetto", "database");
+    createGitRepository(repository);
+    mkdirSync(join(sibling, "supabase"), { recursive: true });
+    writeFileSync(
+      join(sibling, "supabase", "config.toml"),
+      'project_id = "altro"\n'
+    );
+    symlinkSync(sibling, join(repository, "database"));
+    const configPath = join(root, "config.yml");
+    writeFileSync(
+      configPath,
+      `
+version: 1
+database: queue.sqlite
+chambers:
+  local:
+    target: local
+projects:
+  example-web:
+    repo: ${repository}
+    supabase_dir: database
+    chamber: local
+    capabilities: [migrations]
+`
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(
+      /supabase_dir outside its repository/
+    );
+  });
+
+  test("refuses a supabase_dir that points outside the repository", () => {
+    // `resolve` con un path assoluto ignora la base, quindi senza controllo il
+    // campo nato per impedire che il broker parli con lo stack sbagliato era il
+    // modo piu' diretto per farglielo fare.
+    const root = mkdtempSync(join(tmpdir(), "supadrum-escape-"));
+    const repository = join(root, "example-web");
+    const altro = join(root, "altro-progetto");
+    createGitRepository(repository);
+    mkdirSync(altro, { recursive: true });
+    const configPath = join(root, "config.yml");
+
+    for (const escape of [altro, "../altro-progetto", "database/../.."]) {
+      writeFileSync(
+        configPath,
+        `
+version: 1
+database: queue.sqlite
+chambers:
+  local:
+    target: local
+projects:
+  example-web:
+    repo: ${repository}
+    supabase_dir: ${escape}
+    chamber: local
+    capabilities: [migrations]
+`
+      );
+
+      expect(() => loadConfig(configPath)).toThrow(
+        /supabase_dir outside its repository/
+      );
+    }
+  });
+
+  test("refuses supabase_dir without a repo to resolve it against", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-orphan-"));
+    const configPath = join(root, "config", "config.yml");
+    mkdirSync(join(root, "config"), { recursive: true });
+    writeFileSync(
+      configPath,
+      `
+version: 1
+chambers:
+  example-service:
+    target: local
+projects:
+  example-service:
+    supabase_dir: database
+    chamber: example-service
+    capabilities: [migrations, sql]
+`
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(
+      "Project example-service sets supabase_dir without repo"
+    );
   });
 });

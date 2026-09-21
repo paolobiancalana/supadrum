@@ -111,6 +111,11 @@ function workspace(prefix: string) {
     gitRepo(name: string): string {
       const path = join(root, name);
       execFileSync("git", ["init", "--quiet", path]);
+      // Un repo che si registra come progetto Supabase ne ha uno: senza
+      // config.toml la registrazione locale ora si ferma invece di scrivere
+      // una riga che fallirebbe al primo job.
+      mkdirSync(join(path, "supabase"), { recursive: true });
+      writeFileSync(join(path, "supabase", "config.toml"), 'project_id = "fixture"\n');
       return path;
     }
   };
@@ -713,6 +718,8 @@ projects:
     const repository = join(root, "materic-ai");
     const configPath = join(root, "operator", "config.yml");
     execFileSync("git", ["init", "--quiet", repository]);
+    mkdirSync(join(repository, "supabase"), { recursive: true });
+    writeFileSync(join(repository, "supabase", "config.toml"), 'project_id = "fixture"\n');
 
     const chunks: string[] = [];
     expect(await runCli(
