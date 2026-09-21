@@ -1,5 +1,12 @@
 import { readFileSync, statSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  sep
+} from "node:path";
 import { parse } from "yaml";
 import { z } from "zod";
 
@@ -239,11 +246,25 @@ export function loadConfig(path: string): SupadrumConfig {
     if (input.supabase_dir && !resolvedRepo) {
       throw new Error(`Project ${name} sets supabase_dir without repo`);
     }
+    // `resolve` con un secondo argomento assoluto ignora il primo, quindi senza
+    // questo controllo `supabase_dir: /altro/progetto` puntava fuori dalla
+    // repository e `../` ne usciva comunque: il campo nato per impedire che il
+    // broker parli con lo stack sbagliato diventava il modo per farglielo fare.
+    const resolvedSupabaseDir =
+      resolvedRepo && input.supabase_dir
+        ? resolve(resolvedRepo, input.supabase_dir)
+        : undefined;
+    if (resolvedSupabaseDir && resolvedRepo) {
+      const inside = relative(resolvedRepo, resolvedSupabaseDir);
+      if (isAbsolute(inside) || inside === ".." || inside.startsWith(`..${sep}`)) {
+        throw new Error(
+          `Project ${name} sets supabase_dir outside its repository`
+        );
+      }
+    }
     projects[name] = {
       ...(resolvedRepo ? { repo: resolvedRepo } : {}),
-      ...(resolvedRepo && input.supabase_dir
-        ? { supabase_dir: resolve(resolvedRepo, input.supabase_dir) }
-        : {}),
+      ...(resolvedSupabaseDir ? { supabase_dir: resolvedSupabaseDir } : {}),
       chamber: chamberName,
       ...(chamber.target ? { target: chamber.target } : {}),
       project_ref: chamber.project_ref,

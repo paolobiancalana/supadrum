@@ -3,8 +3,12 @@ import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
+  existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   writeFileSync
 } from "node:fs";
 import {
@@ -697,6 +701,28 @@ export class LiveSupabaseExecutor implements Executor {
     if (args.includes("reset")) {
       throw new Error("Local chamber command must not reset the database");
     }
+    // Un diff che non dice cosa ha prodotto non e' revisionabile: chi lo riceve
+    // non sa se rileggere un file o se non c'era niente da cambiare. Si guarda
+    // la directory prima e dopo, invece di interpretare il testo del CLI, che
+    // cambia fra versioni.
+    const migrationsDirectory = join(
+      project.supabase_dir ?? repository,
+      "supabase",
+      "migrations"
+    );
+    const migrationNames = (): ReadonlySet<string> => {
+      try {
+        return new Set(
+          readdirSync(migrationsDirectory).filter((name) =>
+            name.endsWith(".sql")
+          )
+        );
+      } catch {
+        return new Set();
+      }
+    };
+    const before =
+      job.operation === "migration.diff" ? migrationNames() : new Set<string>();
     const result = snapRunner
       ? await this.#runCommand(
           [
@@ -720,6 +746,29 @@ export class LiveSupabaseExecutor implements Executor {
     if (job.operation === "migration.apply") {
       await this.#assertLocalStack(repository, project.supabase_dir);
     }
+    let artifact: Record<string, unknown> = {};
+    if (job.operation === "migration.diff") {
+      const created = [...migrationNames()]
+        .filter((name) => !before.has(name))
+        .sort();
+      if (created.length > 1) {
+        throw new Error(
+          `migration.diff produced more than one migration and cannot report a single artifact: ${created.join(", ")}`
+        );
+      }
+      const [name] = created;
+      if (name) {
+        const body = readFileSync(join(migrationsDirectory, name));
+        artifact = {
+          changed: true,
+          output: relative(repository, join(migrationsDirectory, name)),
+          digest: createHash("sha256").update(body).digest("hex"),
+          bytes: body.byteLength
+        };
+      } else {
+        artifact = { changed: false };
+      }
+    }
     return {
       output: result.output,
       verification: {
@@ -727,6 +776,7 @@ export class LiveSupabaseExecutor implements Executor {
         repository_oid: repositoryOid,
         target: "local",
         local_preflight: true,
+        ...artifact,
         ...(snapRunner ? { migration_runner: "snap" } : {}),
         ...(job.operation === "migration.apply"
           ? { local_postflight: true }
@@ -921,6 +971,20 @@ export class LiveSupabaseExecutor implements Executor {
     repository: string,
     supabaseDir?: string
   ): Promise<ReturnType<typeof databaseParts> & { readonly url: string }> {
+    // Fail-closed, non «funzionante sulla root sbagliata». Il CLI `supabase`
+    // deduce «il progetto corrente» dalla sola working directory e, se lì non
+    // trova un progetto, non fallisce: riporta lo stato di qualunque ALTRO
+    // stack locale stia girando sulla macchina, e il broker ne userebbe host,
+    // porta e password. Quindi la directory va verificata prima di fidarsi
+    // della risposta, e un `supabase_dir` mancante o sbagliato deve fermare il
+    // job invece di dirottarlo in silenzio su un altro progetto.
+    const cwd = supabaseDir ?? repository;
+    const project = join(cwd, "supabase", "config.toml");
+    if (!existsSync(project)) {
+      throw new Error(
+        `No Supabase project at ${cwd}: expected ${project}. Set supabase_dir for this project if config.toml lives in a subdirectory.`
+      );
+    }
     const status = await this.#process.run({
       argv: [
         this.#executables.supabase,
@@ -928,7 +992,7 @@ export class LiveSupabaseExecutor implements Executor {
         "--output",
         "json"
       ],
-      cwd: supabaseDir ?? repository,
+      cwd,
       env: this.#localEnvironment({ NO_COLOR: "1" })
     });
     if (status.exitCode !== 0) {
@@ -1297,16 +1361,46 @@ export class LiveSupabaseExecutor implements Executor {
     return absolutePath;
   }
 
-  /** Resolves a path a job points at, refusing anything outside the repository. */
+  /**
+   * Resolves a path a job points at, refusing anything outside the repository.
+   *
+   * Il controllo non puo' essere solo lessicale: un symlink *dentro* la
+   * repository puo' puntare fuori, e `readFileSync`/`writeFileSync` lo
+   * seguirebbero senza dire niente. Quindi si confronta il path reale
+   * dell'antenato piu' profondo che esiste, e si rifiuta un componente finale
+   * che sia a sua volta un symlink invece di scriverci attraverso.
+   */
   #repositoryPath(repository: string, requested: string, what: string): string {
     const absolutePath = resolve(repository, requested);
-    const relativePath = relative(resolve(repository), absolutePath);
-    if (
-      isAbsolute(relativePath) ||
-      relativePath === ".." ||
-      relativePath.startsWith(`..${sep}`)
-    ) {
+    const outside = (from: string, to: string): boolean => {
+      const step = relative(from, to);
+      return (
+        isAbsolute(step) || step === ".." || step.startsWith(`..${sep}`)
+      );
+    };
+    if (outside(resolve(repository), absolutePath)) {
       throw new Error(`${what} must be inside the project repository`);
+    }
+
+    const realRepository = realpathSync(resolve(repository));
+    let ancestor = absolutePath;
+    while (!existsSync(ancestor)) {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+    if (outside(realRepository, realpathSync(ancestor))) {
+      throw new Error(`${what} must be inside the project repository`);
+    }
+
+    let finalIsLink = false;
+    try {
+      finalIsLink = lstatSync(absolutePath).isSymbolicLink();
+    } catch {
+      finalIsLink = false;
+    }
+    if (finalIsLink) {
+      throw new Error(`${what} must not be a symbolic link`);
     }
     return absolutePath;
   }
