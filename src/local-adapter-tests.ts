@@ -69,14 +69,14 @@ function localUrl(value: unknown, label: string): string {
   return url.toString().replace(/\/$/, "");
 }
 
-function verifiedAnonKey(key: string, secret: string): string {
+export function verifiedLocalKey(key: string, secret: string, role = "anon"): string {
   const [header, payload, signature, extra] = key.split(".");
-  if (!header || !payload || !signature || extra) throw new Error("Local anon key is invalid");
+  if (!header || !payload || !signature || extra) throw new Error(`Local ${role} key is invalid`);
   try {
     const headerJson: unknown = JSON.parse(Buffer.from(header, "base64url").toString());
     const payloadJson: unknown = JSON.parse(Buffer.from(payload, "base64url").toString());
     if (!headerJson || typeof headerJson !== "object" || !("alg" in headerJson) || headerJson.alg !== "HS256" ||
-      !payloadJson || typeof payloadJson !== "object" || !("role" in payloadJson) || payloadJson.role !== "anon" ||
+      !payloadJson || typeof payloadJson !== "object" || !("role" in payloadJson) || payloadJson.role !== role ||
       !("exp" in payloadJson) || typeof payloadJson.exp !== "number" || payloadJson.exp <= Date.now() / 1000) {
       throw new Error("invalid claims");
     }
@@ -87,7 +87,7 @@ function verifiedAnonKey(key: string, secret: string): string {
       throw new Error("invalid signature");
     }
   } catch {
-    throw new Error("Local anon key is invalid");
+    throw new Error(`Local ${role} key is invalid`);
   }
   return key;
 }
@@ -106,7 +106,7 @@ export function parseLocalAdapterStatus(status: Record<string, unknown>) {
   }
   return {
     apiUrl: localUrl(fields["api url"], "API URL"),
-    anonKey: verifiedAnonKey(anonKey, jwtSecret),
+    anonKey: verifiedLocalKey(anonKey, jwtSecret),
     jwtSecret
   };
 }

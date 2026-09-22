@@ -150,11 +150,20 @@ const RemoteChamberSchema = z.object({
 const LocalChamberSchema = z
   .object({
     target: z.literal("local"),
+    auth_password_accounts: z.record(
+      z.string().regex(/^[a-z][a-z0-9_]*$/),
+      z.object({
+        user_id: z.uuid(),
+        email: z.email().max(320),
+        password_ref: VaultReferenceSchema
+      }).strict()
+    ).optional(),
     adapter_tests: z.record(
       z.string().regex(/^[a-z][a-z0-9._-]*$/),
       z.object({
         npm_script: z.string().regex(/^[a-zA-Z][a-zA-Z0-9:._-]*$/),
         writer_password_ref: VaultReferenceSchema,
+        password_accounts: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
         setup_sql_path: z.string()
           .regex(/^[a-zA-Z0-9_./-]+$/)
           .refine((path) => !path.startsWith("/") && !path.split("/").includes(".."))
@@ -190,6 +199,7 @@ export type CredentialBundle = z.infer<typeof CredentialBundleSchema>;
 export type CommandTemplate = z.infer<typeof CommandTemplateSchema>;
 export type DeployTarget = z.infer<typeof DeployTargetSchema>;
 export type AdapterTestConfig = NonNullable<z.infer<typeof LocalChamberSchema>["adapter_tests"]>[string];
+export type LocalPasswordAccount = NonNullable<z.infer<typeof LocalChamberSchema>["auth_password_accounts"]>[string];
 
 export interface ChamberConfig {
   readonly target?: "remote" | "local";
@@ -198,6 +208,7 @@ export interface ChamberConfig {
   readonly credentials: CredentialBundle;
   readonly managed_secrets?: Record<string, string>;
   readonly adapter_tests?: Record<string, AdapterTestConfig>;
+  readonly auth_password_accounts?: Record<string, LocalPasswordAccount>;
 }
 export interface ProjectConfig extends ChamberConfig {
   readonly repo?: string;
@@ -268,13 +279,35 @@ export function loadConfig(path: string): SupadrumConfig {
     Object.values(project.credentials).forEach((ref) => { if (ref) credentialRefs.add(ref); });
   }
   const writerRefs = new Set<string>();
+  const authRefs = new Set<string>();
   for (const chamber of Object.values(parsed.chambers)) {
     if (chamber.target !== "local") continue;
+    const accounts = Object.values(chamber.auth_password_accounts ?? {});
+    for (const key of ["user_id", "email", "password_ref"] as const) {
+      const values = accounts.map((account) => key === "email" ? account.email.toLowerCase() : account[key]);
+      if (new Set(values).size !== values.length) throw new Error(`Duplicate local auth account ${key}`);
+    }
+    for (const account of accounts) {
+      if (credentialRefs.has(account.password_ref)) throw new Error("Local auth password reference collides with a credential reference");
+      if (authRefs.has(account.password_ref) || writerRefs.has(account.password_ref)) {
+        throw new Error("Local auth password reference is shared");
+      }
+      authRefs.add(account.password_ref);
+    }
     for (const registration of Object.values(chamber.adapter_tests ?? {})) {
       const ref = registration.writer_password_ref;
       if (credentialRefs.has(ref)) throw new Error("Adapter writer password collides with a credential reference");
       if (writerRefs.has(ref)) throw new Error("Adapter writer password reference is shared by scripts");
+      if (authRefs.has(ref)) throw new Error("Adapter writer password reference is shared with a local auth account");
       writerRefs.add(ref);
+      for (const name of registration.password_accounts ?? []) {
+        if (!Object.hasOwn(chamber.auth_password_accounts ?? {}, name)) {
+          throw new Error(`Adapter test password account is not registered: ${name}`);
+        }
+      }
+      if (new Set(registration.password_accounts ?? []).size !== (registration.password_accounts ?? []).length) {
+        throw new Error("Duplicate adapter test password account");
+      }
     }
   }
   const baseDirectory = dirname(absolutePath);
@@ -285,6 +318,7 @@ export function loadConfig(path: string): SupadrumConfig {
         ? {
             target: "local",
             ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
+            ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
             project_ref: "",
             credentials: {
               secret_key: "",
@@ -357,6 +391,7 @@ export function loadConfig(path: string): SupadrumConfig {
       credentials: chamber.credentials,
       managed_secrets: chamber.managed_secrets ?? {},
       ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
+      ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
       capabilities: input.capabilities,
       ...(input.commands ? { commands: input.commands } : {}),
       mode:

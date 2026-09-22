@@ -22,6 +22,7 @@ import type { ProjectConfig } from "./config.js";
 import type { ExecutionResult, Job } from "./domain.js";
 import { MacOsKeychainBackend } from "./vault-cli.js";
 import type { VaultBackend } from "./vault.js";
+import { passwordAccountRequest, placeholderReconciliationSql, registeredPasswordAccount, upsertLocalPasswordAccount, validateLocalPasswordStatus } from "./local-password-auth.js";
 import {
   AdapterTestFailure,
   ATLAS_WRITER_LOGIN,
@@ -497,6 +498,7 @@ export class LiveSupabaseExecutor implements Executor {
       if (job.operation === "auth.admin") {
         return this.#executeLocalAuthAdmin(
           job,
+          project,
           repository,
           repositoryOid,
           project.supabase_dir
@@ -817,6 +819,20 @@ export class LiveSupabaseExecutor implements Executor {
       jwtEnvironment[`ATLAS_${persona.toUpperCase()}_JWT`] = jwt;
       jwtValues.push(jwt);
     }
+    const authEnvironment: NodeJS.ProcessEnv = {};
+    const authPasswords: string[] = [];
+    for (const name of registration.password_accounts ?? []) {
+      const account = registeredPasswordAccount(project, name);
+      if (!account) throw new Error("Adapter test password account is not registered");
+      let accountPassword: string;
+      try { accountPassword = await passwordVault.get(account.password_ref); }
+      catch { throw new Error("Adapter test password vault is unavailable"); }
+      if (accountPassword.length < 12) throw new Error("Adapter test password vault is unavailable");
+      const prefix = `SUPADRUM_AUTH_${name.toUpperCase()}`;
+      authEnvironment[`${prefix}_EMAIL`] = account.email;
+      authEnvironment[`${prefix}_PASSWORD`] = accountPassword;
+      authPasswords.push(accountPassword);
+    }
     const result = await this.#process.run({
       argv: ["npm", "run", registration.npm_script],
       cwd: repository,
@@ -827,15 +843,17 @@ export class LiveSupabaseExecutor implements Executor {
         ATLAS_WRITER_DATABASE_URL: writerUrl.toString(),
         ATLAS_DATA_API_URL: apiUrl,
         ATLAS_ANON_KEY: anonKey,
-        ...jwtEnvironment
+        ...jwtEnvironment,
+        ...authEnvironment
       }
     });
     const secrets = [database.url, database.password, password, verifier, writerUrl.toString(),
-      anonKey, jwtSecret, ...jwtValues];
+      anonKey, jwtSecret, ...jwtValues, ...authPasswords];
+    const passwordBearing = authPasswords.length > 0;
     const output = {
       exit_code: result.exitCode,
-      stdout: redact(result.stdout, secrets),
-      stderr: redact(result.stderr, secrets)
+      stdout: passwordBearing ? "[SUPPRESSED: password-bearing test]" : redact(result.stdout, secrets),
+      stderr: passwordBearing ? "[SUPPRESSED: password-bearing test]" : redact(result.stderr, secrets)
     };
     const execution: ExecutionResult = {
       output,
@@ -1037,10 +1055,48 @@ export class LiveSupabaseExecutor implements Executor {
 
   async #executeLocalAuthAdmin(
     job: Job,
+    project: ProjectConfig,
     repository: string,
     repositoryOid: string,
     supabaseDir: string | undefined
   ): Promise<ExecutionResult> {
+    if (job.payload.adapter === "supabase-password") {
+      if (job.capability !== "auth-admin" || !project.capabilities.includes("auth-admin")) {
+        throw new Error("Project lacks auth-admin capability");
+      }
+      const { name, account } = passwordAccountRequest(project, job.payload);
+      const database = await this.#assertLocalStack(repository, supabaseDir);
+      validateLocalPasswordStatus(database.status);
+      const reconciled = await this.#process.run({
+        argv: [this.#executables.psql, ...SCHEMA_INSPECTION_PSQL_ARGS],
+        cwd: repository,
+        env: {
+          PATH: process.env.PATH,
+          PGHOST: database.host, PGPORT: database.port,
+          PGDATABASE: database.database, PGUSER: database.user,
+          PGPASSWORD: database.password, PGSSLMODE: "disable",
+          PGOPTIONS: "-c statement_timeout=5000 -c lock_timeout=1000"
+        },
+        stdin: placeholderReconciliationSql(account)
+      });
+      if (reconciled.exitCode !== 0) {
+        throw new Error(`Local Auth placeholder reconciliation failed with exit code ${reconciled.exitCode}`);
+      }
+      const passwordVault = this.#passwordVault ?? new MacOsKeychainBackend();
+      let password: string;
+      try { password = await passwordVault.get(account.password_ref); }
+      catch { throw new Error("Local Auth password vault is unavailable"); }
+      await upsertLocalPasswordAccount(account, password, database.status, this.#fetch);
+      return {
+        output: { account: name, user_id: account.user_id },
+        verification: {
+          repo_sha_verified: true, repository_oid: repositoryOid, target: "local",
+          local_preflight: true, auth_adapter: "supabase-password",
+          auth_action: "upsert", email_identity_verified: true,
+          login_verified: true, user_id: account.user_id
+        }
+      };
+    }
     const request = localSnapAuthAdmin(job.payload);
     const database = await this.#assertLocalStack(repository, supabaseDir);
     const result = await this.#process.run({

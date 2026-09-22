@@ -529,6 +529,67 @@ the transaction when the account is missing or ambiguous.
 read-only local inspection returning only organization id, name, slug,
 onboarding state, and product/document-ingest counts.
 
+### Local Supabase Auth password accounts
+
+For a local demo whose seed already contains `auth.users` placeholders, register
+the exact Auth user ID and email in the **operator-owned** local chamber config.
+The password reference is metadata; the password itself lives only in the vault.
+For example, the Project Atlas seed contains these four accounts:
+
+```yaml
+chambers:
+  project-atlas:
+    target: local
+    auth_password_accounts:
+      giulia:
+        user_id: 5eed0000-0000-4000-8000-000000000001
+        email: giulia@alfa.test
+        password_ref: vault://atlas/local/giulia
+      marco:
+        user_id: 5eed0000-0000-4000-8000-000000000002
+        email: marco@alfa.test
+        password_ref: vault://atlas/local/marco
+      admin:
+        user_id: 5eed0000-0000-4000-8000-000000000003
+        email: admin@alfa.test
+        password_ref: vault://atlas/local/admin
+      sara:
+        user_id: 5eed0000-0000-4000-8000-000000000004
+        email: sara@beta.test
+        password_ref: vault://atlas/local/sara
+projects:
+  project-atlas:
+    repo: /absolute/path/to/project-atlas
+    supabase_dir: database
+    chamber: project-atlas
+    mode: live
+    capabilities: [auth-admin, adapter-tests, sql]
+```
+
+Use `supadrum-vault keychain put vault://atlas/local/giulia` at an operator
+terminal to store a unique password for each account. Then submit the approval-gated
+`auth.admin` job with payload
+`{"adapter":"supabase-password","action":"upsert","account":"giulia"}`.
+The payload cannot choose an ID, email, URL, or password. The broker requires
+the registered placeholder ID and email to match both `auth.users` and its
+`public.users` link. It normalizes missing GoTrue fields on that one row, then
+updates it through Auth Admin with a confirmed email and the vault password.
+It proves password login against local Auth and verifies the returned signed
+JWT has that ID before reporting `completed`. Repeating the job resets the
+same account. If the placeholder is absent or mismatched, apply the intended
+seed through Supadrum first; the broker does not guess an ID or create an
+unlinked application user.
+
+To pass login credentials to a registered `tests.run` script, add
+`password_accounts: [giulia, marco, admin, sara]` to that script's
+`adapter_tests` entry. Only the pinned child receives the selected
+`SUPADRUM_AUTH_<NAME>_EMAIL` and `_PASSWORD` variables. For these scripts the
+broker returns the exit code and suppresses both captured streams, including
+any encoded form of a password. Treat the child script as trusted code and keep its test
+artifacts free of credential dumps. Use the real login in an acceptance test
+before relying on a PWA or demo login; synthetic persona JWTs used by other
+adapter tests do not prove password access.
+
 ### Pinned local adapter tests
 
 `tests.run` is available only for a live local chamber with the
@@ -582,6 +643,8 @@ be a locally signed JWT with the `anon` role; the JWT signing secret remains
 inside the broker. A nonzero test exit fails the job while preserving its exit
 code and redacted stdout/stderr in the result. The child script is trusted
 code at the pinned commit, not a sandboxed workload.
+When a script declares `password_accounts`, that same child additionally gets
+the selected `SUPADRUM_AUTH_<NAME>_EMAIL` and `_PASSWORD` variables.
 
 Auth Admin can also recreate or reactivate the test user in the known local
 `SNAP Dev` tenant, mark that tenant ready for application access, attach the
