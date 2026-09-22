@@ -18,7 +18,7 @@ import { runCli } from "../src/cli.js";
 import { SqliteStore } from "../src/store.js";
 import { loadConfig } from "../src/config.js";
 import type { SecretPrompt } from "../src/credential-setup.js";
-import { addProject } from "../src/projects.js";
+import { addLocalProject, addProject } from "../src/projects.js";
 import { MissingVaultValueError } from "../src/vault-cli.js";
 import type { VaultBackend } from "../src/vault.js";
 
@@ -756,6 +756,52 @@ projects:
       mode: "live",
       capabilities: ["migrations"]
     });
+  });
+
+  test("starts only a registered local project from its repository", async () => {
+    const space = workspace("supadrum-cli-local-start-");
+    const repository = space.gitRepo("presnap");
+    addLocalProject({
+      alias: "presnap-local",
+      repository,
+      config_path: space.configPath
+    });
+    const started: string[] = [];
+    const harness = cli({
+      cwd: space.root,
+      startLocalStack: async (path) => {
+        started.push(path);
+        return "stack ready";
+      }
+    });
+
+    expect(await runCli([
+      "project", "start", "presnap-local", "--config", space.configPath
+    ], harness.io, harness.runtime)).toBe(0);
+    expect(started).toEqual([realpathSync(repository)]);
+    expect(harness.stdout()).toBe("stack ready\n");
+  });
+
+  test("passes a nested Supabase directory to local project startup", async () => {
+    const space = workspace("supadrum-cli-nested-start-");
+    const repository = space.gitRepo("atlas");
+    addLocalProject({ alias: "atlas", repository, config_path: space.configPath });
+    const document = parse(readFileSync(space.configPath, "utf8")) as {
+      projects: Record<string, Record<string, unknown>>;
+    };
+    document.projects.atlas!.supabase_dir = "database";
+    writeFileSync(space.configPath, stringify(document));
+    const calls: Array<[string, string | undefined]> = [];
+    const harness = cli({
+      cwd: space.root,
+      startLocalStack: async (path, supabaseDir) => {
+        calls.push([path, supabaseDir]);
+        return "stack ready";
+      }
+    });
+    expect(await runCli(["project", "start", "atlas", "--config", space.configPath],
+      harness.io, harness.runtime)).toBe(0);
+    expect(calls).toEqual([[realpathSync(repository), join(realpathSync(repository), "database")]]);
   });
 
   test("supports opting out and repairing Codex setup later", async () => {

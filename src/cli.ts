@@ -34,6 +34,7 @@ import {
   type SecretPrompt
 } from "./credential-setup.js";
 import { isEntrypoint } from "./entrypoint.js";
+import { startLocalStack } from "./local-stack.js";
 import {
   DryRunCredentialProvider,
   DryRunExecutor
@@ -50,10 +51,12 @@ import {
   setMigrationDriver,
   setMigrationOwner,
   setProjectMode,
+  setProjectCapabilities,
   setProjectRepository,
   shareProjectChamber,
   type ProjectProfile
 } from "./projects.js";
+import { capabilityNames, type Capability } from "./catalog.js";
 import { Runner } from "./runner.js";
 import { readMaskedSecret } from "./secret-prompt.js";
 import { SqliteStore } from "./store.js";
@@ -106,6 +109,7 @@ interface CliRuntime {
   };
   readonly promptSecret: SecretPrompt;
   readonly keychain: () => VaultBackend;
+  readonly startLocalStack?: (repository: string, supabaseDir?: string) => Promise<string>;
 }
 
 /*
@@ -163,7 +167,9 @@ const processRuntime: CliRuntime = {
   promptSecret: {
     read: (label) => readMaskedSecret(label)
   },
-  keychain: () => new MacOsKeychainBackend()
+  keychain: () => new MacOsKeychainBackend(),
+  startLocalStack: (repository, supabaseDir) =>
+    startLocalStack(repository, undefined, supabaseDir)
 };
 /* v8 ignore stop */
 
@@ -442,7 +448,9 @@ export async function runCli(
       [
         "Usage:",
         "  supadrum project add <alias> [options]",
+        "  supadrum project start <alias>",
         "  supadrum project setup <alias>",
+        "  supadrum project capabilities set <alias> <capability...>",
         "  supadrum project credentials set <alias> [--replace CREDENTIAL]",
         "  supadrum project migrations owner <alias>",
         "  supadrum project migrations driver <alias> <supabase|prisma>",
@@ -477,6 +485,28 @@ export async function runCli(
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     writeFileSync(path, exampleConfig, { flag: "wx", mode: 0o600 });
     io.stdout(`${path}\n`);
+    return 0;
+  }
+  if (command === "project" && args[1] === "start") {
+    const alias = requireArgument(
+      args[2],
+      "supadrum project start <alias> [--config PATH]"
+    );
+    const configPath = resolveOperatorConfigPath({
+      args,
+      environment: runtime.environment,
+      cwd: runtime.cwd,
+      homeDirectory: runtime.homeDirectory
+    });
+    const project = loadConfig(configPath).projects[alias];
+    if (!project) throw new Error(`Unknown project: ${alias}`);
+    if (project.target !== "local") {
+      throw new Error(`Project is not local: ${alias}`);
+    }
+    if (!project.repo) throw new Error(`Project ${alias} has no repository`);
+    const output = await (runtime.startLocalStack ?? ((repository, supabaseDir) =>
+      startLocalStack(repository, undefined, supabaseDir)))(project.repo, project.supabase_dir);
+    io.stdout(`${output}\n`);
     return 0;
   }
   if (command === "project" && args[1] === "add") {
@@ -728,6 +758,30 @@ export async function runCli(
         ""
       ].join("\n")
     );
+    return 0;
+  }
+  if (
+    command === "project" &&
+    args[1] === "capabilities" &&
+    args[2] === "set"
+  ) {
+    const usage =
+      "supadrum project capabilities set <alias> <capability...> [--config PATH]";
+    const alias = requireArgument(args[3], usage);
+    const requested = args.slice(4, args.indexOf("--config") === -1 ? undefined : args.indexOf("--config"));
+    if (requested.length === 0) throw new Error(usage);
+    const invalid = requested.find(
+      (capability) => !capabilityNames.includes(capability as Capability)
+    );
+    if (invalid) throw new Error(`Unknown capability: ${invalid}`);
+    const configPath = resolveOperatorConfigPath({
+      args,
+      environment: runtime.environment,
+      cwd: runtime.cwd,
+      homeDirectory: runtime.homeDirectory
+    });
+    setProjectCapabilities(configPath, alias, requested as Capability[]);
+    io.stdout(`✓ Capabilities: ${alias} (${requested.join(", ")})\n`);
     return 0;
   }
   if (
@@ -1005,7 +1059,7 @@ export async function runCli(
   }
 
   io.stderr(
-    "Usage: supadrum <init|demo|project add|project setup|project credentials set|project migrations owner|project migrations driver|project live|project dry-run|project inspect|project doctor|project list|approve|status> [options]\n"
+    "Usage: supadrum <init|demo|project add|project start|project setup|project capabilities set|project credentials set|project migrations owner|project migrations driver|project live|project dry-run|project inspect|project doctor|project list|approve|status> [options]\n"
   );
   return 1;
 }

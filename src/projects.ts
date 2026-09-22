@@ -336,7 +336,10 @@ function argumentOption(
   name: string
 ): string | undefined {
   const index = args.indexOf(name);
-  return index === -1 ? undefined : args[index + 1];
+  if (index === -1) return undefined;
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} requires a path`);
+  return value;
 }
 
 export function resolveOperatorConfigPath(input: {
@@ -432,6 +435,9 @@ function normalizedConfigDocument(config: SupadrumConfig): Document {
           : {
               project_ref: chamber.project_ref,
               credentials: chamber.credentials,
+              ...(chamber.deploy_target
+                ? { deploy_target: chamber.deploy_target }
+                : {}),
               ...(chamber.managed_secrets &&
               Object.keys(chamber.managed_secrets).length > 0
                 ? { managed_secrets: chamber.managed_secrets }
@@ -444,6 +450,7 @@ function normalizedConfigDocument(config: SupadrumConfig): Document {
         name,
         {
           ...(project.repo ? { repo: project.repo } : {}),
+          ...(project.supabase_dir ? { supabase_dir: project.supabase_dir } : {}),
           chamber: project.chamber,
           mode: project.mode,
           migrations: project.migrations,
@@ -562,6 +569,31 @@ export function setProjectMode(
       [alias]: { ...project, mode }
     }
   });
+}
+
+export function setProjectCapabilities(
+  configPath: string,
+  alias: string,
+  capabilities: readonly Capability[]
+): void {
+  const config = loadConfig(configPath);
+  const project = config.projects[alias];
+  if (!project) throw new Error(`Unknown project: ${alias}`);
+  if (capabilities.length === 0) {
+    throw new Error("A project needs at least one capability");
+  }
+  const unique = [...new Set(capabilities)];
+  writeNormalizedConfig(configPath, {
+    ...config,
+    projects: {
+      ...config.projects,
+      [alias]: { ...project, capabilities: unique,
+        migrations: unique.includes("migrations") ? project.migrations : "consumer" }
+    }
+  });
+  // Re-parse the operator document so local-only and duplicate capability
+  // rules are enforced before the command reports success.
+  loadConfig(configPath);
 }
 
 export function setProjectRepository(

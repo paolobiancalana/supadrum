@@ -1013,11 +1013,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, [database.url, database.password]);
     const stderr = redact(result.stderr, [database.url, database.password]);
     if (result.exitCode !== 0) {
-      // Take whichever stream said something. The Supabase CLI reports part
-      // of its failures on stdout — the IPv6 one among them — and a thrown
-      // error whose message is empty costs whoever reads it the entire
-      // diagnosis: the job says only that something exited 1.
-      const detail = stderr.trim() || stdout.trim();
+      // BOTH streams, not whichever one spoke first. The Supabase CLI splits
+      // a single failure across the two: the progress chatter goes to stderr
+      // ("Connecting to remote database... Applying migration X...") and the
+      // reason the thing died goes to stdout. Preferring stderr therefore
+      // returns a message that reads like a success cut short, and drops the
+      // only line anyone needed.
+      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
       throw new Error(
         `Command failed with exit code ${result.exitCode}: ${detail}`
       );
@@ -1067,11 +1069,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, [database.url, database.password]);
     const stderr = redact(result.stderr, [database.url, database.password]);
     if (result.exitCode !== 0) {
-      // Take whichever stream said something. The Supabase CLI reports part
-      // of its failures on stdout — the IPv6 one among them — and a thrown
-      // error whose message is empty costs whoever reads it the entire
-      // diagnosis: the job says only that something exited 1.
-      const detail = stderr.trim() || stdout.trim();
+      // BOTH streams, not whichever one spoke first. The Supabase CLI splits
+      // a single failure across the two: the progress chatter goes to stderr
+      // ("Connecting to remote database... Applying migration X...") and the
+      // reason the thing died goes to stdout. Preferring stderr therefore
+      // returns a message that reads like a success cut short, and drops the
+      // only line anyone needed.
+      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
       throw new Error(
         `Command failed with exit code ${result.exitCode}: ${detail}`
       );
@@ -1765,11 +1769,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, secrets);
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {
-      // Take whichever stream said something. The Supabase CLI reports part
-      // of its failures on stdout — the IPv6 one among them — and a thrown
-      // error whose message is empty costs whoever reads it the entire
-      // diagnosis: the job says only that something exited 1.
-      const detail = stderr.trim() || stdout.trim();
+      // BOTH streams, not whichever one spoke first. The Supabase CLI splits
+      // a single failure across the two: the progress chatter goes to stderr
+      // ("Connecting to remote database... Applying migration X...") and the
+      // reason the thing died goes to stdout. Preferring stderr therefore
+      // returns a message that reads like a success cut short, and drops the
+      // only line anyone needed.
+      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
       throw new Error(
         `Command failed with exit code ${result.exitCode}: ${detail}`
       );
@@ -1861,11 +1867,13 @@ export class LiveSupabaseExecutor implements Executor {
     const stdout = redact(result.stdout, secrets);
     const stderr = redact(result.stderr, secrets);
     if (result.exitCode !== 0) {
-      // Take whichever stream said something. The Supabase CLI reports part
-      // of its failures on stdout — the IPv6 one among them — and a thrown
-      // error whose message is empty costs whoever reads it the entire
-      // diagnosis: the job says only that something exited 1.
-      const detail = stderr.trim() || stdout.trim();
+      // BOTH streams, not whichever one spoke first. The Supabase CLI splits
+      // a single failure across the two: the progress chatter goes to stderr
+      // ("Connecting to remote database... Applying migration X...") and the
+      // reason the thing died goes to stdout. Preferring stderr therefore
+      // returns a message that reads like a success cut short, and drops the
+      // only line anyone needed.
+      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
       throw new Error(
         `Command failed with exit code ${result.exitCode}: ${detail}`
       );

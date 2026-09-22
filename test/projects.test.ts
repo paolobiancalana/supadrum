@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { parseDocument } from "yaml";
 
 import { loadConfig } from "../src/config.js";
 import {
@@ -19,6 +20,7 @@ import {
   doctorProject,
   resolveOperatorConfigPath,
   setMigrationOwner,
+  setProjectCapabilities,
   setProjectMode
 } from "../src/projects.js";
 
@@ -393,6 +395,75 @@ projects:
     expect(loadConfig(configPath).projects.alpha?.capabilities).toEqual([
       "data-api"
     ]);
+  });
+
+  test("updates local capabilities through the operator config", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-local-caps-"));
+    const repository = join(root, "example-local");
+    const configPath = join(root, "config.yml");
+    createGitRepository(repository);
+    addLocalProject({ alias: "example-local", repository, config_path: configPath });
+
+    setProjectCapabilities(configPath, "example-local", ["migrations", "sql"]);
+
+    expect(loadConfig(configPath).projects["example-local"]?.capabilities).toEqual([
+      "migrations",
+      "sql"
+    ]);
+  });
+
+  test("changing capabilities preserves a nested Supabase directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-nested-caps-"));
+    const repository = join(root, "atlas");
+    const configPath = join(root, "config.yml");
+    createGitRepository(repository);
+    addLocalProject({ alias: "atlas", repository, config_path: configPath });
+    const document = parseDocument(readFileSync(configPath, "utf8"));
+    document.setIn(["projects", "atlas", "supabase_dir"], "database");
+    writeFileSync(configPath, document.toString());
+
+    setProjectCapabilities(configPath, "atlas", ["migrations", "sql"]);
+
+    expect(loadConfig(configPath).projects.atlas?.supabase_dir)
+      .toBe(join(realpathSync(repository), "database"));
+  });
+
+  test("changing capabilities preserves a remote deploy target", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-deploy-caps-"));
+    const repository = join(root, "web");
+    const configPath = join(root, "config.yml");
+    createGitRepository(repository);
+    const deployTarget = {
+      provider: "vercel" as const,
+      project_id: "prj_abc",
+      org_id: "team_xyz"
+    };
+    addProject({ alias: "web", repository, project_ref: "abcdefghijklmnopqrst",
+      profile: "development", config_path: configPath, deploy_target: deployTarget });
+
+    setProjectCapabilities(configPath, "web", ["migrations", "deploy"]);
+
+    expect(loadConfig(configPath).projects.web?.deploy_target).toEqual(deployTarget);
+  });
+
+  test("removing migrations capability clears migration ownership", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-remove-migrations-"));
+    const repository = join(root, "atlas");
+    const configPath = join(root, "config.yml");
+    createGitRepository(repository);
+    addLocalProject({ alias: "atlas", repository, config_path: configPath });
+    setMigrationOwner(configPath, "atlas");
+
+    setProjectCapabilities(configPath, "atlas", ["sql"]);
+
+    expect(loadConfig(configPath).projects.atlas?.migrations).toBe("consumer");
+  });
+
+  test("rejects --config without a path instead of choosing another config", () => {
+    const root = mkdtempSync(join(tmpdir(), "supadrum-missing-config-"));
+    expect(() => resolveOperatorConfigPath({ args: ["project", "start", "atlas", "--config"],
+      environment: {}, cwd: root, homeDirectory: root }))
+      .toThrow("--config requires a path");
   });
 
   test("leaves an existing config unchanged when the alias already exists", () => {
