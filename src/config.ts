@@ -19,6 +19,7 @@ const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
   "migrations",
   "auth-admin",
   "sql",
+  "adapter-tests",
   "schema-inspection"
 ]);
 
@@ -142,12 +143,31 @@ const RemoteChamberSchema = z.object({
       z.string().regex(/^[A-Z][A-Z0-9_]*$/),
       VaultReferenceSchema
     )
-    .default({})
+    .default({}),
+  adapter_tests: z.never().optional()
 });
 
 const LocalChamberSchema = z
   .object({
-    target: z.literal("local")
+    target: z.literal("local"),
+    adapter_tests: z.record(
+      z.string().regex(/^[a-z][a-z0-9._-]*$/),
+      z.object({
+        npm_script: z.string().regex(/^[a-zA-Z][a-zA-Z0-9:._-]*$/),
+        writer_password_ref: VaultReferenceSchema,
+        setup_sql_path: z.string()
+          .regex(/^[a-zA-Z0-9_./-]+$/)
+          .refine((path) => !path.startsWith("/") && !path.split("/").includes(".."))
+          .optional(),
+        personas: z.record(
+          z.string().regex(/^[a-z][a-z0-9_]*$/),
+          z.uuid()
+        ).refine((personas) =>
+          ["student", "staff", "outsider"].every((name) => Object.hasOwn(personas, name)) &&
+          new Set(Object.values(personas)).size === Object.keys(personas).length
+        )
+      }).strict()
+    ).optional()
   })
   .strict();
 
@@ -169,6 +189,7 @@ const ConfigSchema = z.object({
 export type CredentialBundle = z.infer<typeof CredentialBundleSchema>;
 export type CommandTemplate = z.infer<typeof CommandTemplateSchema>;
 export type DeployTarget = z.infer<typeof DeployTargetSchema>;
+export type AdapterTestConfig = NonNullable<z.infer<typeof LocalChamberSchema>["adapter_tests"]>[string];
 
 export interface ChamberConfig {
   readonly target?: "remote" | "local";
@@ -176,6 +197,7 @@ export interface ChamberConfig {
   readonly deploy_target?: DeployTarget | undefined;
   readonly credentials: CredentialBundle;
   readonly managed_secrets?: Record<string, string>;
+  readonly adapter_tests?: Record<string, AdapterTestConfig>;
 }
 export interface ProjectConfig extends ChamberConfig {
   readonly repo?: string;
@@ -242,6 +264,7 @@ export function loadConfig(path: string): SupadrumConfig {
       chamber.target === "local"
         ? {
             target: "local",
+            ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
             project_ref: "",
             credentials: {
               secret_key: "",
@@ -249,7 +272,13 @@ export function loadConfig(path: string): SupadrumConfig {
               database_access: ""
             }
           }
-        : chamber
+        : {
+            target: "remote",
+            project_ref: chamber.project_ref,
+            credentials: chamber.credentials,
+            ...(chamber.deploy_target ? { deploy_target: chamber.deploy_target } : {}),
+            managed_secrets: chamber.managed_secrets
+          }
     ])
   );
   const projects: Record<string, ProjectConfig> = {};
@@ -307,6 +336,7 @@ export function loadConfig(path: string): SupadrumConfig {
         : {}),
       credentials: chamber.credentials,
       managed_secrets: chamber.managed_secrets ?? {},
+      ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
       capabilities: input.capabilities,
       ...(input.commands ? { commands: input.commands } : {}),
       mode:

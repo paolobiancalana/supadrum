@@ -25,6 +25,7 @@ import { isEntrypoint } from "./entrypoint.js";
 import { BrokerError } from "./errors.js";
 import { resolveOperatorConfigPath } from "./projects.js";
 import { SqliteStore } from "./store.js";
+import { hasCompletedAdapterSetup, registeredAdapterTest } from "./local-adapter-tests.js";
 
 function publicJob(store: SqliteStore, id: string) {
   const job = store.getJob(id);
@@ -53,6 +54,29 @@ function assertProjectCapability(
     );
   }
   return project;
+}
+
+function assertAdapterTestRegistration(
+  config: SupadrumConfig,
+  store: SqliteStore,
+  projectName: string,
+  operation: string,
+  payload: Record<string, unknown>,
+  repoSha: string
+): void {
+  if (operation !== "tests.run") return;
+  const project = config.projects[projectName];
+  if (project?.target !== "local" || project.mode !== "live") {
+    throw new BrokerError("capability_denied", "tests.run is available only on a live local chamber");
+  }
+  if (!registeredAdapterTest(project, payload.script)) {
+    throw new BrokerError("invalid_input", `Adapter test script is not registered: ${String(payload.script)}`);
+  }
+  if (!hasCompletedAdapterSetup((id) => store.getJob(id), project, {
+    project: projectName, payload, repo_sha: repoSha
+  })) {
+    throw new BrokerError("invalid_input", "Adapter tests require a completed sql.execute setup at the same repo_sha");
+  }
 }
 
 export type ConfigSource = SupadrumConfig | (() => SupadrumConfig);
@@ -90,7 +114,9 @@ export function createHandlers(
           }
         >
       )[parsed.operation];
-      assertProjectCapability(getConfig(), parsed.project, definition.capability);
+      const config = getConfig();
+      assertProjectCapability(config, parsed.project, definition.capability);
+      assertAdapterTestRegistration(config, store, parsed.project, parsed.operation, parsed.payload, parsed.repo_sha);
       let job = store.submit(parsed);
       if (job.requires_approval && job.approved_at === null) {
         job = store.transition(job.id, "waiting_approval");
@@ -161,6 +187,8 @@ export function createHandlers(
       payload: Record<string, unknown>;
       idempotency_key: string;
     }) {
+      const session = store.getSession(input.session_id);
+      assertAdapterTestRegistration(getConfig(), store, session.project, input.operation, input.payload, session.repo_sha);
       const job = store.submitSessionJob(input.session_id, input);
       return publicJob(store, job.id);
     },

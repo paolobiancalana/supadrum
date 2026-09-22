@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import {
   accessSync,
   constants,
@@ -19,6 +20,17 @@ import {
 
 import type { ProjectConfig } from "./config.js";
 import type { ExecutionResult, Job } from "./domain.js";
+import { MacOsKeychainBackend } from "./vault-cli.js";
+import type { VaultBackend } from "./vault.js";
+import {
+  AdapterTestFailure,
+  ATLAS_WRITER_LOGIN,
+  parseLocalAdapterStatus,
+  postgresScramVerifier,
+  registeredAdapterTest,
+  syntheticJwt,
+  writerProvisionSql
+} from "./local-adapter-tests.js";
 import type {
   Executor,
   ResolvedCredentials
@@ -318,6 +330,7 @@ interface LiveExecutorOptions {
   readonly fetch?: typeof fetch;
   readonly resolveReference?: (reference: string) => Promise<string>;
   readonly executables?: Partial<LiveExecutables>;
+  readonly passwordVault?: VaultBackend;
 }
 
 interface LiveExecutables {
@@ -436,11 +449,13 @@ export class LiveSupabaseExecutor implements Executor {
     | ((reference: string) => Promise<string>)
     | undefined;
   readonly #executables: LiveExecutables;
+  readonly #passwordVault: VaultBackend | undefined;
 
   constructor(options: LiveExecutorOptions = {}) {
     this.#process = options.process ?? new NodeLiveProcess();
     this.#fetch = options.fetch ?? fetch;
     this.#resolveReference = options.resolveReference;
+    this.#passwordVault = options.passwordVault;
     this.#executables = {
       git: options.executables?.git ?? "git",
       supabase: options.executables?.supabase ?? "supabase",
@@ -460,6 +475,18 @@ export class LiveSupabaseExecutor implements Executor {
     project: ProjectConfig,
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
+    if (job.operation === "tests.run") {
+      if (project.target !== "local") {
+        throw new Error("tests.run is available only on a local chamber");
+      }
+      const script = job.payload.script;
+      if (!registeredAdapterTest(project, script)) {
+        throw new Error(`Adapter test script is not registered: ${String(script)}`);
+      }
+      if (project.mode !== "live") {
+        throw new Error("tests.run requires a live local chamber");
+      }
+    }
     const repository = project.repo;
     if (!repository) {
       throw new Error(`Project ${job.project} has no repository`);
@@ -482,6 +509,9 @@ export class LiveSupabaseExecutor implements Executor {
           repositoryOid,
           project.supabase_dir
         );
+      }
+      if (job.operation === "tests.run") {
+        return this.#executeLocalAdapterTests(job, project, repository, repositoryOid);
       }
       if (job.operation === "types.generate") {
         return this.#generateTypes(job, project, repository, repositoryOid, null);
@@ -696,6 +726,108 @@ export class LiveSupabaseExecutor implements Executor {
       );
     }
     return requestedOid;
+  }
+
+  async #verifyCleanRepository(repository: string): Promise<void> {
+    const status = await this.#process.run({
+      argv: [this.#executables.git, "-C", repository, "status", "--porcelain=v1", "--untracked-files=all"],
+      cwd: repository,
+      env: { PATH: process.env.PATH }
+    });
+    if (status.exitCode !== 0 || status.stdout.trim() || status.stderr.trim()) {
+      throw new Error("Adapter tests require a clean checkout");
+    }
+  }
+
+  async #executeLocalAdapterTests(
+    job: Job,
+    project: ProjectConfig,
+    repository: string,
+    repositoryOid: string
+  ): Promise<ExecutionResult> {
+    const scriptName = job.payload.script as string;
+    const registration = registeredAdapterTest(project, scriptName);
+    if (!registration) throw new Error("Adapter test script is not registered");
+    await this.#verifyCleanRepository(repository);
+    const database = await this.#assertLocalStack(repository, project.supabase_dir);
+    const { apiUrl, anonKey, jwtSecret } = parseLocalAdapterStatus(database.status);
+    const password = randomBytes(32).toString("base64url");
+    const verifier = postgresScramVerifier(password);
+    const passwordVault = this.#passwordVault ?? new MacOsKeychainBackend();
+    try {
+      await passwordVault.put(registration.writer_password_ref, password);
+      if (await passwordVault.get(registration.writer_password_ref) !== password) {
+        throw new Error("round-trip mismatch");
+      }
+    } catch {
+      throw new Error("Writer password vault is unavailable");
+    }
+    const setup = await this.#process.run({
+      argv: [this.#executables.psql, "--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1"],
+      cwd: repository,
+      env: {
+        PATH: process.env.PATH,
+        PGHOST: database.host,
+        PGPORT: database.port,
+        PGDATABASE: database.database,
+        PGUSER: database.user,
+        PGPASSWORD: database.password,
+        PGSSLMODE: "disable"
+      },
+      stdin: writerProvisionSql(verifier)
+    });
+    if (setup.exitCode !== 0) {
+      throw new Error(`Writer login provisioning failed with exit code ${setup.exitCode}`);
+    }
+    await this.#verifyRepository(repository, job);
+    await this.#verifyCleanRepository(repository);
+
+    const writerUrl = new URL(database.url);
+    writerUrl.search = "";
+    writerUrl.hash = "";
+    writerUrl.username = ATLAS_WRITER_LOGIN;
+    writerUrl.password = password;
+    const jwtEnvironment: NodeJS.ProcessEnv = {};
+    const jwtValues: string[] = [];
+    for (const [persona, sub] of Object.entries(registration.personas)) {
+      const jwt = syntheticJwt(jwtSecret, sub);
+      jwtEnvironment[`ATLAS_${persona.toUpperCase()}_JWT`] = jwt;
+      jwtValues.push(jwt);
+    }
+    const result = await this.#process.run({
+      argv: ["npm", "run", registration.npm_script],
+      cwd: repository,
+      env: {
+        PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
+        HOME: process.env.HOME,
+        TMPDIR: process.env.TMPDIR,
+        ATLAS_WRITER_DATABASE_URL: writerUrl.toString(),
+        ATLAS_DATA_API_URL: apiUrl,
+        ATLAS_ANON_KEY: anonKey,
+        ...jwtEnvironment
+      }
+    });
+    const secrets = [database.url, database.password, password, verifier, writerUrl.toString(),
+      anonKey, jwtSecret, ...jwtValues];
+    const output = {
+      exit_code: result.exitCode,
+      stdout: redact(result.stdout, secrets),
+      stderr: redact(result.stderr, secrets)
+    };
+    const execution: ExecutionResult = {
+      output,
+      verification: {
+        repo_sha_verified: true,
+        repository_oid: repositoryOid,
+        clean_checkout: true,
+        target: "local",
+        local_preflight: true,
+        script: scriptName,
+        exit_code: result.exitCode
+      }
+    };
+    if (result.exitCode !== 0) throw new AdapterTestFailure(execution);
+    return execution;
   }
 
   async #runSupabase(
@@ -1015,7 +1147,7 @@ export class LiveSupabaseExecutor implements Executor {
   async #assertLocalStack(
     repository: string,
     supabaseDir?: string
-  ): Promise<ReturnType<typeof databaseParts> & { readonly url: string }> {
+  ): Promise<ReturnType<typeof databaseParts> & { readonly url: string; readonly status: Record<string, unknown> }> {
     const status = await this.#process.run({
       argv: [
         this.#executables.supabase,
@@ -1028,11 +1160,12 @@ export class LiveSupabaseExecutor implements Executor {
     });
     if (status.exitCode !== 0) {
       throw new Error(
-        `Local Supabase stack is unavailable: ${status.stderr.trim()}`
+        `Local Supabase stack is unavailable (exit code ${status.exitCode})`
       );
     }
 
     let values: string[];
+    let statusValues: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(status.stdout);
       if (
@@ -1042,6 +1175,7 @@ export class LiveSupabaseExecutor implements Executor {
       ) {
         throw new Error("status is not an object");
       }
+      statusValues = parsed as Record<string, unknown>;
       values = Object.values(parsed)
         .filter((value): value is string => typeof value === "string");
     } catch {
@@ -1058,13 +1192,14 @@ export class LiveSupabaseExecutor implements Executor {
     if (
       hostname !== "localhost" &&
       hostname !== "::1" &&
-      !hostname.startsWith("127.")
+      hostname !== "[::1]" &&
+      !(isIP(hostname) === 4 && hostname.split(".")[0] === "127")
     ) {
       throw new Error(
-        `Local Supabase database must use a loopback host, got ${hostname}`
+        "Local Supabase database must use a loopback host"
       );
     }
-    return { ...database, url: databaseUrl };
+    return { ...database, url: databaseUrl, status: statusValues };
   }
 
   async #runPrisma(

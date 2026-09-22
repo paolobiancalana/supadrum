@@ -423,7 +423,12 @@ function normalizedConfigDocument(config: SupadrumConfig): Document {
       Object.entries(config.chambers).map(([name, chamber]) => [
         name,
         chamber.target === "local"
-          ? { target: "local" }
+          ? {
+              target: "local",
+              ...(chamber.adapter_tests
+                ? { adapter_tests: chamber.adapter_tests }
+                : {})
+            }
           : {
               project_ref: chamber.project_ref,
               credentials: chamber.credentials,

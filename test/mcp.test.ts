@@ -153,6 +153,65 @@ afterEach(() => {
 });
 
 describe("MCP protocol surface", () => {
+  test("rejects remote adapter tests and unregistered local scripts at submission", () => {
+    const remote = setupProjects(project("remote", ["adapter-tests"]));
+    const submission = {
+      project: "remote", operation: "tests.run" as const,
+      payload: { script: "sessions" }, repo_sha: "abc123", idempotency_key: "remote:tests"
+    };
+    expect(() => createHandlers(remote.config, remote.store).jobsSubmit(submission))
+      .toThrow(/only.*local/i);
+
+    const local = openStore(writeConfig("supadrum-mcp-adapter-", `version: 1
+database: queue.sqlite
+chambers:
+  atlas:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://tests/local/writer
+        setup_sql_path: database/supabase/fixtures/atlas-02-contratto.sql
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000b1
+projects:
+  atlas:
+    chamber: atlas
+    repo: .
+    mode: live
+    capabilities: [adapter-tests]
+`));
+    expect(() => createHandlers(local.config, local.store).jobsSubmit({
+      ...submission, project: "atlas", payload: { script: "missing" }
+    })).toThrow(/not registered/i);
+
+    expect(() => createHandlers(local.config, local.store).jobsSubmit({
+      ...submission, project: "atlas", payload: { script: "sessions" }
+    })).toThrow(/completed.*sql.execute/i);
+
+    const fixture = local.store.submit({
+      project: "atlas", operation: "sql.execute",
+      payload: { path: "database/supabase/fixtures/atlas-02-contratto.sql", digest: "a".repeat(64) },
+      repo_sha: "abc123", idempotency_key: "atlas:fixture"
+    });
+    const granted = local.store.grantIfSchedulable(fixture.id, new Date(Date.now() + 60000).toISOString());
+    expect(granted).not.toBeNull();
+    local.store.transition(fixture.id, "running");
+    local.store.transition(fixture.id, "verifying");
+    local.store.transition(fixture.id, "completed", null, {
+      result: { output: { exit_code: 0 }, verification: { repo_sha_verified: true } }
+    });
+    expect(createHandlers(local.config, local.store).jobsSubmit({
+      ...submission, project: "atlas",
+      payload: { script: "sessions", setup_job_id: fixture.id }
+    }).operation).toBe("tests.run");
+    expect(() => createHandlers(local.config, local.store).jobsSubmit({
+      ...submission, project: "atlas", repo_sha: "def456", idempotency_key: "atlas:wrong-sha",
+      payload: { script: "sessions", setup_job_id: fixture.id }
+    })).toThrow(/same repo_sha/i);
+  });
   test("queues typed schema inspection without approval or SQL payloads", () => {
     const { config, store } = setup();
     const handlers = createHandlers(config, store);

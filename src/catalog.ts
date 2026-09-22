@@ -8,6 +8,7 @@ export const capabilityNames = [
   "migrations",
   "schema-inspection",
   "sql",
+  "adapter-tests",
   "project-management",
   "deploy"
 ] as const;
@@ -28,6 +29,7 @@ export const operationNames = [
   "migration.apply",
   "schema.inspect",
   "sql.execute",
+  "tests.run",
   "project.manage",
   "types.generate",
   "deploy.inspect",
@@ -64,6 +66,7 @@ export const operationCatalog = {
     approval: false
   },
   "sql.execute": { capability: "sql", approval: true },
+  "tests.run": { capability: "adapter-tests", approval: true },
   "project.manage": { capability: "project-management", approval: true },
   "types.generate": { capability: "schema-inspection", approval: false },
   // Deploying is the one operation whose blast radius is the public internet:

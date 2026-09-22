@@ -5,6 +5,8 @@ import type {
 } from "./config.js";
 import type { ExecutionResult, Job, Session } from "./domain.js";
 import { SqliteStore } from "./store.js";
+import { AdapterTestFailure } from "./local-adapter-tests.js";
+import { hasCompletedAdapterSetup, registeredAdapterTest } from "./local-adapter-tests.js";
 
 /**
  * The three Supabase credentials stay required: every chamber carries them and
@@ -100,6 +102,16 @@ export class Runner {
       if (!project.capabilities.includes(candidate.capability)) {
         this.#store.transition(candidate.id, "failed", null, {
           error: `Project ${candidate.project} lacks ${candidate.capability}`
+        });
+        continue;
+      }
+      if (candidate.operation === "tests.run" && (
+        project.target !== "local" || project.mode !== "live" ||
+        !registeredAdapterTest(project, candidate.payload.script) ||
+        !hasCompletedAdapterSetup((id) => this.#store.getJob(id), project, candidate)
+      )) {
+        this.#store.transition(candidate.id, "failed", null, {
+          error: "Adapter tests require a registered script on a live local chamber"
         });
         continue;
       }
@@ -207,7 +219,8 @@ export class Runner {
       } catch (error) {
         job = this.#store.transition(job.id, "failed", null, {
           lease_expires_at: null,
-          error: error instanceof Error ? error.message : String(error)
+          error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof AdapterTestFailure ? { result: error.result } : {})
         });
       }
 
