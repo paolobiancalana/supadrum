@@ -82,6 +82,11 @@ export const CredentialFreePayloadSchema = z
     }
   });
 
+const AdapterTestsPayloadSchema = z.object({
+  script: z.string().regex(/^[a-z][a-z0-9._-]*$/),
+  setup_job_id: z.uuid().optional()
+}).strict();
+
 export const JobSubmissionSchema = z
   .object({
     project: z.string().min(1).max(100),
@@ -94,6 +99,8 @@ export const JobSubmissionSchema = z
     const schema =
       submission.operation === "schema.inspect"
         ? SchemaInspectionPayloadSchema
+        : submission.operation === "tests.run"
+          ? AdapterTestsPayloadSchema
         : submission.operation === "migration.baseline"
           ? MigrationBaselinePayloadSchema
           : submission.operation === "types.generate"

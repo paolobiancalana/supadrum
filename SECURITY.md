@@ -33,6 +33,30 @@ values in MCP messages or LLM prompts:
   templates;
 - exact resolved values are redacted from captured child stdout and stderr.
 
+For `tests.run`, the operator-owned local chamber allowlists one npm script.
+The broker rejects remote chambers, dirty or mismatched checkouts, unregistered
+scripts, and an incomplete fixture job. It checks the setup digest against the
+committed fixture before replaying it
+on the current local stack. It passes only a dedicated writer URL,
+local Data API URL, verified `anon` key, and synthetic user JWTs to the test
+child. The local PostgreSQL admin URL is used only for fixed role-provisioning
+SQL; its password and the generated writer password are absent from the test
+environment. The writer password is stored in macOS Keychain and only a SCRAM
+verifier reaches PostgreSQL SQL. Replacing the broker-owned role fails if it
+has acquired direct grants or owns objects. The provisioner also checks
+effective application privileges, including grants through `PUBLIC`.
+It refuses an `atlas_session_writer` group with elevated role attributes before
+granting membership to the login.
+Both table-level and column-level privileges are checked. Configuration
+rejects writer-password references that collide with another registered
+credential or writer script.
+
+These checks do not prove the target repository's RLS or HTTP behavior. Run
+its real adapter suite against the intended local chamber and inspect the
+effective login role before treating that product gate as passed. The bundled
+writer-password vault backend for this operation is macOS Keychain; other
+backends need a separately reviewed writable adapter.
+
 This reduces the exposure surface compared with a plaintext `.env`: a coding
 agent with repository access can read an `.env`, while it cannot resolve a
 Keychain reference through the MCP surface.

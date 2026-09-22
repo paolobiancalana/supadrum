@@ -1,4 +1,6 @@
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -153,6 +155,75 @@ afterEach(() => {
 });
 
 describe("MCP protocol surface", () => {
+  test("rejects remote adapter tests and unregistered local scripts at submission", () => {
+    const remote = setupProjects(project("remote", ["adapter-tests"]));
+    const submission = {
+      project: "remote", operation: "tests.run" as const,
+      payload: { script: "sessions" }, repo_sha: "abc123", idempotency_key: "remote:tests"
+    };
+    expect(() => createHandlers(remote.config, remote.store).jobsSubmit(submission))
+      .toThrow(/only.*local/i);
+
+    const local = openStore(writeConfig("supadrum-mcp-adapter-", `version: 1
+database: queue.sqlite
+chambers:
+  atlas:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://tests/local/writer
+        setup_sql_path: database/supabase/fixtures/atlas-02-contratto.sql
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000b1
+projects:
+  atlas:
+    chamber: atlas
+    repo: .
+    mode: live
+    capabilities: [adapter-tests]
+`));
+    expect(() => createHandlers(local.config, local.store).jobsSubmit({
+      ...submission, project: "atlas", payload: { script: "missing" }
+    })).toThrow(/not registered/i);
+
+    expect(() => createHandlers(local.config, local.store).jobsSubmit({
+      ...submission, project: "atlas", payload: { script: "sessions" }
+    })).toThrow(/completed.*sql.execute/i);
+
+    const repository = local.config.projects.atlas!.repo!;
+    const fixturePath = "database/supabase/fixtures/atlas-02-contratto.sql";
+    const fixtureSource = "select 1;\n";
+    mkdirSync(join(repository, "database/supabase/fixtures"), { recursive: true });
+    execFileSync("git", ["init", "-q", repository]);
+    writeFileSync(join(repository, fixturePath), fixtureSource);
+    execFileSync("git", ["-C", repository, "add", fixturePath]);
+    execFileSync("git", ["-C", repository, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"]);
+    const sha = execFileSync("git", ["-C", repository, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const localSubmission = { ...submission, project: "atlas", repo_sha: sha };
+    const fixture = local.store.submit({
+      project: "atlas", operation: "sql.execute",
+      payload: { path: fixturePath, digest: createHash("sha256").update(fixtureSource).digest("hex") },
+      repo_sha: sha, idempotency_key: "atlas:fixture"
+    });
+    const granted = local.store.grantIfSchedulable(fixture.id, new Date(Date.now() + 60000).toISOString());
+    expect(granted).not.toBeNull();
+    local.store.transition(fixture.id, "running");
+    local.store.transition(fixture.id, "verifying");
+    local.store.transition(fixture.id, "completed", null, {
+      result: { output: { exit_code: 0 }, verification: { repo_sha_verified: true } }
+    });
+    expect(createHandlers(local.config, local.store).jobsSubmit({
+      ...localSubmission,
+      payload: { script: "sessions", setup_job_id: fixture.id }
+    }).operation).toBe("tests.run");
+    expect(() => createHandlers(local.config, local.store).jobsSubmit({
+      ...localSubmission, repo_sha: "def456", idempotency_key: "atlas:wrong-sha",
+      payload: { script: "sessions", setup_job_id: fixture.id }
+    })).toThrow(/same repo_sha/i);
+  });
   test("queues typed schema inspection without approval or SQL payloads", () => {
     const { config, store } = setup();
     const handlers = createHandlers(config, store);

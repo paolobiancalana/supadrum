@@ -38,6 +38,24 @@ function writeConfig(contents: string): string {
 }
 
 describe("operation catalog", () => {
+  test("adapter tests accept only a registered script selector, never caller argv or env", () => {
+    const base = {
+      project: "atlas",
+      operation: "tests.run",
+      repo_sha: "abc123",
+      idempotency_key: "atlas:abc123:tests",
+      payload: { script: "sessions" }
+    };
+    expect(JobSubmissionSchema.parse(base).payload).toEqual({ script: "sessions" });
+    expect(() => JobSubmissionSchema.parse({
+      ...base,
+      payload: { script: "sessions", argv: ["sh"] }
+    })).toThrow();
+    expect(() => JobSubmissionSchema.parse({
+      ...base,
+      payload: { script: "sessions", env: { PATH: "/tmp" } }
+    })).toThrow();
+  });
   test("maps read and mutation operations to the intended capability and approval gate", () => {
     expect(operationCatalog["schema.inspect"]).toEqual({
       capability: "schema-inspection",
@@ -63,6 +81,140 @@ describe("operation catalog", () => {
 });
 
 describe("project chambers", () => {
+  test("accepts a registered local adapter script without remote credentials", () => {
+    const path = writeConfig(`version: 1
+chambers:
+  atlas-local:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://tests/local/writer
+        setup_sql_path: database/supabase/fixtures/atlas-02-contratto.sql
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000b1
+projects:
+  atlas:
+    chamber: atlas-local
+    capabilities: [adapter-tests]
+    repo: .
+    mode: live
+`);
+    expect(loadConfig(path).projects.atlas?.adapter_tests?.sessions).toMatchObject({
+      npm_script: "test:adapter",
+      setup_sql_path: "database/supabase/fixtures/atlas-02-contratto.sql",
+      personas: { student: "c0470000-0000-4000-8000-1000000000a1" }
+    });
+  });
+
+  test("rejects writer password references that collide with another credential", () => {
+    const path = writeConfig(`version: 1
+chambers:
+  remote:
+    target: remote
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/remote/secret
+      management_token: vault://supabase/remote/management
+      database_access: vault://supabase/remote/postgres
+  local:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://supabase/remote/postgres
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000b1
+projects:
+  atlas:
+    chamber: local
+    capabilities: [adapter-tests]
+    repo: .
+  remote-app:
+    chamber: remote
+    capabilities: [data-api]
+`);
+    expect(() => loadConfig(path)).toThrow(/writer password.*credential/i);
+  });
+
+  test("rejects two adapter scripts sharing one writer password reference", () => {
+    const path = writeConfig(`version: 1
+chambers:
+  local:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://tests/local/writer
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000b1
+      sessions2:
+        npm_script: test:other
+        writer_password_ref: vault://tests/local/writer
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000b1
+projects:
+  atlas:
+    chamber: local
+    capabilities: [adapter-tests]
+    repo: .
+`);
+    expect(() => loadConfig(path)).toThrow(/writer password.*shared/i);
+  });
+
+  test("rejects adapter-test configuration on remote chambers", () => {
+    const path = writeConfig(`version: 1
+chambers:
+  remote:
+    target: remote
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/remote/secret
+      management_token: vault://supabase/remote/management
+      database_access: vault://supabase/remote/postgres
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://supabase/remote/writer-password
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+projects:
+  atlas:
+    chamber: remote
+    capabilities: [adapter-tests]
+`);
+    expect(() => loadConfig(path)).toThrow();
+  });
+
+  test("rejects duplicate or missing synthetic personas", () => {
+    const yaml = `version: 1
+chambers:
+  atlas:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://tests/local/writer
+        personas:
+          student: c0470000-0000-4000-8000-1000000000a1
+          staff: c0470000-0000-4000-8000-1000000000a3
+          outsider: c0470000-0000-4000-8000-1000000000a1
+projects:
+  atlas:
+    chamber: atlas
+    capabilities: [adapter-tests]
+`;
+    expect(() => loadConfig(writeConfig(yaml))).toThrow();
+    expect(() => loadConfig(writeConfig(yaml.replace("outsider:", "other:")))).toThrow();
+  });
   test("normalizes the bundled Node vault launcher for service environments", () => {
     const config = loadConfig(
       writeConfig(`

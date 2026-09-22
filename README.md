@@ -529,6 +529,60 @@ the transaction when the account is missing or ambiguous.
 read-only local inspection returning only organization id, name, slug,
 onboarding state, and product/document-ingest counts.
 
+### Pinned local adapter tests
+
+`tests.run` is available only for a live local chamber with the
+`adapter-tests` capability. The operator registers an npm script and synthetic
+persona IDs in the chamber configuration; a job may select only its registered
+name, not supply argv, environment, SQL, or credentials:
+
+```yaml
+chambers:
+  example-local:
+    target: local
+    adapter_tests:
+      sessions:
+        npm_script: test:adapter
+        writer_password_ref: vault://examples/local/writer-password
+        setup_sql_path: database/supabase/fixtures/adapter-contract.sql
+        personas:
+          student: 00000000-0000-4000-8000-000000000001
+          staff: 00000000-0000-4000-8000-000000000002
+          outsider: 00000000-0000-4000-8000-000000000003
+projects:
+  example:
+    repo: /absolute/path/to/example
+    supabase_dir: database
+    chamber: example-local
+    mode: live
+    capabilities: [sql, adapter-tests]
+```
+
+For a suite with `setup_sql_path`, first submit `sql.execute` for that
+repository file with its SHA-256 digest and the same `repo_sha`; wait until the
+job is **completed**. Then submit `tests.run` with payload
+`{"script":"sessions","setup_job_id":"<completed SQL job UUID>"}`. The broker
+checks that the SQL job completed successfully for the same project, commit,
+registered path, and exact fixture blob digest. A failed or mismatched setup
+blocks the test job. Immediately before the script, the broker reapplies that
+registered, committed fixture to the current local stack. Fixture SQL must be
+idempotent; this replay keeps a restarted or recreated stack from silently
+reusing an old setup job. A job cannot select arbitrary SQL.
+
+Before running the script, the broker requires HEAD to resolve exactly to
+`repo_sha`, a clean tracked and untracked checkout, and a loopback Supabase
+stack. It recreates the broker-owned login as a member only of
+`atlas_session_writer`, stores its random password in the local macOS Keychain,
+and checks its effective `app` function and application-table privileges.
+Plaintext is never sent in provisioning SQL: PostgreSQL receives a SCRAM
+verifier. The test process receives only `ATLAS_WRITER_DATABASE_URL`,
+`ATLAS_DATA_API_URL`, `ATLAS_ANON_KEY`, and short-lived
+`ATLAS_<PERSONA>_JWT` values, plus basic process variables. The anon key must
+be a locally signed JWT with the `anon` role; the JWT signing secret remains
+inside the broker. A nonzero test exit fails the job while preserving its exit
+code and redacted stdout/stderr in the result. The child script is trusted
+code at the pinned commit, not a sandboxed workload.
+
 Auth Admin can also recreate or reactivate the test user in the known local
 `SNAP Dev` tenant, mark that tenant ready for application access, attach the
 user as owner, reset the same public development password, and revoke stale

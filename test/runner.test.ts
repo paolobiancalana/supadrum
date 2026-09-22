@@ -16,6 +16,7 @@ import {
   type Executor
 } from "../src/runner.js";
 import { SqliteStore } from "../src/store.js";
+import { AdapterTestFailure } from "../src/local-adapter-tests.js";
 
 let currentTime = new Date("2026-07-29T15:00:00.000Z");
 const now = () => currentTime;
@@ -159,6 +160,46 @@ afterEach(() => {
 });
 
 describe("global scheduler", () => {
+  test("keeps a nonzero adapter-test exit code on the failed job", async () => {
+    const store = createStore();
+    const config = projectConfig();
+    const local = {
+      ...config.projects.alpha!,
+      target: "local" as const,
+      capabilities: ["adapter-tests" as const],
+      adapter_tests: {
+        sessions: {
+          npm_script: "test:adapter",
+          writer_password_ref: "vault://tests/local/writer",
+          personas: {
+            student: "c0470000-0000-4000-8000-1000000000a1",
+            staff: "c0470000-0000-4000-8000-1000000000a3",
+            outsider: "c0470000-0000-4000-8000-1000000000b1"
+          }
+        }
+      }
+    };
+    config.projects.alpha = local;
+    const queued = store.submit({
+      project: "alpha", operation: "tests.run", payload: { script: "sessions" },
+      repo_sha: "abc123", idempotency_key: "alpha:tests"
+    });
+    store.approve(queued.id, "operator");
+    const executor = new RecordingExecutor();
+    executor.execute = async () => {
+      throw new AdapterTestFailure({
+        output: { exit_code: 7, stdout: "[REDACTED]", stderr: "test failed" },
+        verification: { repo_sha_verified: true }
+      });
+    };
+    const runner = new Runner(store, config, new AvailableCredentials(), executor, { now });
+    await runner.tick();
+    expect(store.getJob(queued.id)).toMatchObject({
+      status: "failed",
+      error: "Adapter test script failed with exit code 7",
+      result: { output: { exit_code: 7, stdout: "[REDACTED]" } }
+    });
+  });
   test("atomically grants a job when two runners tick concurrently", async () => {
     const store = createStore();
     const job = submit(store, "alpha", "migration.plan", "contended");
