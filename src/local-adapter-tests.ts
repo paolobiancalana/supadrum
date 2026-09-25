@@ -167,6 +167,7 @@ begin
       where n.nspname = 'app'
         and has_function_privilege('${ATLAS_WRITER_LOGIN}', p.oid, 'EXECUTE'))
      is distinct from array[
+       'live_owner_claim', 'live_owner_cycle',
        'session_activate', 'session_confirm_closed',
        'session_expire_leases', 'session_fail_opening', 'session_heartbeat',
        'session_mark_closing', 'session_record_usage'
