@@ -171,7 +171,7 @@ begin
        'session_activate', 'session_begin_opening', 'session_confirm_closed',
        'session_expire_leases', 'session_fail_opening', 'session_fail_stale_openings',
        'session_heartbeat',
-       'session_mark_closing', 'session_record_usage'
+       'session_mark_closing', 'session_owner_mark_closing', 'session_record_usage'
      ]::text[] then
     raise exception 'Broker writer login has unexpected app function privileges';
   end if;
