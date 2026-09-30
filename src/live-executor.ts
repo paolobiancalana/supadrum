@@ -836,10 +836,11 @@ export class LiveSupabaseExecutor implements Executor {
       });
       const provisioned = await psql(personalLoginProvisionSql(login, registered.role, loginVerifier, members));
       if (provisioned.exitCode !== 0) {
-        await psql(personalLoginDisableSql(login));
+        const disabled = await psql(personalLoginDisableSql(login));
         const reason = redact(provisioned.stderr, [database.url, database.password, loginPassword, loginVerifier])
           .split("\n").find((line) => line.includes("ERROR:"))?.trim() ?? "no error line";
-        throw new Error(`Personal login provisioning failed for ${login} with exit code ${provisioned.exitCode}: ${reason}`);
+        const warning = disabled.exitCode === 0 ? "" : `; disabling ${login} also failed, it may still log in`;
+        throw new Error(`Personal login provisioning failed for ${login} with exit code ${provisioned.exitCode}: ${reason}${warning}`);
       }
       const loginUrl = new URL(database.url);
       loginUrl.search = "";

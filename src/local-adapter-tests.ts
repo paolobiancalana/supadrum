@@ -221,9 +221,11 @@ begin
   if exists (select 1 from pg_auth_members where member = role_oid) then
     raise exception '${role} inherits another role';
   end if;
+  -- The provisioner itself is exempt: without superuser it may grant the role only as its admin.
   if exists (
     select 1 from pg_auth_members m join pg_roles r on r.oid = m.member
-    where m.roleid = role_oid and r.rolname <> all (array[${memberList}]::text[])
+    where m.roleid = role_oid and r.rolname <> current_user
+      and r.rolname <> all (array[${memberList}]::text[])
   ) then
     raise exception '${role} has a member that is not a registered personal login';
   end if;

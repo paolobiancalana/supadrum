@@ -610,7 +610,8 @@ chambers:
         database_logins: [cost_owner_paolobiancalana]
 ```
 
-The login name must end with `_<person>` (dashes become underscores). The child
+The login name must end with `_<person>` (dashes become underscores), and no
+person may end with another (`maria` and `anna-maria` would share a suffix). The child
 then receives `ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL` for the
 PostgreSQL login `supadrum_atlas_cost_owner_paolobiancalana`, member of only
 `atlas_cost_owner`. The role must already exist in the target schema; if it

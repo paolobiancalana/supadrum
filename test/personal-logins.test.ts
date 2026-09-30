@@ -61,12 +61,14 @@ class Process implements LiveProcess {
   readonly calls: LiveProcessInput[] = [];
   failLogin = "";
   failStderr = "";
+  failDisable = false;
   async run(input: LiveProcessInput) {
     this.calls.push(input);
     if (input.argv[0] === "git" && input.argv.includes("rev-parse")) return { exitCode: 0, stdout: `${oid}\n${oid}\n`, stderr: "" };
     if (input.argv[0] === "git") return { exitCode: 0, stdout: "", stderr: "" };
     if (input.argv.includes("status")) return { exitCode: 0, stdout: JSON.stringify(status), stderr: "" };
     if (input.argv[0] === "psql") {
+      if (this.failDisable && input.stdin?.includes(" nologin")) return { exitCode: 2, stdout: "", stderr: "" };
       const failing = this.failLogin && input.stdin?.includes(`create role supadrum_atlas_${this.failLogin} `);
       const verifier = input.stdin?.match(/SCRAM-SHA-256\$4096:[^']+/)?.[0] ?? "";
       return { exitCode: failing ? 3 : 0, stdout: "", stderr: failing ? this.failStderr.replace("{verifier}", verifier) : "" };
@@ -155,6 +157,16 @@ describe("personal database logins", () => {
       `Personal login provisioning failed for supadrum_atlas_${operator} with exit code 3: ` +
       "psql:<stdin>:40: ERROR:  Personal login can execute a function of atlas_cost_owner");
     expect(process.calls.at(-1)?.stdin).toContain(`alter role supadrum_atlas_${operator} nologin`);
+    expect(process.calls.every((call) => call.argv[0] !== "npm")).toBe(true);
+  });
+
+  test("a login that could not be disabled is named as possibly still able to log in", async () => {
+    const { executor, process, repository } = setup();
+    process.failLogin = operator;
+    process.failDisable = true;
+    process.failStderr = "ERROR:  atlas_session_operator has a member that is not a registered personal login\n";
+    const failure = await executor.execute(job, project(repository), {} as never).catch((error: Error) => error);
+    expect(String(failure)).toContain(`disabling supadrum_atlas_${operator} also failed, it may still log in`);
     expect(process.calls.every((call) => call.argv[0] !== "npm")).toBe(true);
   });
 
@@ -257,6 +269,11 @@ describe("personal login registration", () => {
       .toThrow(/must end with _<person>/);
     expect(loadConfig(write(`    database_logins:\n${login("owner_anna_maria", "atlas_cost_owner", "anna-maria", "vault://a/w")}`))
       .projects.atlas?.database_logins?.owner_anna_maria).toBeDefined();
+  });
+
+  test("refuses persons one of which ends with another, so the login name names one person", () => {
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_maria", "atlas_cost_owner", "maria", "vault://a/1")}${login("operator_anna_maria", "atlas_session_operator", "anna-maria", "vault://a/2")}`)))
+      .toThrow(/must not end with one another/);
   });
 
   test("refuses a password reference shared with a local auth account or a remote credential", () => {

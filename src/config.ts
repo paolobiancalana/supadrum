@@ -333,6 +333,12 @@ export function loadConfig(path: string): SupadrumConfig {
   const loginRefs = new Set<string>();
   for (const chamber of Object.values(parsed.chambers)) {
     if (chamber.target !== "local") continue;
+    const suffixes = [...new Set(Object.values(chamber.database_logins ?? {})
+      .map((login) => `_${login.person.replaceAll("-", "_")}`))];
+    // With persons maria and anna-maria, owner_anna_maria would name either one.
+    if (suffixes.some((a) => suffixes.some((b) => a !== b && b.endsWith(a)))) {
+      throw new Error("Database login persons must not end with one another");
+    }
     const holders = new Set<string>();
     for (const [name, login] of Object.entries(chamber.database_logins ?? {})) {
       // The PostgreSQL login name is what session_user records: it must name the person.
