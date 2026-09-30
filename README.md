@@ -610,12 +610,22 @@ chambers:
         database_logins: [cost_owner_paolobiancalana]
 ```
 
-The child then receives `ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL`
-for the PostgreSQL login `supadrum_atlas_cost_owner_paolobiancalana`, member of
-only `atlas_cost_owner`. The role must already exist in the target schema; if it
-does not, the job fails before the script starts. Add each new login to
-[docs/database-logins.md](docs/database-logins.md) in the same commit that
-registers it.
+The login name must end with `_<person>` (dashes become underscores). The child
+then receives `ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL` for the
+PostgreSQL login `supadrum_atlas_cost_owner_paolobiancalana`, member of only
+`atlas_cost_owner`. The role must already exist in the target schema; if it
+does not, or if the guard in [SECURITY.md](SECURITY.md) refuses, the job fails
+before the script starts. The configuration file is not versioned: when you
+register a login there, add its row to
+[docs/database-logins.md](docs/database-logins.md) and commit that. To retire a
+login, remove it from the configuration, drop the role through a broker SQL job
+and mark the ledger row retired; until the role is dropped, the guard refuses
+every run of that human role, because the role then has an unregistered member.
+
+To prove the guard on a real PostgreSQL, point
+`SUPADRUM_THROWAWAY_PG_URL` at a disposable loopback cluster (never a Supabase
+stack: the test creates and drops Atlas-named roles and the `app` schema) and
+run `npx vitest run test/personal-login-guard.pg.test.ts`.
 
 ### Pinned local adapter tests
 

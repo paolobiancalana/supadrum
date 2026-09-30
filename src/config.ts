@@ -334,7 +334,11 @@ export function loadConfig(path: string): SupadrumConfig {
   for (const chamber of Object.values(parsed.chambers)) {
     if (chamber.target !== "local") continue;
     const holders = new Set<string>();
-    for (const login of Object.values(chamber.database_logins ?? {})) {
+    for (const [name, login] of Object.entries(chamber.database_logins ?? {})) {
+      // The PostgreSQL login name is what session_user records: it must name the person.
+      if (!name.endsWith(`_${login.person.replaceAll("-", "_")}`)) {
+        throw new Error(`Database login ${name} must end with _<person>`);
+      }
       const holder = `${login.role}:${login.person}`;
       if (holders.has(holder)) throw new Error("Database logins allow one login per person and role");
       holders.add(holder);

@@ -28,6 +28,7 @@ import {
   ATLAS_LOGIN_PREFIX,
   ATLAS_WRITER_LOGIN,
   parseLocalAdapterStatus,
+  personalLoginDisableSql,
   personalLoginProvisionSql,
   postgresScramVerifier,
   registeredAdapterTest,
@@ -822,16 +823,23 @@ export class LiveSupabaseExecutor implements Executor {
       } catch {
         throw new Error("Personal login password vault is unavailable");
       }
-      const provisioned = await this.#process.run({
+      const members = Object.entries(project.database_logins ?? {})
+        .filter(([, candidate]) => candidate.role === registered.role)
+        .map(([other]) => `${ATLAS_LOGIN_PREFIX}${other}`);
+      const psql = (stdin: string) => this.#process.run({
         argv: [this.#executables.psql, "--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1"],
         cwd: repository,
         env: { PATH: process.env.PATH, PGHOST: database.host, PGPORT: database.port,
           PGDATABASE: database.database, PGUSER: database.user,
           PGPASSWORD: database.password, PGSSLMODE: "disable" },
-        stdin: personalLoginProvisionSql(login, registered.role, loginVerifier)
+        stdin
       });
+      const provisioned = await psql(personalLoginProvisionSql(login, registered.role, loginVerifier, members));
       if (provisioned.exitCode !== 0) {
-        throw new Error(`Personal login provisioning failed with exit code ${provisioned.exitCode}`);
+        await psql(personalLoginDisableSql(login));
+        const reason = redact(provisioned.stderr, [database.url, database.password, loginPassword, loginVerifier])
+          .split("\n").find((line) => line.includes("ERROR:"))?.trim() ?? "no error line";
+        throw new Error(`Personal login provisioning failed for ${login} with exit code ${provisioned.exitCode}: ${reason}`);
       }
       const loginUrl = new URL(database.url);
       loginUrl.search = "";

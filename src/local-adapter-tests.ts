@@ -194,8 +194,20 @@ commit;
 `;
 }
 
-/** Recreate one person's login as a member of only its human role; any wider reach fails closed. */
-export function personalLoginProvisionSql(login: string, role: "atlas_cost_owner" | "atlas_session_operator", verifier: string): string {
+export type HumanRole = "atlas_cost_owner" | "atlas_session_operator";
+
+/**
+ * Recreate one person's login as a member of only its human role; any wider reach fails closed.
+ * `members` names every registered personal login of that role: any other member of the role
+ * (a shared login, the writer, a retired person) is refused.
+ */
+export function personalLoginProvisionSql(login: string, role: HumanRole, verifier: string,
+  members: readonly string[]): string {
+  const other: HumanRole = role === "atlas_cost_owner" ? "atlas_session_operator" : "atlas_cost_owner";
+  const memberList = members.map(quote).join(", ");
+  // Reserved = executable by some role but not by PUBLIC. A PUBLIC function is nobody's.
+  const reserved = `not (p.proacl is null or exists (
+        select 1 from aclexplode(p.proacl) a where a.grantee = 0 and a.privilege_type = 'EXECUTE'))`;
   return `begin;
 do $supadrum$
 declare
@@ -209,44 +221,76 @@ begin
   if exists (select 1 from pg_auth_members where member = role_oid) then
     raise exception '${role} inherits another role';
   end if;
+  if exists (
+    select 1 from pg_auth_members m join pg_roles r on r.oid = m.member
+    where m.roleid = role_oid and r.rolname <> all (array[${memberList}]::text[])
+  ) then
+    raise exception '${role} has a member that is not a registered personal login';
+  end if;
 end
 $supadrum$;
 drop role if exists ${login};
 create role ${login} login inherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls password ${quote(verifier)};
 grant ${role} to ${login};
--- No cross-membership check is needed below: the login was just created with this one grant,
--- and the role was refused above if it is a member of any other role (writer or other human role).
 do $supadrum$
+declare
+  other_oid oid;
 begin
+  select oid into other_oid from pg_roles where rolname = '${other}';
   if exists (
     select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'app' and (p.proacl is null or exists (
-      select 1 from aclexplode(p.proacl) a where a.grantee = 0 and a.privilege_type = 'EXECUTE'))
+    where n.nspname = 'app' and not ${reserved}
   ) then
     raise exception 'An app function is executable by PUBLIC';
   end if;
   if exists (
     select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'app'
+    where n.nspname in ('app', 'public') and ${reserved}
       and has_function_privilege('${login}', p.oid, 'EXECUTE')
       and has_function_privilege('atlas_session_writer', p.oid, 'EXECUTE')
   ) then
     raise exception 'Personal login can execute a writer function';
   end if;
+  if other_oid is not null and exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname in ('app', 'public') and ${reserved}
+      and has_function_privilege('${login}', p.oid, 'EXECUTE')
+      and has_function_privilege(other_oid, p.oid, 'EXECUTE')
+  ) then
+    raise exception 'Personal login can execute a function of ${other}';
+  end if;
   if exists (
     select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
-    where n.nspname in ('app', 'public') and c.relkind in ('r', 'p', 'v', 'm', 'f')
-      and (
+    where n.nspname in ('app', 'public') and (
+      (c.relkind in ('r', 'p', 'v', 'm', 'f') and (
         has_table_privilege('${login}', c.oid,
           'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
         or has_any_column_privilege('${login}', c.oid,
-          'SELECT,INSERT,UPDATE,REFERENCES')
-      )
+          'SELECT,INSERT,UPDATE,REFERENCES')))
+      or (c.relkind = 'S' and has_sequence_privilege('${login}', c.oid, 'USAGE,SELECT,UPDATE'))
+    )
   ) then
     raise exception 'Personal login has table privileges';
+  end if;
+  if has_database_privilege('${login}', current_database(), 'CREATE')
+    or has_schema_privilege('${login}', 'app', 'CREATE')
+    or has_schema_privilege('${login}', 'public', 'CREATE') then
+    raise exception 'Personal login can create objects';
   end if;
 end
 $supadrum$;
 commit;
+`;
+}
+
+/** After a refused provisioning, a login left from an earlier run must not stay usable. */
+export function personalLoginDisableSql(login: string): string {
+  return `do $supadrum$
+begin
+  if exists (select 1 from pg_roles where rolname = '${login}') then
+    execute 'alter role ${login} nologin';
+  end if;
+end
+$supadrum$;
 `;
 }

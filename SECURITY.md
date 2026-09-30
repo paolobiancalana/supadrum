@@ -53,16 +53,27 @@ credential or writer script.
 
 A script may also select personal database logins (`database_logins`), one per
 person and human role (`atlas_cost_owner` or `atlas_session_operator`), so
-that `session_user` names who acted. Each run recreates the selected login as
-a member of only its role, from a fresh Keychain password sent as a SCRAM
-verifier. Provisioning fails closed if the role is missing, can log in, has
-elevated attributes or belongs to another role; if any `app` function is
-executable by `PUBLIC`; if the login can execute a writer function; or if it
-has table or column privileges. Configuration refuses two logins for the same
+that `session_user` names who acted; the login name must end with the person.
+Each run recreates the selected login as a member of only its role, from a
+fresh Keychain password sent as a SCRAM verifier. Provisioning fails closed if
+the role is missing, can log in, has elevated attributes, belongs to another
+role, or has a member other than the registered personal logins of that role;
+if an `app` function is executable by `PUBLIC`; if the login can execute a
+function in `app` or `public` that is also executable by the writer or by the
+other human role (a function executable by `PUBLIC` counts as nobody's); if it
+has table, column or sequence privileges in `app` or `public`; or if it can
+create in the database, `app` or `public`. After a refusal the login, if left
+from an earlier run, is set `NOLOGIN`, and the error names the login and the
+failed check. Not covered: other schemas, and `SECURITY DEFINER` wrappers left
+executable by `PUBLIC` in the target schema, which the target repository's own
+privilege tests must refuse. Configuration refuses two logins for the same
 person and role and a password reference shared with any other secret. The
-login URLs are redacted from the result; the result records each login's role
-and person. Who registered which login, and when, is kept in
-[docs/database-logins.md](docs/database-logins.md).
+login URLs, passwords and verifiers are redacted from the result; the result
+records each login's role and person. Who registered which login, and when, is
+kept in [docs/database-logins.md](docs/database-logins.md). The guard's
+behaviour is proved on PostgreSQL by `test/personal-login-guard.pg.test.ts`,
+which runs only when `SUPADRUM_THROWAWAY_PG_URL` names a disposable loopback
+cluster.
 
 These checks do not prove the target repository's RLS or HTTP behavior. Run
 its real adapter suite against the intended local chamber and inspect the

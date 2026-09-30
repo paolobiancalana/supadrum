@@ -60,6 +60,7 @@ const job: Job = {
 class Process implements LiveProcess {
   readonly calls: LiveProcessInput[] = [];
   failLogin = "";
+  failStderr = "";
   async run(input: LiveProcessInput) {
     this.calls.push(input);
     if (input.argv[0] === "git" && input.argv.includes("rev-parse")) return { exitCode: 0, stdout: `${oid}\n${oid}\n`, stderr: "" };
@@ -67,20 +68,27 @@ class Process implements LiveProcess {
     if (input.argv.includes("status")) return { exitCode: 0, stdout: JSON.stringify(status), stderr: "" };
     if (input.argv[0] === "psql") {
       const failing = this.failLogin && input.stdin?.includes(`create role supadrum_atlas_${this.failLogin} `);
-      return { exitCode: failing ? 3 : 0, stdout: "", stderr: "" };
+      const verifier = input.stdin?.match(/SCRAM-SHA-256\$4096:[^']+/)?.[0] ?? "";
+      return { exitCode: failing ? 3 : 0, stdout: "", stderr: failing ? this.failStderr.replace("{verifier}", verifier) : "" };
     }
-    const urls = Object.entries(input.env).filter(([key]) => key.startsWith("ATLAS_LOGIN_")).map(([, value]) => value);
-    return { exitCode: 0, stdout: urls.join(" "), stderr: "" };
+    // The fake child prints each login URL and, separately, its bare password and the verifier it saw.
+    const urls = Object.entries(input.env).filter(([key]) => key.startsWith("ATLAS_LOGIN_")).map(([, value]) => value ?? "");
+    const passwords = urls.map((url) => decodeURIComponent(new URL(url).password));
+    const verifiers = this.calls.flatMap((call) => call.stdin?.match(/SCRAM-SHA-256\$4096:[^']+/g) ?? []);
+    return { exitCode: 0, stdout: [...urls, ...passwords].join(" "), stderr: verifiers.join(" ") };
   }
 }
 
-function setup() {
+function setup(brokenRef = "", forgetfulRef = "") {
   const process = new Process();
   const stored = new Map<string, string>();
   const executor = new LiveSupabaseExecutor({
     process,
     passwordVault: {
-      async put(reference, value) { stored.set(reference, value); },
+      async put(reference, value) {
+        if (reference === brokenRef) throw new Error("keychain locked");
+        if (reference !== forgetfulRef) stored.set(reference, value);
+      },
       async get(reference) { return stored.get(reference) ?? ""; }
     }
   });
@@ -117,6 +125,8 @@ describe("personal database logins", () => {
     expect(serialized).not.toContain(stored.get("vault://tests/local/cost-owner"));
     expect(serialized).not.toContain(stored.get("vault://tests/local/operator"));
     expect(serialized).not.toContain("supadrum_atlas_cost_owner_paolobiancalana:");
+    expect(serialized).not.toContain("SCRAM-SHA-256");
+    expect(result.output).toMatchObject({ stderr: expect.stringContaining("[REDACTED]") });
   });
 
   test("records which person and role each provisioned login stands for", async () => {
@@ -137,16 +147,57 @@ describe("personal database logins", () => {
     expect(process.calls.at(-1)!.env.ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL).toBeUndefined();
   });
 
-  test("a failed login guard never starts the tests", async () => {
+  test("a failed login guard disables that login, names the failed check and never starts the tests", async () => {
     const { executor, process, repository } = setup();
     process.failLogin = operator;
-    await expect(executor.execute(job, project(repository), {} as never))
-      .rejects.toThrow("Personal login provisioning failed with exit code 3");
+    process.failStderr = "psql:<stdin>:40: ERROR:  Personal login can execute a function of atlas_cost_owner\n";
+    await expect(executor.execute(job, project(repository), {} as never)).rejects.toThrow(
+      `Personal login provisioning failed for supadrum_atlas_${operator} with exit code 3: ` +
+      "psql:<stdin>:40: ERROR:  Personal login can execute a function of atlas_cost_owner");
+    expect(process.calls.at(-1)?.stdin).toContain(`alter role supadrum_atlas_${operator} nologin`);
     expect(process.calls.every((call) => call.argv[0] !== "npm")).toBe(true);
   });
 
-  test("the guard refuses a privileged or inheriting role, PUBLIC and writer functions, table grants", () => {
-    const sql = personalLoginProvisionSql("supadrum_atlas_x", "atlas_cost_owner", "SCRAM-SHA-256$4096:x");
+  test("the failure reason never carries the verifier psql may echo back", async () => {
+    const { executor, process, repository } = setup();
+    process.failLogin = costOwner;
+    process.failStderr = "ERROR:  syntax error\nLINE 1: password 'SCRAM-SHA-256$4096:echoed'\n";
+    const failure = await executor.execute(job, project(repository), {} as never).catch((error: Error) => error);
+    expect(String(failure)).toContain("ERROR:  syntax error");
+    process.failStderr = "ERROR:  bad verifier {verifier}\n";
+    const leaked = await executor.execute(job, project(repository), {} as never).catch((error: Error) => error);
+    expect(String(leaked)).toContain("ERROR:  bad verifier [REDACTED]");
+    expect(String(leaked)).not.toContain("SCRAM-SHA-256");
+  });
+
+  test("a vault failure on a later login stops before the tests", async () => {
+    const { executor, process, repository } = setup("vault://tests/local/operator");
+    await expect(executor.execute(job, project(repository), {} as never))
+      .rejects.toThrow("Personal login password vault is unavailable");
+    expect(provisioning(process, operator)).toBeUndefined();
+    expect(process.calls.every((call) => call.argv[0] !== "npm")).toBe(true);
+  });
+
+  test("a vault that does not keep the password stops before provisioning that login", async () => {
+    const { executor, process, repository } = setup("", "vault://tests/local/cost-owner");
+    await expect(executor.execute(job, project(repository), {} as never))
+      .rejects.toThrow("Personal login password vault is unavailable");
+    expect(provisioning(process, costOwner)).toBeUndefined();
+  });
+
+  test("each role's guard knows every registered login of that role, and only those", async () => {
+    const { executor, process, repository } = setup();
+    const config = project(repository, [costOwner]);
+    const logins = { ...config.database_logins!,
+      cost_owner_giulia: { role: "atlas_cost_owner" as const, person: "giulia", password_ref: "vault://tests/local/giulia" } };
+    await executor.execute(job, { ...config, database_logins: logins }, {} as never);
+    const sql = provisioning(process, costOwner)?.stdin ?? "";
+    expect(sql).toContain(`array['supadrum_atlas_${costOwner}', 'supadrum_atlas_cost_owner_giulia']::text[]`);
+  });
+
+  // Names only: the behaviour of each check is proved on PostgreSQL in personal-login-guard.pg.test.ts.
+  test("the provisioning SQL names every check of the guard", () => {
+    const sql = personalLoginProvisionSql("supadrum_atlas_x", "atlas_cost_owner", "SCRAM-SHA-256$4096:x", ["supadrum_atlas_x"]);
     const roleCheck = sql.slice(0, sql.indexOf("drop role if exists"));
     for (const attribute of ["rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"]) {
       expect(roleCheck).toContain(attribute);
@@ -178,7 +229,7 @@ describe("personal login registration", () => {
   });
 
   test("refuses two logins for the same person in the same role", () => {
-    expect(() => loadConfig(write(`    database_logins:\n${login("owner_a", "atlas_cost_owner", "paolo", "vault://a/1")}${login("owner_b", "atlas_cost_owner", "paolo", "vault://a/2")}`)))
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/1")}${login("cost_paolo", "atlas_cost_owner", "paolo", "vault://a/2")}`)))
       .toThrow(/one login per person and role/i);
   });
 
@@ -193,7 +244,27 @@ describe("personal login registration", () => {
       .toThrow(/shared/i);
   });
 
-  test("refuses a script that selects an unregistered login", () => {
+  test("refuses a script that selects an unregistered login, or one login twice", () => {
     expect(() => loadConfig(write(script("ghost_paolo")))).toThrow(/not registered: ghost_paolo/);
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/o")}${script("owner_paolo, owner_paolo")}`)))
+      .toThrow(/duplicate adapter test database login/i);
+  });
+
+  test("refuses a login name that does not end with its person", () => {
+    expect(() => loadConfig(write(`    database_logins:\n${login("writer", "atlas_cost_owner", "paolo", "vault://a/w")}`)))
+      .toThrow(/must end with _<person>/);
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "giulia", "vault://a/w")}`)))
+      .toThrow(/must end with _<person>/);
+    expect(loadConfig(write(`    database_logins:\n${login("owner_anna_maria", "atlas_cost_owner", "anna-maria", "vault://a/w")}`))
+      .projects.atlas?.database_logins?.owner_anna_maria).toBeDefined();
+  });
+
+  test("refuses a password reference shared with a local auth account or a remote credential", () => {
+    expect(() => loadConfig(write(`    auth_password_accounts:\n      giulia: {user_id: 5eed0000-0000-4000-8000-000000000001, email: g@alfa.test, password_ref: vault://a/auth}\n    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/auth")}`)))
+      .toThrow(/shared/i);
+    const dir = mkdtempSync(join(tmpdir(), "supadrum-logins-config-"));
+    const file = join(dir, "config.yaml");
+    writeFileSync(file, `version: 1\nchambers:\n  remote:\n    project_ref: abcdefghijklmnopqrst\n    credentials: {secret_key: vault://r/secret, management_token: vault://r/mgmt, database_access: vault://r/db}\n  local:\n    target: local\n    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://r/db")}projects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [adapter-tests], mode: live}\n`);
+    expect(() => loadConfig(file)).toThrow(/shared/i);
   });
 });
