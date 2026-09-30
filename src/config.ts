@@ -158,12 +158,22 @@ const LocalChamberSchema = z
         password_ref: VaultReferenceSchema
       }).strict()
     ).optional(),
+    database_logins: z.record(
+      // ponytail: the Postgres login is supadrum_atlas_<name>, so 48 characters keeps it within 63.
+      z.string().regex(/^[a-z][a-z0-9_]{0,47}$/),
+      z.object({
+        role: z.enum(["atlas_cost_owner", "atlas_session_operator"]),
+        person: z.string().regex(/^[a-z0-9][a-z0-9-]{0,38}$/),
+        password_ref: VaultReferenceSchema
+      }).strict()
+    ).optional(),
     adapter_tests: z.record(
       z.string().regex(/^[a-z][a-z0-9._-]*$/),
       z.object({
         npm_script: z.string().regex(/^[a-zA-Z][a-zA-Z0-9:._-]*$/),
         writer_password_ref: VaultReferenceSchema,
         password_accounts: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
+        database_logins: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
         setup_sql_path: z.string()
           .regex(/^[a-zA-Z0-9_./-]+$/)
           .refine((path) => !path.startsWith("/") && !path.split("/").includes(".."))
@@ -200,6 +210,7 @@ export type CommandTemplate = z.infer<typeof CommandTemplateSchema>;
 export type DeployTarget = z.infer<typeof DeployTargetSchema>;
 export type AdapterTestConfig = NonNullable<z.infer<typeof LocalChamberSchema>["adapter_tests"]>[string];
 export type LocalPasswordAccount = NonNullable<z.infer<typeof LocalChamberSchema>["auth_password_accounts"]>[string];
+export type DatabaseLogin = NonNullable<z.infer<typeof LocalChamberSchema>["database_logins"]>[string];
 
 export interface ChamberConfig {
   readonly target?: "remote" | "local";
@@ -209,6 +220,7 @@ export interface ChamberConfig {
   readonly managed_secrets?: Record<string, string>;
   readonly adapter_tests?: Record<string, AdapterTestConfig>;
   readonly auth_password_accounts?: Record<string, LocalPasswordAccount>;
+  readonly database_logins?: Record<string, DatabaseLogin>;
 }
 export interface ProjectConfig extends ChamberConfig {
   readonly repo?: string;
@@ -308,6 +320,29 @@ export function loadConfig(path: string): SupadrumConfig {
       if (new Set(registration.password_accounts ?? []).size !== (registration.password_accounts ?? []).length) {
         throw new Error("Duplicate adapter test password account");
       }
+      for (const name of registration.database_logins ?? []) {
+        if (!Object.hasOwn(chamber.database_logins ?? {}, name)) {
+          throw new Error(`Adapter test database login is not registered: ${name}`);
+        }
+      }
+      if (new Set(registration.database_logins ?? []).size !== (registration.database_logins ?? []).length) {
+        throw new Error("Duplicate adapter test database login");
+      }
+    }
+  }
+  const loginRefs = new Set<string>();
+  for (const chamber of Object.values(parsed.chambers)) {
+    if (chamber.target !== "local") continue;
+    const holders = new Set<string>();
+    for (const login of Object.values(chamber.database_logins ?? {})) {
+      const holder = `${login.role}:${login.person}`;
+      if (holders.has(holder)) throw new Error("Database logins allow one login per person and role");
+      holders.add(holder);
+      const ref = login.password_ref;
+      if (credentialRefs.has(ref) || authRefs.has(ref) || writerRefs.has(ref) || loginRefs.has(ref)) {
+        throw new Error("Database login password reference is shared");
+      }
+      loginRefs.add(ref);
     }
   }
   const baseDirectory = dirname(absolutePath);
@@ -319,6 +354,7 @@ export function loadConfig(path: string): SupadrumConfig {
             target: "local",
             ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
             ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
+            ...(chamber.database_logins ? { database_logins: chamber.database_logins } : {}),
             project_ref: "",
             credentials: {
               secret_key: "",
@@ -392,6 +428,7 @@ export function loadConfig(path: string): SupadrumConfig {
       managed_secrets: chamber.managed_secrets ?? {},
       ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
       ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
+      ...(chamber.database_logins ? { database_logins: chamber.database_logins } : {}),
       capabilities: input.capabilities,
       ...(input.commands ? { commands: input.commands } : {}),
       mode:

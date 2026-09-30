@@ -7,6 +7,7 @@ import type { ProjectConfig } from "./config.js";
 import type { JobSubmission, Job } from "./domain.js";
 
 export const ATLAS_WRITER_LOGIN = "supadrum_atlas_writer";
+export const ATLAS_LOGIN_PREFIX = "supadrum_atlas_";
 
 export function registeredAdapterTest(project: ProjectConfig, script: unknown) {
   return typeof script === "string" && project.adapter_tests &&
@@ -186,6 +187,63 @@ begin
       )
   ) then
     raise exception 'Broker writer login has table privileges';
+  end if;
+end
+$supadrum$;
+commit;
+`;
+}
+
+/** Recreate one person's login as a member of only its human role; any wider reach fails closed. */
+export function personalLoginProvisionSql(login: string, role: "atlas_cost_owner" | "atlas_session_operator", verifier: string): string {
+  return `begin;
+do $supadrum$
+declare
+  role_oid oid;
+begin
+  select oid into role_oid from pg_roles
+  where rolname = '${role}' and not rolcanlogin
+    and not rolsuper and not rolcreatedb and not rolcreaterole
+    and not rolreplication and not rolbypassrls;
+  if role_oid is null then raise exception '${role} is unavailable'; end if;
+  if exists (select 1 from pg_auth_members where member = role_oid) then
+    raise exception '${role} inherits another role';
+  end if;
+end
+$supadrum$;
+drop role if exists ${login};
+create role ${login} login inherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls password ${quote(verifier)};
+grant ${role} to ${login};
+-- No cross-membership check is needed below: the login was just created with this one grant,
+-- and the role was refused above if it is a member of any other role (writer or other human role).
+do $supadrum$
+begin
+  if exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'app' and (p.proacl is null or exists (
+      select 1 from aclexplode(p.proacl) a where a.grantee = 0 and a.privilege_type = 'EXECUTE'))
+  ) then
+    raise exception 'An app function is executable by PUBLIC';
+  end if;
+  if exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'app'
+      and has_function_privilege('${login}', p.oid, 'EXECUTE')
+      and has_function_privilege('atlas_session_writer', p.oid, 'EXECUTE')
+  ) then
+    raise exception 'Personal login can execute a writer function';
+  end if;
+  if exists (
+    select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname in ('app', 'public') and c.relkind in ('r', 'p', 'v', 'm', 'f')
+      and (
+        has_table_privilege('${login}', c.oid,
+          'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+        or has_any_column_privilege('${login}', c.oid,
+          'SELECT,INSERT,UPDATE,REFERENCES')
+      )
+  ) then
+    raise exception 'Personal login has table privileges';
   end if;
 end
 $supadrum$;

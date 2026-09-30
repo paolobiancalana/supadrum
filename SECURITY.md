@@ -51,6 +51,19 @@ Both table-level and column-level privileges are checked. Configuration
 rejects writer-password references that collide with another registered
 credential or writer script.
 
+A script may also select personal database logins (`database_logins`), one per
+person and human role (`atlas_cost_owner` or `atlas_session_operator`), so
+that `session_user` names who acted. Each run recreates the selected login as
+a member of only its role, from a fresh Keychain password sent as a SCRAM
+verifier. Provisioning fails closed if the role is missing, can log in, has
+elevated attributes or belongs to another role; if any `app` function is
+executable by `PUBLIC`; if the login can execute a writer function; or if it
+has table or column privileges. Configuration refuses two logins for the same
+person and role and a password reference shared with any other secret. The
+login URLs are redacted from the result; the result records each login's role
+and person. Who registered which login, and when, is kept in
+[docs/database-logins.md](docs/database-logins.md).
+
 These checks do not prove the target repository's RLS or HTTP behavior. Run
 its real adapter suite against the intended local chamber and inspect the
 effective login role before treating that product gate as passed. The bundled

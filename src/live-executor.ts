@@ -25,8 +25,10 @@ import type { VaultBackend } from "./vault.js";
 import { passwordAccountRequest, placeholderReconciliationSql, registeredPasswordAccount, upsertLocalPasswordAccount, validateLocalPasswordStatus } from "./local-password-auth.js";
 import {
   AdapterTestFailure,
+  ATLAS_LOGIN_PREFIX,
   ATLAS_WRITER_LOGIN,
   parseLocalAdapterStatus,
+  personalLoginProvisionSql,
   postgresScramVerifier,
   registeredAdapterTest,
   syntheticJwt,
@@ -804,6 +806,42 @@ export class LiveSupabaseExecutor implements Executor {
     if (setup.exitCode !== 0) {
       throw new Error(`Writer login provisioning failed with exit code ${setup.exitCode}`);
     }
+    const loginEnvironment: NodeJS.ProcessEnv = {};
+    const loginSecrets: string[] = [];
+    const provisionedLogins: { login: string; role: string; person: string }[] = [];
+    for (const name of registration.database_logins ?? []) {
+      const registered = project.database_logins && Object.hasOwn(project.database_logins, name)
+        ? project.database_logins[name] : undefined;
+      if (!registered) throw new Error("Adapter test database login is not registered");
+      const login = `${ATLAS_LOGIN_PREFIX}${name}`;
+      const loginPassword = randomBytes(32).toString("base64url");
+      const loginVerifier = postgresScramVerifier(loginPassword);
+      try {
+        await passwordVault.put(registered.password_ref, loginPassword);
+        if (await passwordVault.get(registered.password_ref) !== loginPassword) throw new Error("round-trip mismatch");
+      } catch {
+        throw new Error("Personal login password vault is unavailable");
+      }
+      const provisioned = await this.#process.run({
+        argv: [this.#executables.psql, "--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1"],
+        cwd: repository,
+        env: { PATH: process.env.PATH, PGHOST: database.host, PGPORT: database.port,
+          PGDATABASE: database.database, PGUSER: database.user,
+          PGPASSWORD: database.password, PGSSLMODE: "disable" },
+        stdin: personalLoginProvisionSql(login, registered.role, loginVerifier)
+      });
+      if (provisioned.exitCode !== 0) {
+        throw new Error(`Personal login provisioning failed with exit code ${provisioned.exitCode}`);
+      }
+      const loginUrl = new URL(database.url);
+      loginUrl.search = "";
+      loginUrl.hash = "";
+      loginUrl.username = login;
+      loginUrl.password = loginPassword;
+      loginEnvironment[`ATLAS_LOGIN_${name.toUpperCase()}_DATABASE_URL`] = loginUrl.toString();
+      loginSecrets.push(loginPassword, loginVerifier, loginUrl.toString());
+      provisionedLogins.push({ login, role: registered.role, person: registered.person });
+    }
     await this.#verifyRepository(repository, job);
     await this.#verifyCleanRepository(repository);
 
@@ -844,11 +882,12 @@ export class LiveSupabaseExecutor implements Executor {
         ATLAS_DATA_API_URL: apiUrl,
         ATLAS_ANON_KEY: anonKey,
         ...jwtEnvironment,
-        ...authEnvironment
+        ...authEnvironment,
+        ...loginEnvironment
       }
     });
     const secrets = [database.url, database.password, password, verifier, writerUrl.toString(),
-      anonKey, jwtSecret, ...jwtValues, ...authPasswords];
+      anonKey, jwtSecret, ...jwtValues, ...authPasswords, ...loginSecrets];
     const passwordBearing = authPasswords.length > 0;
     const output = {
       exit_code: result.exitCode,
@@ -864,7 +903,8 @@ export class LiveSupabaseExecutor implements Executor {
         target: "local",
         local_preflight: true,
         script: scriptName,
-        exit_code: result.exitCode
+        exit_code: result.exitCode,
+        ...(registration.database_logins ? { database_logins: provisionedLogins } : {})
       }
     };
     if (result.exitCode !== 0) throw new AdapterTestFailure(execution);

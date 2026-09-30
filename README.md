@@ -590,6 +590,33 @@ artifacts free of credential dumps. Use the real login in an acceptance test
 before relying on a PWA or demo login; synthetic persona JWTs used by other
 adapter tests do not prove password access.
 
+Atlas tickets that need a human actor (the cost owner who waives a verification,
+the operator who resolves a closing) select personal database logins instead of
+a shared one. Register one login per person and role in the chamber, then list
+the ones a script needs:
+
+```yaml
+chambers:
+  example-local:
+    target: local
+    database_logins:
+      cost_owner_paolobiancalana:
+        role: atlas_cost_owner
+        person: paolobiancalana
+        password_ref: vault://examples/local/cost-owner-paolobiancalana
+    adapter_tests:
+      reconciler:
+        # ...writer_password_ref, personas as above
+        database_logins: [cost_owner_paolobiancalana]
+```
+
+The child then receives `ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL`
+for the PostgreSQL login `supadrum_atlas_cost_owner_paolobiancalana`, member of
+only `atlas_cost_owner`. The role must already exist in the target schema; if it
+does not, the job fails before the script starts. Add each new login to
+[docs/database-logins.md](docs/database-logins.md) in the same commit that
+registers it.
+
 ### Pinned local adapter tests
 
 `tests.run` is available only for a live local chamber with the
