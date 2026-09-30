@@ -77,7 +77,7 @@ records each login's role and person. Who registered which login, and when, is
 kept in [docs/database-logins.md](docs/database-logins.md). The guard's
 behaviour is proved on PostgreSQL by `test/personal-login-guard.pg.test.ts`,
 which runs only when `SUPADRUM_THROWAWAY_PG_URL` names a disposable loopback
-cluster.
+cluster running PostgreSQL 16 or later.
 
 These checks do not prove the target repository's RLS or HTTP behavior. Run
 its real adapter suite against the intended local chamber and inspect the

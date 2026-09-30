@@ -79,7 +79,7 @@ describe.skipIf(!url)("personal login guard on PostgreSQL", () => {
     expect(run.status, run.stderr).toBe(0);
     expect(memberships(owner)).toBe("atlas_cost_owner");
     expect(attributes(owner)).toBe("f|f|f|f|f|t|t");
-    psql("create role atlas_team_owner login; grant atlas_cost_owner to atlas_team_owner with admin option, inherit false, set false;");
+    psql("create role atlas_team_owner login createrole; grant atlas_cost_owner to atlas_team_owner with admin option, inherit false, set false;");
     const shared = provision(owner, "atlas_cost_owner", [owner], true);
     expect(shared.stderr).toContain("has a member that is not a registered personal login");
   });
@@ -103,6 +103,9 @@ describe.skipIf(!url)("personal login guard on PostgreSQL", () => {
     ["the role creates roles", "alter role atlas_cost_owner createrole;", "atlas_cost_owner is unavailable"],
     ["the role replicates", "alter role atlas_cost_owner replication;", "atlas_cost_owner is unavailable"],
     ["the role belongs to the writer", "grant atlas_session_writer to atlas_cost_owner;", "atlas_cost_owner inherits another role"],
+    ["the role may only SET ROLE to the writer", "grant atlas_session_writer to atlas_cost_owner with inherit false, set true;", "atlas_cost_owner inherits another role"],
+    ["the role only administers the writer", "grant atlas_session_writer to atlas_cost_owner with admin true, inherit false, set false;", "atlas_cost_owner inherits another role"],
+    ["the role belongs to a system role", "grant pg_read_server_files to atlas_cost_owner;", "atlas_cost_owner inherits another role"],
     ["the role belongs to the other human role", "grant atlas_session_operator to atlas_cost_owner;", "atlas_cost_owner inherits another role"],
     ["the writer belongs to the role", "grant atlas_cost_owner to atlas_session_writer;", "has a member that is not a registered personal login"],
     ["a shared login belongs to the role", "create role atlas_team_owner login; grant atlas_cost_owner to atlas_team_owner;", "has a member that is not a registered personal login"],
@@ -115,6 +118,13 @@ describe.skipIf(!url)("personal login guard on PostgreSQL", () => {
     ["default privileges give new app functions to both roles", "alter default privileges in schema app grant execute on functions to atlas_session_operator; create function app.waive() returns int language sql as 'select 6'; revoke all on function app.waive() from public; grant execute on function app.waive() to atlas_cost_owner;", "Personal login can execute a function of atlas_session_operator"],
     ["the role reads a table", "grant select on app.t to atlas_cost_owner;", "Personal login has table privileges"],
     ["the role reads a column", "grant select (x) on app.t to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role deletes from a table", "grant delete on app.t to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role truncates a table", "grant truncate on app.t to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role inserts into a column", "grant insert (x) on app.t to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role updates a column", "grant update (x) on app.t to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role reads a materialized view", "create materialized view app.mv as select 1 as x; grant select on app.mv to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role reads a partitioned table", "create table app.pt (x int) partition by range (x); grant select on app.pt to atlas_cost_owner;", "Personal login has table privileges"],
+    ["the role reads a sequence", "grant select on sequence app.s to atlas_cost_owner;", "Personal login has table privileges"],
     ["the role reads a view", "create view app.v as select 1 as x; grant select on app.v to atlas_cost_owner;", "Personal login has table privileges"],
     ["the role advances a sequence", "grant usage on sequence app.s to atlas_cost_owner;", "Personal login has table privileges"],
     ["the role sets a sequence", "grant update on sequence app.s to atlas_cost_owner;", "Personal login has table privileges"],

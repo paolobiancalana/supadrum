@@ -153,9 +153,10 @@ describe("personal database logins", () => {
     const { executor, process, repository } = setup();
     process.failLogin = operator;
     process.failStderr = "psql:<stdin>:40: ERROR:  Personal login can execute a function of atlas_cost_owner\n";
-    await expect(executor.execute(job, project(repository), {} as never)).rejects.toThrow(
-      `Personal login provisioning failed for supadrum_atlas_${operator} with exit code 3: ` +
+    const failure = await executor.execute(job, project(repository), {} as never).catch((error: Error) => error);
+    expect(String(failure)).toBe(`Error: Personal login provisioning failed for supadrum_atlas_${operator} with exit code 3: ` +
       "psql:<stdin>:40: ERROR:  Personal login can execute a function of atlas_cost_owner");
+    expect(provisioning(process, operator)?.argv).toEqual(expect.arrayContaining(["--set", "ON_ERROR_STOP=1"]));
     expect(process.calls.at(-1)?.stdin).toContain(`alter role supadrum_atlas_${operator} nologin`);
     expect(process.calls.every((call) => call.argv[0] !== "npm")).toBe(true);
   });
@@ -274,6 +275,8 @@ describe("personal login registration", () => {
   test("refuses persons one of which ends with another, so the login name names one person", () => {
     expect(() => loadConfig(write(`    database_logins:\n${login("owner_maria", "atlas_cost_owner", "maria", "vault://a/1")}${login("operator_anna_maria", "atlas_session_operator", "anna-maria", "vault://a/2")}`)))
       .toThrow(/must not end with one another/);
+    expect(loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/1")}${login("owner_paolobiancalana", "atlas_cost_owner", "paolobiancalana", "vault://a/2")}${login("operator_amaria", "atlas_session_operator", "amaria", "vault://a/3")}${login("operator_maria", "atlas_session_operator", "maria", "vault://a/4")}`))
+      .projects.atlas?.database_logins?.owner_paolobiancalana).toBeDefined();
   });
 
   test("refuses a password reference shared with a local auth account or a remote credential", () => {

@@ -619,11 +619,13 @@ does not, or if the guard in [SECURITY.md](SECURITY.md) refuses, the job fails
 before the script starts. The configuration file is not versioned: when you
 register a login there, add its row to
 [docs/database-logins.md](docs/database-logins.md) and commit that. To retire a
-login, remove it from the configuration, drop the role through a broker SQL job
-and mark the ledger row retired; until the role is dropped, the guard refuses
+login, remove it from the configuration, commit to the target repository a SQL
+file that drops the role and run it with a broker `sql.execute` job (which runs
+only versioned files, by digest), delete its Keychain entry, and mark the ledger
+row retired; until the role is dropped, the guard refuses
 every run of that human role, because the role then has an unregistered member.
 
-To prove the guard on a real PostgreSQL, point
+To prove the guard on a real PostgreSQL (16 or later), point
 `SUPADRUM_THROWAWAY_PG_URL` at a disposable loopback cluster (never a Supabase
 stack: the test creates and drops Atlas-named roles and the `app` schema) and
 run `npx vitest run test/personal-login-guard.pg.test.ts`.
