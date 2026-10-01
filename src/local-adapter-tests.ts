@@ -175,7 +175,7 @@ begin
       where n.nspname = 'app'
         and has_function_privilege('${login}', p.oid, 'EXECUTE'))
      is distinct from array[
-       ${role === 'atlas_graph_writer' ? "'graph_draft_lock', 'graph_draft_replace'" : `
+       ${role === 'atlas_graph_writer' ? "'graph_draft_lock', 'graph_draft_replace', 'graph_review_read', 'graph_review_return', 'graph_review_submit'" : `
        'live_owner_claim', 'live_owner_cycle',
        'session_activate', 'session_begin_opening', 'session_confirm_closed',
        'session_expire_leases', 'session_fail_opening', 'session_fail_stale_openings',
