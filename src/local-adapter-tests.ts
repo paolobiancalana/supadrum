@@ -7,6 +7,12 @@ import type { ProjectConfig } from "./config.js";
 import type { JobSubmission, Job } from "./domain.js";
 
 export const ATLAS_WRITER_LOGIN = "supadrum_atlas_writer";
+export type WriterRole = "atlas_session_writer" | "atlas_graph_writer";
+export const writerLogin = (role: WriterRole = "atlas_session_writer") => {
+  if (role === "atlas_session_writer") return ATLAS_WRITER_LOGIN;
+  if (role === "atlas_graph_writer") return "supadrum_atlas_graph_writer";
+  throw new Error("Unregistered adapter writer role");
+};
 export const ATLAS_LOGIN_PREFIX = "supadrum_atlas_";
 
 export function registeredAdapterTest(project: ProjectConfig, script: unknown) {
@@ -141,7 +147,8 @@ export function postgresScramVerifier(password: string, salt = randomBytes(16)):
 }
 
 /** Recreate only the broker-owned login; dependencies or active use fail closed. */
-export function writerProvisionSql(verifier: string): string {
+export function writerProvisionSql(verifier: string, role: WriterRole = "atlas_session_writer"): string {
+  const login = writerLogin(role);
   const verifierLiteral = quote(verifier);
   return `begin;
 do $supadrum$
@@ -149,30 +156,31 @@ declare
   writer_oid oid;
 begin
   select oid into writer_oid from pg_roles
-  where rolname = 'atlas_session_writer' and not rolcanlogin
+  where rolname = '${role}' and not rolcanlogin
     and not rolsuper and not rolcreatedb and not rolcreaterole
     and not rolreplication and not rolbypassrls;
-  if writer_oid is null then raise exception 'atlas_session_writer is unavailable'; end if;
+  if writer_oid is null then raise exception '${role} is unavailable'; end if;
   if exists (select 1 from pg_auth_members where member = writer_oid) then
-    raise exception 'atlas_session_writer inherits another role';
+    raise exception '${role} inherits another role';
   end if;
 end
 $supadrum$;
-drop role if exists ${ATLAS_WRITER_LOGIN};
-create role ${ATLAS_WRITER_LOGIN} login inherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls password ${verifierLiteral};
-grant atlas_session_writer to ${ATLAS_WRITER_LOGIN};
+drop role if exists ${login};
+create role ${login} login inherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls password ${verifierLiteral};
+grant ${role} to ${login};
 do $supadrum$
 begin
   if (select array_agg(p.proname::text order by p.proname, p.oid)
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
       where n.nspname = 'app'
-        and has_function_privilege('${ATLAS_WRITER_LOGIN}', p.oid, 'EXECUTE'))
+        and has_function_privilege('${login}', p.oid, 'EXECUTE'))
      is distinct from array[
+       ${role === 'atlas_graph_writer' ? "'graph_draft_lock', 'graph_draft_replace'" : `
        'live_owner_claim', 'live_owner_cycle',
        'session_activate', 'session_begin_opening', 'session_confirm_closed',
        'session_expire_leases', 'session_fail_opening', 'session_fail_stale_openings',
        'session_heartbeat',
-       'session_mark_closing', 'session_owner_mark_closing', 'session_record_usage'
+       'session_mark_closing', 'session_owner_mark_closing', 'session_record_usage'`}
      ]::text[] then
     raise exception 'Broker writer login has unexpected app function privileges';
   end if;
@@ -180,9 +188,9 @@ begin
     select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
     where n.nspname in ('app', 'public') and c.relkind in ('r', 'p', 'v', 'm', 'f')
       and (
-        has_table_privilege('${ATLAS_WRITER_LOGIN}', c.oid,
+        has_table_privilege('${login}', c.oid,
           'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
-        or has_any_column_privilege('${ATLAS_WRITER_LOGIN}', c.oid,
+        or has_any_column_privilege('${login}', c.oid,
           'SELECT,INSERT,UPDATE,REFERENCES')
       )
   ) then

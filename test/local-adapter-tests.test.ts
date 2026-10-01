@@ -293,3 +293,18 @@ describe("local adapter tests", () => {
     expect(process.calls.find((call) => call.argv[0] === "psql")?.stdin).not.toContain(password);
   });
 });
+
+test("graph writer registration provisions an isolated login and only graph functions", async () => {
+  const { executor, process, repository } = setup();
+  const config = project(repository);
+  Object.assign(config.adapter_tests!.sessions!, { writer_role: "atlas_graph_writer" });
+  await executor.execute(job(), config, {} as never);
+  const sql = process.calls.find(call => call.argv[0] === "psql")!.stdin!;
+  expect(sql).toContain("grant atlas_graph_writer to supadrum_atlas_graph_writer;");
+  expect(sql).toContain("'graph_draft_lock', 'graph_draft_replace'");
+  expect(sql).not.toContain("session_activate");
+  expect(sql).not.toContain("grant atlas_session_writer");
+  expect(sql).toContain("has_any_column_privilege");
+  const run = process.calls.find(call => call.argv[0] === "npm")!;
+  expect(new URL(run.env.ATLAS_WRITER_DATABASE_URL!).username).toBe("supadrum_atlas_graph_writer");
+});

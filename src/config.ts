@@ -172,6 +172,7 @@ const LocalChamberSchema = z
       z.object({
         npm_script: z.string().regex(/^[a-zA-Z][a-zA-Z0-9:._-]*$/),
         writer_password_ref: VaultReferenceSchema,
+        writer_role: z.enum(["atlas_session_writer", "atlas_graph_writer"]).optional(),
         password_accounts: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
         database_logins: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
         setup_sql_path: z.string()

@@ -26,7 +26,7 @@ import { passwordAccountRequest, placeholderReconciliationSql, registeredPasswor
 import {
   AdapterTestFailure,
   ATLAS_LOGIN_PREFIX,
-  ATLAS_WRITER_LOGIN,
+  writerLogin,
   parseLocalAdapterStatus,
   personalLoginDisableSql,
   personalLoginProvisionSql,
@@ -802,7 +802,7 @@ export class LiveSupabaseExecutor implements Executor {
         PGPASSWORD: database.password,
         PGSSLMODE: "disable"
       },
-      stdin: writerProvisionSql(verifier)
+      stdin: writerProvisionSql(verifier, registration.writer_role)
     });
     if (setup.exitCode !== 0) {
       throw new Error(`Writer login provisioning failed with exit code ${setup.exitCode}`);
@@ -857,7 +857,7 @@ export class LiveSupabaseExecutor implements Executor {
     const writerUrl = new URL(database.url);
     writerUrl.search = "";
     writerUrl.hash = "";
-    writerUrl.username = ATLAS_WRITER_LOGIN;
+    writerUrl.username = writerLogin(registration.writer_role);
     writerUrl.password = password;
     const jwtEnvironment: NodeJS.ProcessEnv = {};
     const jwtValues: string[] = [];
