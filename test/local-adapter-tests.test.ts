@@ -301,7 +301,7 @@ test("graph writer registration provisions an isolated login and only graph func
   await executor.execute(job(), config, {} as never);
   const sql = process.calls.find(call => call.argv[0] === "psql")!.stdin!;
   expect(sql).toContain("grant atlas_graph_writer to supadrum_atlas_graph_writer;");
-  expect(sql).toContain("'graph_draft_lock', 'graph_draft_replace', 'graph_review_read', 'graph_review_return', 'graph_review_submit'");
+  expect(sql).toContain("'graph_approve', 'graph_authoring_lock', 'graph_draft_lock', 'graph_draft_replace', 'graph_publication_read', 'graph_publication_snapshot', 'graph_publish', 'graph_review_read', 'graph_review_return', 'graph_review_submit', 'graph_revise'");
   expect(sql).not.toContain("session_activate");
   expect(sql).not.toContain("grant atlas_session_writer");
   expect(sql).toContain("has_any_column_privilege");
