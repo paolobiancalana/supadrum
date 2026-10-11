@@ -7,6 +7,7 @@ import type { SupadrumConfig } from "../src/config.js";
 import type {
   ExecutionResult,
   Job,
+  JobStatus,
   JobSubmission
 } from "../src/domain.js";
 import {
@@ -92,12 +93,35 @@ function projectConfig(): SupadrumConfig {
   };
 }
 
+function queuePath(): string {
+  return join(mkdtempSync(join(tmpdir(), "supadrum-runner-")), "queue.sqlite");
+}
+
 function createStore() {
-  const path = join(
-    mkdtempSync(join(tmpdir(), "supadrum-runner-")),
-    "queue.sqlite"
-  );
-  const store = new SqliteStore(path, now, "manual");
+  const store = new SqliteStore(queuePath(), now, "manual");
+  stores.push(store);
+  return store;
+}
+
+/**
+ * Lands a cancel from another process just before the runner's next move of
+ * one granted job to `before`: the order in which the cancel wins the race.
+ */
+class CancelLandsFirst extends SqliteStore {
+  race: { readonly id: string; readonly before: JobStatus } | null = null;
+
+  override transition(...args: Parameters<SqliteStore["transition"]>): Job {
+    const [id, next] = args;
+    if (this.race?.id === id && this.race.before === next) {
+      this.race = null;
+      this.cancel(id);
+    }
+    return super.transition(...args);
+  }
+}
+
+function createRacingStore() {
+  const store = new CancelLandsFirst(queuePath(), now, "manual");
   stores.push(store);
   return store;
 }
@@ -351,6 +375,73 @@ describe("global scheduler", () => {
     expect(store.getJob(abandoned.id).status).toBe("lease_expired");
   });
 
+  test.each([
+    { before: "running" as const, mount: async () => {} },
+    {
+      before: "failed" as const,
+      mount: async () => {
+        throw new Error("mount failed");
+      }
+    }
+  ])(
+    "survives a cancel that lands just before it moves a granted job to $before",
+    async ({ before, mount }) => {
+      const store = createRacingStore();
+      const job = submit(store, "alpha", "migration.plan", "raced");
+      store.race = { id: job.id, before };
+      const executor = new RecordingExecutor();
+      executor.mount = mount;
+      const runner = new Runner(
+        store,
+        projectConfig(),
+        new AvailableCredentials(),
+        executor,
+        { now }
+      );
+
+      // Nothing ran, so the job keeps the cancel's verdict; failing it would
+      // be an illegal move that rejects the tick and stops the runner.
+      await expect(runner.tick()).resolves.toMatchObject({
+        id: job.id,
+        status: "cancelled"
+      });
+      expect(
+        executor.calls.filter((call) => call.startsWith("execute:"))
+      ).toEqual([]);
+      expect(store.events(job.id, 0).map((event) => event.status)).toEqual([
+        "queued",
+        "granted",
+        "cancelled"
+      ]);
+    }
+  );
+
+  test("still rejects the tick when it cannot record a failure no cancel explains", async () => {
+    class FailureNotRecorded extends SqliteStore {
+      override transition(...args: Parameters<SqliteStore["transition"]>): Job {
+        if (args[1] === "failed") throw new Error("disk I/O error");
+        return super.transition(...args);
+      }
+    }
+    const store = new FailureNotRecorded(queuePath(), now, "manual");
+    stores.push(store);
+    submit(store, "alpha", "migration.plan", "unrecorded");
+    const executor = new RecordingExecutor();
+    executor.mount = async () => {
+      throw new Error("mount failed");
+    };
+    const runner = new Runner(
+      store,
+      projectConfig(),
+      new AvailableCredentials(),
+      executor,
+      { now }
+    );
+
+    // Only a cancel excuses the failed write; anything else is not swallowed.
+    await expect(runner.tick()).rejects.toThrow("disk I/O error");
+  });
+
   test("skips an approval-blocked job and runs the first executable job", async () => {
     const store = createStore();
     const blocked = submit(store, "alpha", "migration.apply", "apply");
@@ -493,6 +584,40 @@ describe("interactive session lease", () => {
       "drain",
       "unmount"
     ]);
+  });
+
+  test("survives a cancel that wins the race to a granted session command", async () => {
+    const store = createRacingStore();
+    const session = store.openSession({
+      project: "alpha",
+      capability: "migrations",
+      repo_sha: "abc123",
+      idempotency_key: "alpha:session:migrations",
+      ttl_ms: 60_000
+    });
+    store.approve(session.open_job_id, "operator");
+    const executor = new RecordingExecutor();
+    const runner = new Runner(
+      store,
+      projectConfig(),
+      new AvailableCredentials(),
+      executor,
+      { now }
+    );
+    await runner.tick();
+    const command = store.submitSessionJob(session.id, {
+      operation: "migration.plan",
+      payload: { migration: "rules.sql" },
+      idempotency_key: "alpha:session:plan"
+    });
+    store.race = { id: command.id, before: "running" };
+
+    await expect(runner.tick()).resolves.toMatchObject({
+      id: command.id,
+      status: "cancelled"
+    });
+    // The chamber stays mounted for the session's next command.
+    expect(executor.calls).toEqual(["mount:alpha"]);
   });
 
   test("expires an abandoned session and releases the chamber", async () => {

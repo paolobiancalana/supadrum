@@ -4,7 +4,7 @@ import type {
   SupadrumConfig
 } from "./config.js";
 import type { ExecutionResult, Job, Session } from "./domain.js";
-import { SqliteStore } from "./store.js";
+import { SqliteStore, type TransitionPatch } from "./store.js";
 import { AdapterTestFailure } from "./local-adapter-tests.js";
 import { hasCompletedAdapterSetup, registeredAdapterTest } from "./local-adapter-tests.js";
 
@@ -217,7 +217,7 @@ export class Runner {
           result
         });
       } catch (error) {
-        job = this.#store.transition(job.id, "failed", null, {
+        job = this.#fail(job.id, {
           lease_expires_at: null,
           error: error instanceof Error ? error.message : String(error),
           ...(error instanceof AdapterTestFailure ? { result: error.result } : {})
@@ -347,10 +347,26 @@ export class Runner {
       this.#store.heartbeatSession(sessionId);
       return current;
     } catch (error) {
-      return this.#store.transition(current.id, "failed", null, {
+      return this.#fail(current.id, {
         lease_expires_at: null,
         error: error instanceof Error ? error.message : String(error)
       });
+    }
+  }
+
+  /**
+   * Fails a job this runner holds. A cancel can still win the race to a
+   * granted job — the store refuses one only once the job is running — and
+   * then nothing ran: the job keeps its cancelled verdict, instead of an
+   * illegal move to failed taking the runner down with it.
+   */
+  #fail(id: string, patch: TransitionPatch): Job {
+    try {
+      return this.#store.transition(id, "failed", null, patch);
+    } catch (error) {
+      const current = this.#store.getJob(id);
+      if (current.status === "cancelled") return current;
+      throw error;
     }
   }
 

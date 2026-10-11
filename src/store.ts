@@ -86,7 +86,7 @@ interface EventRow {
   created_at: string;
 }
 
-interface TransitionPatch {
+export interface TransitionPatch {
   lease_expires_at?: string | null;
   result?: unknown;
   error?: string | null;
@@ -721,17 +721,22 @@ export class SqliteStore {
   }
 
   cancel(id: string): Job {
-    const current = this.getJob(id);
-    if ((terminalJobStatuses as readonly JobStatus[]).includes(current.status)) {
-      return current;
-    }
-    if (current.status === "running" || current.status === "verifying") {
-      throw new BrokerError(
-        "job_state_conflict",
-        "Running jobs cannot be cancelled atomically"
-      );
-    }
-    return this.transition(id, "cancelled");
+    // Check and write in one transaction: a runner that moves the job from
+    // granted to running in between would see it cancelled under a running
+    // execution, and its next transition would throw.
+    return this.#database.transaction(() => {
+      const current = this.getJob(id);
+      if ((terminalJobStatuses as readonly JobStatus[]).includes(current.status)) {
+        return current;
+      }
+      if (current.status === "running" || current.status === "verifying") {
+        throw new BrokerError(
+          "job_state_conflict",
+          "Running jobs cannot be cancelled atomically"
+        );
+      }
+      return this.transition(id, "cancelled");
+    }).immediate();
   }
 
   #insertEvent(

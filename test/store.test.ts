@@ -3,9 +3,10 @@ import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, test } from "vitest";
 
-import type { JobSubmission } from "../src/domain.js";
+import type { Job, JobSubmission } from "../src/domain.js";
 import { BrokerError, type BrokerErrorCode } from "../src/errors.js";
 import { SqliteStore } from "../src/store.js";
 
@@ -319,6 +320,50 @@ describe("durable jobs", () => {
       expectCode(() => store.cancel(job.id), "job_state_conflict");
     }
   );
+
+  test("lets no runner start a job between the check and the write of its cancel", () => {
+    const { path, store: runner } = createStore();
+    const job = runner.submit(submission());
+    runner.grantIfSchedulable(job.id, "2026-07-29T16:00:00.000Z");
+    // Reports a held write lock at once instead of waiting on it: a second
+    // connection that waited here would block the very thread holding it.
+    const lockProbe = new Database(path, { timeout: 0 });
+    let raced = false;
+    class RunnerStartsMidCancel extends SqliteStore {
+      override getJob(id: string): Job {
+        const current = super.getJob(id);
+        if (!raced) {
+          raced = true;
+          // Right after cancel has read the job, the runner moves it from
+          // granted to running — if the queue lets anyone write now.
+          try {
+            lockProbe.exec("BEGIN IMMEDIATE");
+            lockProbe.exec("ROLLBACK");
+            runner.transition(id, "running");
+          } catch (error) {
+            if ((error as { code?: unknown }).code !== "SQLITE_BUSY") throw error;
+          }
+        }
+        return current;
+      }
+    }
+    const canceller = new RunnerStartsMidCancel(path, now, "manual");
+    stores.push(canceller);
+
+    try {
+      expect(canceller.cancel(job.id).status).toBe("cancelled");
+    } finally {
+      lockProbe.close();
+    }
+
+    // Never running then cancelled: that is a job marked stopped while its
+    // execution goes on, and the runner's next transition would throw.
+    expect(runner.events(job.id, 0).map((event) => event.status)).toEqual([
+      "queued",
+      "granted",
+      "cancelled"
+    ]);
+  });
 
   test("does not persist chamber references with a job", () => {
     const { path, store } = createStore();
