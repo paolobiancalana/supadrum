@@ -7,6 +7,7 @@ import type { ExecutionResult, Job, Session } from "./domain.js";
 import { SqliteStore, type TransitionPatch } from "./store.js";
 import { AdapterTestFailure } from "./local-adapter-tests.js";
 import { hasCompletedAdapterSetup, registeredAdapterTest } from "./local-adapter-tests.js";
+import { PgtapRunFailure, type PgtapReason } from "./pgtap-reasons.js";
 
 /**
  * The three Supabase credentials stay required: every chamber carries them and
@@ -115,6 +116,24 @@ export class Runner {
         });
         continue;
       }
+      if (candidate.operation === "pgtap.run") {
+        // The command refuses a dry-run config before queueing; this is the
+        // second check, for a job queued some other way.
+        if (project.mode !== "live" || this.#config.executor !== "command") {
+          this.#store.transition(candidate.id, "failed", null, {
+            error: "pgtap.run requires a live chamber and the command executor"
+          });
+          continue;
+        }
+        const waitedMs = this.#now().getTime() - new Date(candidate.created_at).getTime();
+        if (waitedMs > this.#config.pgtap.queue_timeout_ms) {
+          this.#store.transition(candidate.id, "failed", null, {
+            error: `pgtap.run expired in the queue after ${waitedMs} ms (limit ${this.#config.pgtap.queue_timeout_ms} ms)`,
+            result: { output: null, verification: { reason: "queue_timeout" satisfies PgtapReason } }
+          });
+          continue;
+        }
+      }
       if (
         (candidate.operation === "migration.plan" ||
           candidate.operation === "migration.baseline" ||
@@ -220,7 +239,9 @@ export class Runner {
         job = this.#fail(job.id, {
           lease_expires_at: null,
           error: error instanceof Error ? error.message : String(error),
-          ...(error instanceof AdapterTestFailure ? { result: error.result } : {})
+          ...(error instanceof AdapterTestFailure || error instanceof PgtapRunFailure
+            ? { result: error.result }
+            : {})
         });
       }
 

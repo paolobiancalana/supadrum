@@ -1,3 +1,4 @@
+import type { ExecutionResult } from "./domain.js";
 import type { PgtapConfigReason } from "./pgtap-config.js";
 import type { PgtapPrerequisiteReason } from "./pgtap-stack.js";
 import type { PgtapTreeReason } from "./pgtap-tree.js";
@@ -34,3 +35,18 @@ export type PgtapReason = (typeof pgtapReasons)[number];
 type ModuleReason = PgtapTreeReason | PgtapPrerequisiteReason | PgtapConfigReason;
 const moduleReasonsAreListed: ModuleReason extends PgtapReason ? true : never = true;
 void moduleReasonsAreListed;
+
+/**
+ * A `pgtap.run` that ended with a reason. Like `AdapterTestFailure`, it carries
+ * the whole result, which the runner keeps on the failed job.
+ */
+export class PgtapRunFailure extends Error {
+  constructor(
+    readonly reason: PgtapReason,
+    message: string,
+    readonly result: ExecutionResult
+  ) {
+    super(message);
+    this.name = "PgtapRunFailure";
+  }
+}

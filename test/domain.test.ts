@@ -192,6 +192,13 @@ ${extra}`;
     expect(() => loadConfig(writeConfig(pgtapConfig("")))).toThrow(/pgtap/);
   });
 
+  test("rejects a pgTAP project whose name cannot become a disposable stack id", () => {
+    const named = (name: string) =>
+      writeConfig(pgtapConfig(pgtapBlock("supabase/tests")).replace("  atlas:\n", `  ${name}:\n`));
+    expect(() => loadConfig(named("Atlas_X"))).toThrow(/lowercase letters, digits and hyphens/);
+    expect(Object.keys(loadConfig(named("atlas-2")).projects)).toEqual(["atlas-2"]);
+  });
+
   test("rejects pgTAP blocks with unknown keys or a tests path leaving the repository", () => {
     for (const testsPath of ["/etc/tests", "../tests", "a/../b"]) {
       expect(() => loadConfig(writeConfig(pgtapConfig(pgtapBlock(testsPath)))), testsPath).toThrow();

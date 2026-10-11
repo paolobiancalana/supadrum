@@ -18,6 +18,7 @@ import {
 } from "../src/runner.js";
 import { SqliteStore } from "../src/store.js";
 import { AdapterTestFailure } from "../src/local-adapter-tests.js";
+import { PgtapRunFailure } from "../src/pgtap-reasons.js";
 
 let currentTime = new Date("2026-07-29T15:00:00.000Z");
 const now = () => currentTime;
@@ -225,6 +226,96 @@ describe("global scheduler", () => {
       result: { output: { exit_code: 7, stdout: "[REDACTED]" } }
     });
   });
+  describe("pgtap.run", () => {
+    function pgtapConfig(): SupadrumConfig {
+      const config = projectConfig();
+      config.projects.alpha = {
+        ...config.projects.alpha!,
+        target: "local",
+        capabilities: ["pgtap"],
+        pgtap: { tests_path: "supabase/tests", start_timeout_ms: 300_000, test_timeout_ms: 120_000 }
+      };
+      return config;
+    }
+    const submitPgtap = (store: SqliteStore) => store.submit({
+      project: "alpha", operation: "pgtap.run", payload: {},
+      repo_sha: "0123456789abcdef0123456789abcdef01234567", idempotency_key: "alpha:pgtap"
+    });
+    const waited = (ms: number) => { currentTime = new Date(currentTime.getTime() + ms); };
+
+    test("drops a run that waited past the queue timeout, without the executor", async () => {
+      const store = createStore();
+      const config = pgtapConfig();
+      const queued = submitPgtap(store);
+      waited(config.pgtap.queue_timeout_ms + 1);
+      const executor = new RecordingExecutor();
+
+      await new Runner(store, config, new AvailableCredentials(), executor, { now }).tick();
+
+      expect(store.getJob(queued.id)).toMatchObject({
+        status: "failed",
+        result: { verification: { reason: "queue_timeout" } }
+      });
+      expect(executor.calls).toEqual([]);
+    });
+
+    test("runs a job that waited exactly the queue timeout", async () => {
+      const store = createStore();
+      const config = pgtapConfig();
+      const queued = submitPgtap(store);
+      waited(config.pgtap.queue_timeout_ms);
+      const executor = new RecordingExecutor();
+
+      await new Runner(store, config, new AvailableCredentials(), executor, { now }).tick();
+
+      expect(store.getJob(queued.id).status).toBe("completed");
+      expect(executor.calls).toContain("execute:alpha:pgtap.run");
+    });
+
+    test("refuses a dry-run chamber or a dry-run executor, without the executor", async () => {
+      for (const config of [
+        { ...pgtapConfig(), executor: "dry-run" as const },
+        (() => {
+          const config = pgtapConfig();
+          config.projects.alpha = { ...config.projects.alpha!, mode: "dry-run" };
+          return config;
+        })()
+      ]) {
+        const store = createStore();
+        const queued = submitPgtap(store);
+        const executor = new RecordingExecutor();
+
+        await new Runner(store, config, new AvailableCredentials(), executor, { now }).tick();
+
+        expect(store.getJob(queued.id)).toMatchObject({
+          status: "failed",
+          error: "pgtap.run requires a live chamber and the command executor"
+        });
+        expect(executor.calls).toEqual([]);
+      }
+    });
+
+    test("keeps the result of a failed run, reason included, on the job", async () => {
+      const store = createStore();
+      const queued = submitPgtap(store);
+      const executor = new RecordingExecutor();
+      executor.execute = async () => {
+        throw new PgtapRunFailure("tests_failed", "pgTAP tests failed with exit code 3", {
+          output: { exit_code: 3, stdout: "not ok 1\n", stderr: "" },
+          verification: { target: "local", reason: "tests_failed" }
+        });
+      };
+
+      await new Runner(store, pgtapConfig(), new AvailableCredentials(), executor, { now }).tick();
+
+      expect(store.getJob(queued.id)).toMatchObject({
+        status: "failed",
+        error: "pgTAP tests failed with exit code 3",
+        result: { output: { exit_code: 3 }, verification: { reason: "tests_failed" } }
+      });
+    });
+  });
+
   test("atomically grants a job when two runners tick concurrently", async () => {
     const store = createStore();
     const job = submit(store, "alpha", "migration.plan", "contended");

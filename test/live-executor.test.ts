@@ -790,17 +790,6 @@ describe("live Supabase executor", () => {
     ).toEqual([]);
   });
 
-  test("refuses a pgTAP run until its executor exists, without touching the stack", async () => {
-    const repository = mkdtempSync(join(tmpdir(), "supadrum-pgtap-"));
-    const process = new LocalRecordingProcess();
-    const executor = new LiveSupabaseExecutor({ process });
-
-    await expect(
-      executor.execute(runningJob("pgtap.run", {}), localProject(repository), credentials)
-    ).rejects.toThrow(/not implemented/);
-    expect(process.calls).toEqual([]);
-  });
-
   test("runs a repository SQL file against the local stack, never a stored credential", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-local-sql-"));
     const sql = "select 1;\n";

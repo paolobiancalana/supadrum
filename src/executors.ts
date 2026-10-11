@@ -430,6 +430,7 @@ export function createRuntime(config: SupadrumConfig): {
     (project) => project.mode === "live"
   );
   const liveExecutor = new LiveSupabaseExecutor({
+    pgtap: config.pgtap,
     executables: {
       git: hasLiveProject ? resolveExecutable("git") : "git",
       supabase: hasLiveProject

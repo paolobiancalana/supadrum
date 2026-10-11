@@ -516,6 +516,13 @@ export function loadConfig(path: string): SupadrumConfig {
         `Project ${name} lists pgtap but chamber ${chamberName} has no pgtap block`
       );
     }
+    // The name becomes the disposable stack id, `supadrum-tmp-<name>`, which
+    // Docker objects and the cleanup guard accept only in this alphabet.
+    if (input.capabilities.includes("pgtap") && !/^[a-z0-9-]+$/.test(name)) {
+      throw new Error(
+        `Project ${name} lists pgtap, so its name must use only lowercase letters, digits and hyphens`
+      );
+    }
   }
 
   for (const chamberName of Object.keys(chambers)) {

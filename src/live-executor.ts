@@ -4,10 +4,12 @@ import { isIP } from "node:net";
 import {
   accessSync,
   constants,
+  existsSync,
   mkdirSync,
   readFileSync,
   writeFileSync
 } from "node:fs";
+import { homedir } from "node:os";
 import {
   delimiter,
   dirname,
@@ -18,8 +20,18 @@ import {
   sep
 } from "node:path";
 
-import type { ProjectConfig } from "./config.js";
+import { pgtapBrokerDefaults, type PgtapBrokerConfig, type ProjectConfig } from "./config.js";
 import type { ExecutionResult, Job } from "./domain.js";
+import type { CommandRunner } from "./local-stack.js";
+import { buildPgtapConfig, PgtapConfigError } from "./pgtap-config.js";
+import { PgtapRunFailure, type PgtapReason } from "./pgtap-reasons.js";
+import {
+  checkPgtapPrerequisites,
+  createDisposableNetwork,
+  PgtapPrerequisiteError,
+  removeDisposableStack
+} from "./pgtap-stack.js";
+import { extractTree, PgtapTreeError, verifyTree } from "./pgtap-tree.js";
 import { MacOsKeychainBackend } from "./vault-cli.js";
 import type { VaultBackend } from "./vault.js";
 import { passwordAccountRequest, placeholderReconciliationSql, registeredPasswordAccount, upsertLocalPasswordAccount, validateLocalPasswordStatus } from "./local-password-auth.js";
@@ -374,6 +386,88 @@ interface LiveExecutorOptions {
   readonly resolveReference?: (reference: string) => Promise<string>;
   readonly executables?: Partial<LiveExecutables>;
   readonly passwordVault?: VaultBackend;
+  readonly pgtap?: PgtapBrokerConfig;
+  /** Parent of the disposable folders; tests point it away from `$HOME`. */
+  readonly cacheRoot?: string;
+}
+
+const PGTAP_PREPARE_MS = 60_000;
+const PGTAP_CLEANUP_MS = 60_000;
+/** Every service but the database: `test db` needs nothing else (#45). */
+const PGTAP_EXCLUDED_SERVICES =
+  "gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor";
+const PGTAP_PROBE_REPOSITORY = "public.ecr.aws/supabase/postgres";
+
+type PgtapPhase = "prepare" | "start" | "test" | "cleanup";
+
+/** A refusal or verdict of `pgtap.run`, raised before its result exists. */
+class PgtapStop extends Error {
+  constructor(
+    readonly reason: PgtapReason,
+    message: string,
+    readonly phase?: PgtapPhase
+  ) {
+    super(message);
+  }
+}
+
+interface PhaseRunner {
+  readonly live: LiveProcess;
+  readonly execute: CommandRunner;
+  readonly timedOut: () => boolean;
+}
+
+/**
+ * The commands of one phase share its deadline: each gets what is left of it
+ * as `timeoutMs`. `timedOut` remembers a kill even where the caller swallows
+ * the failed command (the probes, the cleanup listings), so the phase ends as
+ * a timeout and not as the refusal the kill would otherwise read as.
+ */
+function phaseRunner(
+  inner: LiveProcess,
+  budgetMs: number,
+  supabase: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): PhaseRunner {
+  const deadline = Date.now() + budgetMs;
+  let timedOut = false;
+  const live: LiveProcess = {
+    async run(input) {
+      const result = await inner.run({
+        ...input,
+        timeoutMs: Math.max(deadline - Date.now(), 1)
+      });
+      if (result.timedOut) timedOut = true;
+      return result;
+    }
+  };
+  return {
+    live,
+    execute: async (command, args, commandCwd) => {
+      const result = await live.run({
+        argv: [command === "supabase" ? supabase : command, ...args],
+        cwd: commandCwd ?? cwd,
+        env
+      });
+      return { code: result.exitCode, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
+    },
+    timedOut: () => timedOut
+  };
+}
+
+/** The `port` of the `[db]` table of a config.toml. */
+function databasePort(toml: string): string | undefined {
+  let table = "";
+  for (const line of toml.split("\n")) {
+    const header = /^\s*\[\s*([^\]]+?)\s*\]/.exec(line);
+    if (header) table = header[1] ?? "";
+    else if (table === "db") {
+      const port = /^\s*port\s*=\s*(\d+)/.exec(line)?.[1];
+      if (port) return port;
+    }
+  }
+  return undefined;
 }
 
 interface LiveExecutables {
@@ -493,8 +587,12 @@ export class LiveSupabaseExecutor implements Executor {
     | undefined;
   readonly #executables: LiveExecutables;
   readonly #passwordVault: VaultBackend | undefined;
+  readonly #pgtap: PgtapBrokerConfig;
+  readonly #cacheRoot: string;
 
   constructor(options: LiveExecutorOptions = {}) {
+    this.#pgtap = options.pgtap ?? pgtapBrokerDefaults;
+    this.#cacheRoot = options.cacheRoot ?? join(homedir(), ".cache", "supadrum");
     this.#process = options.process ?? new NodeLiveProcess();
     this.#fetch = options.fetch ?? fetch;
     this.#resolveReference = options.resolveReference;
@@ -518,11 +616,8 @@ export class LiveSupabaseExecutor implements Executor {
     project: ProjectConfig,
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
-    // Catalogued ahead of its executor (#51): refuse here rather than fall
-    // through to the local migration path below.
-    if (job.operation === "pgtap.run") {
-      throw new Error("pgtap.run is not implemented yet");
-    }
+    // Before `#verifyRepository`: the job names a tree, not the checkout's HEAD.
+    if (job.operation === "pgtap.run") return this.#executePgtap(job, project);
     if (job.operation === "tests.run") {
       if (project.target !== "local") {
         throw new Error("tests.run is available only on a local chamber");
@@ -664,6 +759,171 @@ export class LiveSupabaseExecutor implements Executor {
       default:
         throw new Error(`No live adapter for ${job.operation}`);
     }
+  }
+
+  /**
+   * Runs the pgTAP suite of one git tree in a disposable stack: prepare,
+   * start, test, then cleanup whatever happened once cleanup-before passed.
+   * Every refusal and verdict leaves as a `PgtapRunFailure` carrying
+   * `verification.reason`; a cleanup residue is reported beside the verdict,
+   * never instead of it.
+   */
+  async #executePgtap(job: Job, project: ProjectConfig): Promise<ExecutionResult> {
+    const repository = project.repo;
+    const chamber = project.pgtap;
+    if (!repository || !chamber) {
+      throw new Error(`Project ${job.project} has no repository or pgtap block`);
+    }
+    const id = `supadrum-tmp-${job.project}`;
+    const directory = join(this.#cacheRoot, id);
+    const env = this.#localEnvironment({ NO_COLOR: "1" });
+    const supabase = this.#executables.supabase;
+    const startedAt = Date.now();
+    const phases = { prepare_ms: 0, start_ms: 0, test_ms: 0, cleanup_ms: 0 };
+    const phase = async <T>(
+      name: PgtapPhase,
+      budgetMs: number,
+      body: (run: PhaseRunner) => Promise<T>
+    ): Promise<T> => {
+      const began = Date.now();
+      const run = phaseRunner(this.#process, budgetMs, supabase, repository, env);
+      try {
+        const value = await body(run);
+        if (!run.timedOut()) return value;
+      } catch (error) {
+        if (!run.timedOut()) throw error;
+      } finally {
+        phases[`${name}_ms` as const] = Date.now() - began;
+      }
+      throw new PgtapStop(
+        "phase_timeout",
+        `pgtap.run ${name} phase exceeded its ${budgetMs / 1000} s limit` +
+          (name === "start" ? "; first run after a Supabase CLI upgrade? Retry" : ""),
+        name
+      );
+    };
+    let secrets: string[] = [];
+    const captured = (result: LiveProcessResult) => ({
+      exit_code: result.exitCode,
+      stdout: redact(result.stdout, secrets),
+      stderr: redact(result.stderr, secrets)
+    });
+    let output: unknown = null;
+    let dbImage: string | null = null;
+    let armed = false;
+    let residue = "";
+    let caught: unknown;
+    try {
+      // The fixed 60 s include extraction, `bash -c 'git archive | tar'`: a
+      // timeout signals bash only, and git or tar may hold the pipes open a
+      // while longer. That delays when the kill is seen, not the cleanup.
+      const network = await phase("prepare", PGTAP_PREPARE_MS, async (run) => {
+        const source = { process: run.live, git: this.#executables.git, repository };
+        await verifyTree(source, job.repo_sha);
+        // Any local tag measures the same disk, and none is pulled. Without
+        // one, the bare name fails `docker image inspect` and the check below
+        // refuses with no_probe_image, after the Docker and CLI probes.
+        const images = await run.execute("docker", [
+          "images", "--format", "{{.Repository}}:{{.Tag}}", PGTAP_PROBE_REPOSITORY
+        ]);
+        const probeImage = images.stdout.split("\n")
+          .find((tag) => tag && !tag.endsWith(":<none>")) ?? PGTAP_PROBE_REPOSITORY;
+        await checkPgtapPrerequisites(
+          { probeImage, minFreeGib: this.#pgtap.min_free_gib },
+          run.execute
+        );
+        const left = await removeDisposableStack(id, run.execute, this.#cacheRoot)
+          .catch((error: unknown) => {
+            throw new PgtapStop("cleanup_before_failed",
+              `Cleanup before the run failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        if (left) throw new PgtapStop("cleanup_before_failed", `Cleanup before the run left:\n${left}`);
+        armed = true;
+        mkdirSync(directory, { recursive: true });
+        await extractTree(source, job.repo_sha, directory);
+        if (!existsSync(join(directory, chamber.tests_path))) {
+          throw new PgtapStop("tests_path_missing", `Tree ${job.repo_sha} has no ${chamber.tests_path}`);
+        }
+        const configPath = join(directory, "supabase", "config.toml");
+        const config = await buildPgtapConfig({
+          tree: readFileSync(configPath, "utf8"),
+          project: job.project,
+          portBase: this.#pgtap.port_base
+        });
+        writeFileSync(configPath, config);
+        // The stack keeps the CLI's default password, so only the URL around
+        // it is redacted: the bare word `postgres` would deface the TAP.
+        const port = databasePort(config);
+        if (port) secrets = [`postgresql://postgres:postgres@127.0.0.1:${port}/postgres`];
+        return createDisposableNetwork(id, run.execute);
+      });
+      await phase("start", chamber.start_timeout_ms, async (run) => {
+        const started = await run.live.run({
+          argv: [supabase, "start", "--workdir", directory, "--network-id", network,
+            "-x", PGTAP_EXCLUDED_SERVICES],
+          cwd: directory,
+          env
+        });
+        output = captured(started);
+        if (started.exitCode !== 0) {
+          throw new PgtapStop("start_failed", `supabase start failed with exit code ${started.exitCode}`);
+        }
+        const container = `supabase_db_${id}`;
+        const inspected = await run.execute("docker", ["inspect", "--format", "{{.Config.Image}}", container]);
+        if (inspected.code !== 0 || !inspected.stdout) {
+          throw new PgtapStop("start_failed", `No database container ${container} after supabase start`);
+        }
+        dbImage = inspected.stdout;
+      });
+      const tested = await phase("test", chamber.test_timeout_ms, async (run) => {
+        const result = await run.live.run({
+          argv: [supabase, "test", "db", "--workdir", directory, chamber.tests_path],
+          cwd: directory,
+          env
+        });
+        output = captured(result);
+        return result;
+      });
+      if (tested.exitCode !== 0) {
+        throw new PgtapStop("tests_failed", `pgTAP tests failed with exit code ${tested.exitCode}`);
+      }
+    } catch (error) {
+      caught = error;
+    }
+    if (armed) {
+      try {
+        await phase("cleanup", PGTAP_CLEANUP_MS, async (run) => {
+          residue = await removeDisposableStack(id, run.execute, this.#cacheRoot);
+        });
+      } catch (error) {
+        residue ||= error instanceof Error ? error.message : String(error);
+        // Only a timeout is a reason here, and only for a run that had none.
+        if (error instanceof PgtapStop) caught ??= error;
+      }
+    }
+    const reason =
+      caught instanceof PgtapStop ||
+      caught instanceof PgtapTreeError ||
+      caught instanceof PgtapPrerequisiteError ||
+      caught instanceof PgtapConfigError
+        ? caught.reason
+        : undefined;
+    if (caught !== undefined && reason === undefined) throw caught;
+    const result: ExecutionResult = {
+      output,
+      verification: {
+        target: "local",
+        tree_oid: job.repo_sha,
+        db_image: dbImage,
+        duration_ms: Date.now() - startedAt,
+        phases,
+        reason: reason ?? null,
+        ...(caught instanceof PgtapStop && caught.phase ? { phase: caught.phase } : {}),
+        ...(residue ? { cleanup_residue: residue } : {})
+      }
+    };
+    if (reason) throw new PgtapRunFailure(reason, (caught as Error).message, result);
+    return result;
   }
 
   async #routeDirectDatabase(
