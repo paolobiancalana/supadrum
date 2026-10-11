@@ -1606,7 +1606,6 @@ export class LiveSupabaseExecutor implements Executor {
       );
     }
 
-    let values: string[];
     let statusValues: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(status.stdout);
@@ -1618,14 +1617,16 @@ export class LiveSupabaseExecutor implements Executor {
         throw new Error("status is not an object");
       }
       statusValues = parsed as Record<string, unknown>;
-      values = Object.values(parsed)
-        .filter((value): value is string => typeof value === "string");
     } catch {
       throw new Error("Local Supabase status returned invalid JSON");
     }
-    const databaseUrl = values.find((value) =>
+    // The direct database URL by its key, never "the first postgres:// value":
+    // with the pooler enabled the status also carries a pooler URL, and a
+    // session there cannot hold an advisory lock or set keepalives (#29).
+    const databaseUrl = Object.entries(statusValues).find(([key, value]) =>
+      /^DB[ _]URL$/i.test(key) && typeof value === "string" &&
       /^postgres(?:ql)?:\/\//.test(value)
-    );
+    )?.[1] as string | undefined;
     if (!databaseUrl) {
       throw new Error("Local Supabase status has no database URL");
     }

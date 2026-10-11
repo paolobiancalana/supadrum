@@ -686,6 +686,18 @@ code at the pinned commit, not a sandboxed workload.
 When a script declares `password_accounts`, that same child additionally gets
 the selected `SUPADRUM_AUTH_<NAME>_EMAIL` and `_PASSWORD` variables.
 
+`ATLAS_WRITER_DATABASE_URL` is the stack's **direct** database port (the
+`DB URL` of `supabase status`), never the connection pooler, so a session
+opened on it is the one that holds an advisory lock and the one that releases
+it. The URL is built at run time from the Keychain password and never written
+to a file; the broker redacts it from the captured streams. The script may
+open it more than once (two concurrent runtimes contend for the lock against
+the stack's own `max_connections`, 100 by default, shared with no other
+project) and sets TCP keepalives itself, per session, since
+`tcp_keepalives_idle`, `_interval` and `_count` are user-settable: pass
+`?options=-c%20tcp_keepalives_idle%3D30` or run `SET` after connecting, then
+read them back with `current_setting`.
+
 Auth Admin can also recreate or reactivate the test user in the known local
 `SNAP Dev` tenant, mark that tenant ready for application access, attach the
 user as owner, reset the same public development password, and revoke stale

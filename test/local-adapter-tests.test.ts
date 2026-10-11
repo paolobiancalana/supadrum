@@ -73,7 +73,7 @@ class RecordingProcess implements LiveProcess {
   testExit = 0;
   directGrant = false;
   verifier = "";
-  status = localStatus;
+  status: Record<string, string> = localStatus;
   committedFixture = "select 1;\n";
 
   async run(input: LiveProcessInput) {
@@ -271,6 +271,19 @@ describe("local adapter tests", () => {
     await expect(executor.execute(job(), project(repository), {} as never))
       .rejects.toThrow(/anon key/i);
     expect(stored.size).toBe(0);
+  });
+
+  test("hands the script the direct database URL, never the pooler's", async () => {
+    const { executor, process, repository } = setup();
+    // Key order as a status with the pooler enabled lists it first; the
+    // advisory lock of project-atlas needs the session that took it (#29).
+    process.status = {
+      "POOLER URL": "postgresql://postgres.atlas:admin-canary@127.0.0.1:54339/postgres",
+      ...localStatus
+    };
+    await executor.execute(job(), project(repository), {} as never);
+    const child = process.calls.at(-1);
+    expect(new URL(child!.env.ATLAS_WRITER_DATABASE_URL!).port).toBe("54332");
   });
 
   test("refuses a database host with a loopback-looking remote name", async () => {
