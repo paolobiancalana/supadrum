@@ -73,12 +73,20 @@ export interface LiveProcessInput {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
   readonly stdin?: string;
+  /**
+   * Wall-clock cap. When it elapses the child gets SIGTERM, then SIGKILL after
+   * the kill grace period, and the result carries `timedOut: true`. Absent
+   * means no cap and no signal.
+   */
+  readonly timeoutMs?: number;
 }
 
 export interface LiveProcessResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  /** True when `timeoutMs` elapsed and the child was signalled. */
+  readonly timedOut?: boolean;
 }
 
 export interface LiveProcess {
@@ -301,7 +309,16 @@ commit;
 `;
 }
 
-class NodeLiveProcess implements LiveProcess {
+const DEFAULT_KILL_GRACE_MS = 5_000;
+
+export class NodeLiveProcess implements LiveProcess {
+  readonly #killGraceMs: number;
+
+  /** `killGraceMs` is the SIGTERM-to-SIGKILL delay; tests shorten it. */
+  constructor(options: { readonly killGraceMs?: number } = {}) {
+    this.#killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  }
+
   run(input: LiveProcessInput): Promise<LiveProcessResult> {
     const [program, ...args] = input.argv;
     if (!program) throw new Error("Command argv cannot be empty");
@@ -314,14 +331,36 @@ class NodeLiveProcess implements LiveProcess {
       });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
+      let timedOut = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      const timeoutTimer =
+        input.timeoutMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              timedOut = true;
+              child.kill("SIGTERM");
+              killTimer = setTimeout(
+                () => child.kill("SIGKILL"),
+                this.#killGraceMs
+              );
+            }, input.timeoutMs);
+      const stopTimers = (): void => {
+        clearTimeout(timeoutTimer);
+        clearTimeout(killTimer);
+      };
       child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-      child.on("error", reject);
+      child.on("error", (error) => {
+        stopTimers();
+        reject(error);
+      });
       child.on("close", (code) => {
+        stopTimers();
         resolveProcess({
           exitCode: code ?? 1,
           stdout: Buffer.concat(stdout).toString("utf8"),
-          stderr: Buffer.concat(stderr).toString("utf8")
+          stderr: Buffer.concat(stderr).toString("utf8"),
+          timedOut
         });
       });
       child.stdin.end(input.stdin);

@@ -8,12 +8,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { ProjectConfig } from "../src/config.js";
 import type { Job } from "../src/domain.js";
 import {
   LiveSupabaseExecutor,
+  NodeLiveProcess,
   databasePassword,
   resolveExecutable,
   type LiveProcess,
@@ -1795,4 +1796,133 @@ describe("live Supabase executor", () => {
     ]);
     expect(JSON.stringify(result)).not.toContain("stripe-canary");
   });
+});
+
+describe("NodeLiveProcess timeout", () => {
+  const shell = (script: string, timeoutMs?: number): LiveProcessInput => ({
+    argv: ["sh", "-c", script],
+    cwd: tmpdir(),
+    env: process.env,
+    ...(timeoutMs === undefined ? {} : { timeoutMs })
+  });
+  const realSetTimeout = setTimeout;
+  // Real wall-clock pause, for the child (a real process) to get going.
+  const realDelay = (ms: number) =>
+    new Promise((resolve) => realSetTimeout(resolve, ms));
+  // Only the timers are faked: the child stays real and its I/O keeps flowing.
+  // After a run, vi.getTimerCount() must be 0: a leftover cap or kill timer
+  // would keep the process alive for up to the full timeoutMs.
+  const withFakeTimers = async (body: () => Promise<void>) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await body();
+  };
+  // Also runs when a test times out, so a hung test cannot leak fake timers.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("sends SIGTERM to a child that outlives timeoutMs and reports timedOut", () =>
+    withFakeTimers(async () => {
+      // The child answers SIGTERM, so the SIGKILL timer must be cleared, not fired.
+      let settled = false;
+      const running = new NodeLiveProcess()
+        .run(
+          shell("trap 'echo got-term; kill $!; exit 0' TERM; sleep 30 & wait", 300)
+        )
+        .then((result) => {
+          settled = true;
+          return result;
+        });
+      await realDelay(300); // let sh install its trap before any signal
+      await vi.advanceTimersByTimeAsync(299);
+      await realDelay(300); // a signal before the cap would land by now
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(await running).toMatchObject({
+        exitCode: 0,
+        stdout: "got-term\n",
+        timedOut: true
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    }));
+
+  test("escalates to SIGKILL after the grace period for a child that ignores SIGTERM", async () => {
+    const started = performance.now();
+
+    const result = await new NodeLiveProcess({ killGraceMs: 1_000 }).run(
+      shell("trap '' TERM; exec sleep 30", 500)
+    );
+    const elapsed = performance.now() - started;
+
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+    // Dead only after the 500 ms cap plus the 1 000 ms grace, not at SIGTERM
+    // time, and long before the child's own 30 s.
+    expect(elapsed).toBeGreaterThanOrEqual(1_400);
+    expect(elapsed).toBeLessThan(10_000);
+  });
+
+  test("waits 5 seconds between SIGTERM and SIGKILL when no grace is given", () =>
+    withFakeTimers(async () => {
+      let settled = false;
+      const running = new NodeLiveProcess()
+        .run(shell("trap '' TERM; exec sleep 30", 100))
+        .then((result) => {
+          settled = true;
+          return result;
+        });
+      await realDelay(300); // let sh install its trap before any signal
+      await vi.advanceTimersByTimeAsync(100); // the cap: SIGTERM, ignored
+      await vi.advanceTimersByTimeAsync(4_999); // 1 ms short of the grace
+      await realDelay(300); // a wrongly early SIGKILL would land by now
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(await running).toMatchObject({ timedOut: true });
+      expect(vi.getTimerCount()).toBe(0);
+    }));
+
+  test("sends no signal and reports no timeout without timeoutMs", async () => {
+    // Any SIGTERM during the run would put "got-term" before "done".
+    const result = await new NodeLiveProcess({ killGraceMs: 10 }).run(
+      shell("trap 'echo got-term' TERM; sleep 0.3; echo done; exit 3")
+    );
+
+    expect(result).toEqual({
+      exitCode: 3,
+      stdout: "done\n",
+      stderr: "",
+      timedOut: false
+    });
+  });
+
+  test("still rejects a program that cannot be spawned and clears its timer", () =>
+    withFakeTimers(async () => {
+      await expect(
+        new NodeLiveProcess().run({
+          argv: ["supadrum-no-such-program"],
+          cwd: tmpdir(),
+          env: process.env,
+          timeoutMs: 60_000
+        })
+      ).rejects.toThrow(/ENOENT/);
+
+      expect(vi.getTimerCount()).toBe(0);
+    }));
+
+  test("leaves a child that finishes within timeoutMs alone and clears its timer", () =>
+    withFakeTimers(async () => {
+      const result = await new NodeLiveProcess().run(shell("echo hi", 60_000));
+
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: "hi\n",
+        stderr: "",
+        timedOut: false
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    }));
 });
