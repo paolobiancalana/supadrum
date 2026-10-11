@@ -90,7 +90,7 @@ describe("operation catalog", () => {
     });
   });
 
-  test("pgTAP runs need a full commit hash and a payload with no choices", () => {
+  test("pgTAP runs need a full tree object name and a payload with no choices", () => {
     const base = {
       project: "atlas",
       operation: "pgtap.run",

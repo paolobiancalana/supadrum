@@ -91,9 +91,9 @@ const AdapterTestsPayloadSchema = z.object({
 // chooses nothing, so any key at all is a mistake (#41).
 const PgtapPayloadSchema = z.object({}).strict();
 
-// A prefix, a branch or HEAD would be resolved against whatever the repository
-// holds when the runner gets to the job, not what the hook saw (#41).
-const FULL_COMMIT_HASH = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+// repo_sha carries the tree OID the hook staged (#41). A prefix, a branch or
+// HEAD would be resolved against whatever the repository holds later.
+const FULL_OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
 export const JobSubmissionSchema = z
   .object({
@@ -106,12 +106,12 @@ export const JobSubmissionSchema = z
   .superRefine((submission, context) => {
     if (
       submission.operation === "pgtap.run" &&
-      !FULL_COMMIT_HASH.test(submission.repo_sha)
+      !FULL_OBJECT_NAME.test(submission.repo_sha)
     ) {
       context.addIssue({
         code: "custom",
         path: ["repo_sha"],
-        message: "pgtap.run needs the full commit hash (40 or 64 hex characters)"
+        message: "pgtap.run needs the full tree object name (40 or 64 hex characters)"
       });
     }
     const schema =

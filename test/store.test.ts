@@ -429,7 +429,7 @@ describe("granting a lease", () => {
       });
 
     // The store surfaces the schema error raw; the MCP layer maps it to invalid_input.
-    expect(() => store.submit(pgtap({ repo_sha: "abc123" }))).toThrow(/full commit hash/);
+    expect(() => store.submit(pgtap({ repo_sha: "abc123" }))).toThrow(/full tree object name/);
     expect(() => store.submit(pgtap({ payload: { script: "x" } }))).toThrow(/unrecognized key/i);
     expect(store.listJobs()).toHaveLength(0);
   });
