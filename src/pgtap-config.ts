@@ -32,6 +32,7 @@ const TEMPORARY_PREFIX = "supadrum-tmp-";
 
 const TABLE_HEADER = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$/;
 const ASSIGNMENT = /^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)([^#]*?)(\s*(#.*)?)$/;
+const LOOKS_LIKE_ASSIGNMENT = /^\s*[^#\s][^#]*?=/;
 
 export type PortProbe = (port: number) => Promise<boolean>;
 
@@ -75,7 +76,7 @@ function integerValue(value: string): number | null {
 }
 
 function unquote(value: string): string {
-  return value.replace(/^"(.*)"$/, "$1");
+  return value.replace(/^["'](.*)["']$/, "$1");
 }
 
 /**
@@ -131,12 +132,18 @@ export async function buildPgtapConfig(input: {
   for (const [index, line] of lines.entries()) {
     const header = TABLE_HEADER.exec(line);
     if (header) {
-      table = header[1] ?? "";
+      table = unquote((header[1] ?? "").trim());
       if (table === "db.seed") seedHeader = index;
       continue;
     }
     const assignment = parseAssignment(line);
-    if (!assignment) continue;
+    if (!assignment) {
+      if (LOOKS_LIKE_ASSIGNMENT.test(line)) {
+        throw new PgtapConfigError("original_port_left",
+          `${line.trim()} looks like an assignment but could not be parsed and would stay original`);
+      }
+      continue;
+    }
     if (assignment.key === "project_id") projectId = unquote(assignment.value);
     if (assignment.key === "enabled" && table === "db.seed") seedEnabled = index;
     if (isPortKey(assignment.key)) {
@@ -165,7 +172,7 @@ export async function buildPgtapConfig(input: {
   const out = lines.map((line, index) => {
     const header = TABLE_HEADER.exec(line);
     if (header) {
-      table = header[1] ?? "";
+      table = unquote((header[1] ?? "").trim());
       return line;
     }
     const assignment = parseAssignment(line);

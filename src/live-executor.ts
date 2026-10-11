@@ -461,10 +461,10 @@ function phaseRunner(
 function databasePort(toml: string): string | undefined {
   let table = "";
   for (const line of toml.split("\n")) {
-    const header = /^\s*\[\s*([^\]]+?)\s*\]/.exec(line);
+    const header = /^\s*\[\s*["']?([^\]"'\s]+)["']?\s*\]/.exec(line);
     if (header) table = header[1] ?? "";
     else if (table === "db") {
-      const port = /^\s*port\s*=\s*(\d+)/.exec(line)?.[1];
+      const port = /^\s*["']?port["']?\s*=\s*["']?(\d+)["']?/.exec(line)?.[1];
       if (port) return port;
     }
   }
@@ -777,7 +777,13 @@ export class LiveSupabaseExecutor implements Executor {
     }
     const id = `supadrum-tmp-${job.project}`;
     const directory = join(this.#cacheRoot, id);
-    const env = this.#localEnvironment({ NO_COLOR: "1" });
+    const env: NodeJS.ProcessEnv = {
+      PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
+      HOME: process.env.HOME,
+      TMPDIR: process.env.TMPDIR,
+      DOCKER_HOST: process.env.DOCKER_HOST,
+      NO_COLOR: "1"
+    };
     const supabase = this.#executables.supabase;
     const startedAt = Date.now();
     const phases = { prepare_ms: 0, start_ms: 0, test_ms: 0, cleanup_ms: 0 };

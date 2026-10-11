@@ -148,6 +148,37 @@ describe("pgTAP disposable config", () => {
     }))).toBe("original_port_left");
   });
 
+  test("refuses an assignment whose key has quotes, since it cannot be safely rewritten", async () => {
+    const treeDouble = 'project_id = "p"\n[db]\n"port" = 54322\n';
+    expect(await rejectReason(buildPgtapConfig({
+      tree: treeDouble, project: "demo", portBase: 54330, isFree: always
+    }))).toBe("original_port_left");
+
+    const treeSingle = 'project_id = "p"\n[db]\n\'port\' = 54322\n';
+    expect(await rejectReason(buildPgtapConfig({
+      tree: treeSingle, project: "demo", portBase: 54330, isFree: always
+    }))).toBe("original_port_left");
+
+    const treeNonPort = 'project_id = "p"\n"foo" = "bar"\n';
+    expect(await rejectReason(buildPgtapConfig({
+      tree: treeNonPort, project: "demo", portBase: 54330, isFree: always
+    }))).toBe("original_port_left");
+
+    const treeDotted = 'project_id = "p"\ndb.port = 54322\n';
+    expect(await rejectReason(buildPgtapConfig({
+      tree: treeDotted, project: "demo", portBase: 54330, isFree: always
+    }))).toBe("original_port_left");
+  });
+
+  test("ignores comments that contain equals signs", async () => {
+    const tree = 'project_id = "p"\n# port = 54321\n[api]\nport = 54321\n';
+    const result = await buildPgtapConfig({
+      tree, project: "demo", portBase: 54330, isFree: always
+    });
+    expect(result).toContain("# port = 54321\n");
+    expect(result).toContain("port = 54330\n");
+  });
+
   test("a port key whose name is not port or *_port is left alone", async () => {
     const tree = 'project_id = "p"\n[api]\nportal = 1\nreport_ports = 2\n';
     const result = await buildPgtapConfig({

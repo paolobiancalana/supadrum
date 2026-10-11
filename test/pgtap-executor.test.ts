@@ -226,6 +226,25 @@ describe("pgtap.run in the live executor", () => {
     expect(stdout).toBe("Connecting to [REDACTED]\n1..1\nok 1 - postgres owns the public schema\n");
   });
 
+  test("runs pgTAP processes with an allowlisted environment only", async () => {
+    const { process, run } = setup();
+
+    await run();
+
+    const startCall = process.calls.find((c) => is(c.argv, "supabase", "start"));
+    const testCall = process.calls.find((c) => is(c.argv, "supabase", "test"));
+    expect(startCall).toBeDefined();
+    expect(testCall).toBeDefined();
+
+    for (const call of [startCall!, testCall!]) {
+      const keys = Object.keys(call.env).sort();
+      expect(keys).toEqual(["DOCKER_HOST", "HOME", "NO_COLOR", "PATH", "TMPDIR"].sort());
+      expect(call.env.NO_COLOR).toBe("1");
+      expect(call.env.DATABASE_URL).toBeUndefined();
+      expect(call.env.SUPABASE_ACCESS_TOKEN).toBeUndefined();
+    }
+  });
+
   test("rewrites the extracted config before start, under the disposable project id", async () => {
     const { process, run } = setup((argv) => {
       if (!is(argv, "supabase", "start")) return undefined;
@@ -289,6 +308,8 @@ describe("pgtap.run in the live executor", () => {
       { ...TREE_FILES, "supabase/config.toml": TREE_CONFIG.replace('"atlas"', '"supadrum-tmp-x"') }],
     ["a port that is not an integer", "original_port_left", () => undefined,
       { ...TREE_FILES, "supabase/config.toml": TREE_CONFIG.replace("port = 54321", 'port = "env(API_PORT)"') }],
+    ["a quoted port key", "original_port_left", () => undefined,
+      { ...TREE_FILES, "supabase/config.toml": TREE_CONFIG.replace("port = 54321", '"port" = 54321') }],
     ["a failed start", "start_failed", (argv) => is(argv, "supabase", "start") ? { exitCode: 1 } : undefined],
     ["no db container after start", "start_failed", (argv) => is(argv, "docker", "inspect") ? { exitCode: 1 } : undefined],
     ["a red suite", "tests_failed", (argv) => is(argv, "supabase", "test") ? { exitCode: 3, stdout: "not ok 1\n" } : undefined]
