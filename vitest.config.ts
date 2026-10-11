@@ -1,7 +1,10 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    // Agent worktrees live under .claude/worktrees and carry their own copy of
+    // the suite; running them from the main checkout multiplies every test.
+    exclude: [...configDefaults.exclude, ".claude/**"],
     coverage: {
       enabled: false,
       provider: "v8",
