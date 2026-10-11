@@ -58,6 +58,7 @@ import {
   type ProjectProfile
 } from "./projects.js";
 import { capabilityNames, type Capability } from "./catalog.js";
+import { runPgtap, type PgtapSeams } from "./pgtap-cli.js";
 import { Runner } from "./runner.js";
 import { readMaskedSecret } from "./secret-prompt.js";
 import { SqliteStore } from "./store.js";
@@ -111,6 +112,7 @@ interface CliRuntime {
   readonly promptSecret: SecretPrompt;
   readonly keychain: () => VaultBackend;
   readonly startLocalStack?: (repository: string, supabaseDir?: string) => Promise<string>;
+  readonly pgtap?: PgtapSeams;
 }
 
 /*
@@ -463,6 +465,7 @@ export async function runCli(
         "  supadrum project list",
         "  supadrum approve <job-id>",
         "  supadrum status <job-id>",
+        "  supadrum pgtap <alias> <tree-oid> [--config PATH]",
         "  supadrum demo",
         "",
         "Project add options:",
@@ -482,6 +485,7 @@ export async function runCli(
     await runDemo(io);
     return 0;
   }
+  if (command === "pgtap") return runPgtap(args.slice(1), io, runtime);
   if (command === "init") {
     const path = resolve(args[1] ?? "supadrum.yml");
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -1061,7 +1065,7 @@ export async function runCli(
   }
 
   io.stderr(
-    "Usage: supadrum <init|demo|project add|project start|project setup|project capabilities set|project credentials set|project migrations owner|project migrations driver|project live|project dry-run|project inspect|project doctor|project list|approve|status> [options]\n"
+    "Usage: supadrum <init|demo|project add|project start|project setup|project capabilities set|project credentials set|project migrations owner|project migrations driver|project live|project dry-run|project inspect|project doctor|project list|approve|status|pgtap> [options]\n"
   );
   return 1;
 }

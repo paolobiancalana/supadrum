@@ -93,7 +93,7 @@ const PgtapPayloadSchema = z.object({}).strict();
 
 // repo_sha carries the tree OID the hook staged (#41). A prefix, a branch or
 // HEAD would be resolved against whatever the repository holds later.
-const FULL_OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+export const FULL_OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
 export const JobSubmissionSchema = z
   .object({

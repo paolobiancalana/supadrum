@@ -26,6 +26,11 @@ function numericOption(
   return value;
 }
 
+/** Where the runner leaves its sign of life: beside the queue it serves. */
+export function runnerPidPath(databasePath: string): string {
+  return join(dirname(databasePath), "runner.pid");
+}
+
 export async function runRunner(args: readonly string[]): Promise<void> {
   const configPath = resolveOperatorConfigPath({
     args,
@@ -39,7 +44,7 @@ export async function runRunner(args: readonly string[]): Promise<void> {
   let mtime = configMtime(configPath);
   // The runner's sign of life beside the queue: a caller that must not queue
   // work nobody will run checks this pid. Nothing here enforces one runner.
-  const pidPath = join(dirname(config.database_path), "runner.pid");
+  const pidPath = runnerPidPath(config.database_path);
   mkdirSync(dirname(pidPath), { recursive: true });
   writeFileSync(pidPath, `${process.pid}\n`);
   let stopping = false;
