@@ -236,6 +236,15 @@ export class Runner {
           result
         });
       } catch (error) {
+        if (error instanceof MissingCredentialsError) {
+          // A running job cannot be cancelled under the runner, so no race
+          // here. The job stays schedulable, so move on to the next one rather
+          // than letting it block the queue every tick (#27).
+          this.#store.transition(job.id, "waiting_credentials", { missing: error.missing }, {
+            lease_expires_at: null
+          });
+          continue;
+        }
         job = this.#fail(job.id, {
           lease_expires_at: null,
           error: error instanceof Error ? error.message : String(error),

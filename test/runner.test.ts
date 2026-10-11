@@ -636,6 +636,33 @@ describe("global scheduler", () => {
     expect(store.getJob(missing.id).status).toBe("waiting_credentials");
     expect(store.getJob(executable.id).status).toBe("completed");
   });
+
+  test("a credential the executor finds missing leaves the job waiting, not failed", async () => {
+    const store = createStore();
+    const missing = submit(store, "alpha", "migration.plan", "missing");
+    const executable = submit(store, "beta", "migration.plan", "ready");
+    class LateMissing extends RecordingExecutor {
+      override async execute(job: Job): Promise<ExecutionResult> {
+        // Found while running, as a command template's `env` does (#27).
+        if (job.project === "alpha") throw new MissingCredentialsError(["deploy_token"]);
+        return super.execute(job);
+      }
+    }
+    const runner = new Runner(
+      store,
+      projectConfig(),
+      new AvailableCredentials(),
+      new LateMissing(),
+      { now }
+    );
+
+    await runner.tick();
+
+    const waiting = store.getJob(missing.id);
+    expect(waiting.status).toBe("waiting_credentials");
+    expect(waiting.lease_expires_at).toBeNull();
+    expect(store.getJob(executable.id).status).toBe("completed");
+  });
 });
 
 describe("interactive session lease", () => {

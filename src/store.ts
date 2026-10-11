@@ -103,7 +103,9 @@ const allowedTransitions: Readonly<Record<JobStatus, readonly JobStatus[]>> = {
   waiting_credentials: ["queued", "failed", "cancelled"],
   waiting_approval: ["queued", "failed", "cancelled"],
   granted: ["running", "failed", "cancelled", "lease_expired"],
-  running: ["verifying", "failed", "cancelled", "lease_expired"],
+  // An executor can find a credential missing only once it runs; that job is
+  // waiting, not failed (#27).
+  running: ["verifying", "waiting_credentials", "failed", "cancelled", "lease_expired"],
   verifying: ["completed", "failed", "lease_expired"],
   completed: [],
   failed: [],
