@@ -657,14 +657,12 @@ export function addProject(input: {
   ) {
     document.set("vault_command", [...input.vault_command]);
   }
-  // Un target di deploy scoperto porta con se' la sua credenziale e la sua
-  // capability: se il repository sa gia' dove spedisce, chiedere all'operatore
-  // di dichiararlo a mano sarebbe chiedergli di ripetere cio' che e' scritto.
+  // Un target di deploy scoperto porta con se' il riferimento alla sua
+  // credenziale, non la capability: un file nel repository non e' l'autorita'
+  // dell'operatore, e chi scrive nel repo non deve poter concedersi un permesso.
+  // `deploy` si aggiunge con `project capabilities set` (#26).
   const deployTarget = input.deploy_target ?? null;
   const capabilities = [...projectProfiles[profile]];
-  if (deployTarget && !capabilities.includes("deploy")) {
-    capabilities.push("deploy");
-  }
 
   document.setIn(["projects", alias], {
     repo: repository,

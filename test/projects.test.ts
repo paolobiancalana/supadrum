@@ -634,7 +634,7 @@ describe("deploy target discovery", () => {
     ).toBeNull();
   });
 
-  test("a discovered target brings its credential and its capability", () => {
+  test("a discovered target brings its credential reference, not the capability", () => {
     const { root, repository } = repositoryWithVercel([
       { path: ".vercel/project.json", body: linked("prj_abc", "team_xyz") }
     ]);
@@ -660,7 +660,9 @@ describe("deploy target discovery", () => {
     expect(project?.credentials.deploy_token).toBe(
       "vault://vercel/example-web/token"
     );
-    expect(project?.capabilities).toContain("deploy");
+    // Il permesso lo concede l'operatore, non un file che chiunque può scrivere
+    // nel repository: la capability resta un opt-in esplicito (#26).
+    expect(project?.capabilities).not.toContain("deploy");
     expect(project?.deploy_target).toEqual({
       provider: "vercel",
       project_id: "prj_abc",
