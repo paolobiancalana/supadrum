@@ -518,6 +518,11 @@ export class LiveSupabaseExecutor implements Executor {
     project: ProjectConfig,
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
+    // Catalogued ahead of its executor (#51): refuse here rather than fall
+    // through to the local migration path below.
+    if (job.operation === "pgtap.run") {
+      throw new Error("pgtap.run is not implemented yet");
+    }
     if (job.operation === "tests.run") {
       if (project.target !== "local") {
         throw new Error("tests.run is available only on a local chamber");

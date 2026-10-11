@@ -393,6 +393,47 @@ describe("granting a lease", () => {
     expect(store.getJob(second.id).status).toBe("queued");
   });
 
+  test("schedules a pgTAP run under manual approval while adapter tests still wait", () => {
+    const { store } = createStore("manual");
+    const pgtap = store.submit(
+      submission({
+        operation: "pgtap.run",
+        payload: {},
+        repo_sha: "a".repeat(40),
+        idempotency_key: "example-web:pgtap"
+      })
+    );
+    expect(pgtap.requires_approval).toBe(false);
+    expect(pgtap.status).toBe("queued");
+    expect(store.grantIfSchedulable(pgtap.id, lease)).not.toBeNull();
+
+    const adapter = store.submit(
+      submission({
+        operation: "tests.run",
+        payload: { script: "sessions" },
+        idempotency_key: "example-web:tests"
+      })
+    );
+    expect(adapter.requires_approval).toBe(true);
+  });
+
+  test("refuses a pgTAP run with a short hash or a payload key before creating a job", () => {
+    const { store } = createStore();
+    const pgtap = (overrides: Partial<JobSubmission>) =>
+      submission({
+        operation: "pgtap.run",
+        payload: {},
+        repo_sha: "a".repeat(40),
+        idempotency_key: "example-web:pgtap",
+        ...overrides
+      });
+
+    // The store surfaces the schema error raw; the MCP layer maps it to invalid_input.
+    expect(() => store.submit(pgtap({ repo_sha: "abc123" }))).toThrow(/full commit hash/);
+    expect(() => store.submit(pgtap({ payload: { script: "x" } }))).toThrow(/unrecognized key/i);
+    expect(store.listJobs()).toHaveLength(0);
+  });
+
   test("grants nothing for a job that has left the runnable statuses", () => {
     const { store } = createStore();
     const job = store.submit(submission());

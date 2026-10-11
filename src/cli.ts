@@ -16,6 +16,7 @@ import { installCodexAgentSetup } from "./agent-setup.js";
 import {
   inspectProject,
   loadConfig,
+  pgtapBrokerDefaults,
   type SupadrumConfig
 } from "./config.js";
 import {
@@ -217,6 +218,7 @@ async function runDemo(io: CliIo): Promise<void> {
     config_path: join(directory, "supadrum.yml"),
     executor: "dry-run",
     approval_mode: "automatic",
+    pgtap: pgtapBrokerDefaults,
     chambers: {
       demo: {
         project_ref: "demo-ref",

@@ -18,7 +18,7 @@ import {
   redactSecrets
 } from "../src/executors.js";
 import { MissingCredentialsError, type Executor } from "../src/runner.js";
-import type { SupadrumConfig } from "../src/config.js";
+import { pgtapBrokerDefaults, type SupadrumConfig } from "../src/config.js";
 
 const project: ProjectConfig = {
   chamber: "alpha",
@@ -81,6 +81,7 @@ describe("credential isolation", () => {
       config_path: "/tmp/config.yml",
       executor: "command",
       approval_mode: "automatic",
+      pgtap: pgtapBrokerDefaults,
       chambers: { alpha: localProject },
       projects: { alpha: localProject }
     };
@@ -107,6 +108,7 @@ describe("credential isolation", () => {
       config_path: "/tmp/config.yml",
       executor: "command",
       approval_mode: "automatic",
+      pgtap: pgtapBrokerDefaults,
       vault_command: ["/definitely/missing/resolver"],
       chambers: {
         alpha: {

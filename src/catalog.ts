@@ -9,6 +9,7 @@ export const capabilityNames = [
   "schema-inspection",
   "sql",
   "adapter-tests",
+  "pgtap",
   "project-management",
   "deploy"
 ] as const;
@@ -30,6 +31,7 @@ export const operationNames = [
   "schema.inspect",
   "sql.execute",
   "tests.run",
+  "pgtap.run",
   "project.manage",
   "types.generate",
   "deploy.inspect",
@@ -67,6 +69,12 @@ export const operationCatalog = {
   },
   "sql.execute": { capability: "sql", approval: true },
   "tests.run": { capability: "adapter-tests", approval: true },
+  // pgTAP runs against a disposable Docker stack built from git objects of the
+  // registered repository, in a directory under $HOME that is removed after.
+  // Nothing persistent is written, no credential is resolved, and the payload
+  // leaves the caller no choices: the blast radius is runner time, so a commit
+  // hook can queue it without a human approving each run (#40).
+  "pgtap.run": { capability: "pgtap", approval: false },
   "project.manage": { capability: "project-management", approval: true },
   "types.generate": { capability: "schema-inspection", approval: false },
   // Deploying is the one operation whose blast radius is the public internet:

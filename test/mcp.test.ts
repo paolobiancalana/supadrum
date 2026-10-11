@@ -604,6 +604,55 @@ projects:
     expect(store.listJobs()).toHaveLength(0);
   });
 
+  test("keeps pgtap and adapter-tests as separate capabilities", () => {
+    const remote = setupProjects(project("remote", ["adapter-tests"]));
+    expect(() =>
+      createHandlers(remote.config, remote.store).jobsSubmit({
+        project: "remote",
+        operation: "pgtap.run",
+        payload: {},
+        repo_sha: "a".repeat(40),
+        idempotency_key: "remote:pgtap"
+      })
+    ).toThrow("Project remote lacks pgtap");
+    expect(remote.store.listJobs()).toHaveLength(0);
+
+    const local = openStore(writeConfig("supadrum-mcp-pgtap-", `version: 1
+database: queue.sqlite
+chambers:
+  atlas:
+    target: local
+    pgtap:
+      tests_path: supabase/tests
+projects:
+  atlas:
+    chamber: atlas
+    repo: .
+    mode: live
+    capabilities: [pgtap]
+`));
+    const handlers = createHandlers(local.config, local.store);
+    expect(() =>
+      handlers.jobsSubmit({
+        project: "atlas",
+        operation: "tests.run",
+        payload: { script: "sessions" },
+        repo_sha: "abc123",
+        idempotency_key: "atlas:tests"
+      })
+    ).toThrow("Project atlas lacks adapter-tests");
+    expect(local.store.listJobs()).toHaveLength(0);
+
+    const job = handlers.jobsSubmit({
+      project: "atlas",
+      operation: "pgtap.run",
+      payload: {},
+      repo_sha: "a".repeat(40),
+      idempotency_key: "atlas:pgtap"
+    });
+    expect(job.capability).toBe("pgtap");
+  });
+
   test("lists every project sorted and free of credential references", () => {
     const { config, store } = setupProjects(
       project("zulu", ["data-api"]) + project("alpha", ["data-api"])
@@ -916,6 +965,51 @@ describe("error taxonomy on the tool surface", () => {
       code: "capability_denied",
       retryable: false
     });
+  });
+
+  test("codes a short hash or a payload key on a pgTAP run as invalid input", async () => {
+    const { config } = openStore(writeConfig("supadrum-mcp-pgtap-errors-", `version: 1
+database: queue.sqlite
+chambers:
+  atlas:
+    target: local
+    pgtap:
+      tests_path: supabase/tests
+projects:
+  atlas:
+    chamber: atlas
+    repo: .
+    mode: live
+    capabilities: [pgtap]
+`));
+    await using connected = await connect(config);
+    const submit = (overrides: Record<string, unknown>) =>
+      connected.client.callTool({
+        name: "jobs.submit",
+        arguments: {
+          project: "atlas",
+          operation: "pgtap.run",
+          payload: {},
+          repo_sha: "a".repeat(40),
+          idempotency_key: "atlas:errors:pgtap",
+          ...overrides
+        }
+      });
+
+    // Shorter refs such as "main" or "HEAD" never reach the broker: the SDK
+    // already rejects them against the tool's own min-length rule.
+    for (const attempt of [
+      await submit({ repo_sha: "abc123" }),
+      await submit({ repo_sha: "refs/heads/main" }),
+      await submit({ payload: { tests_path: "elsewhere" } })
+    ]) {
+      expect(attempt.isError).toBe(true);
+      expect(structured(attempt, ERROR_RESULT).error).toMatchObject({
+        code: "invalid_input",
+        retryable: false
+      });
+    }
+    expect(connected.store.listJobs()).toHaveLength(0);
   });
 
   test("codes an unopened lease as worth retrying", async () => {

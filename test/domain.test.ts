@@ -78,6 +78,41 @@ describe("operation catalog", () => {
       approval: true
     });
   });
+
+  test("pgTAP runs under its own capability without approval, unlike adapter tests", () => {
+    expect(operationCatalog["pgtap.run"]).toEqual({
+      capability: "pgtap",
+      approval: false
+    });
+    expect(operationCatalog["tests.run"]).toEqual({
+      capability: "adapter-tests",
+      approval: true
+    });
+  });
+
+  test("pgTAP runs need a full commit hash and a payload with no choices", () => {
+    const base = {
+      project: "atlas",
+      operation: "pgtap.run",
+      repo_sha: "a".repeat(40),
+      idempotency_key: "atlas:pgtap",
+      payload: {}
+    };
+    expect(JobSubmissionSchema.parse(base).payload).toEqual({});
+    expect(JobSubmissionSchema.parse({ ...base, repo_sha: "0123456789abcdef".repeat(4) }).repo_sha)
+      .toBe("0123456789abcdef".repeat(4));
+    expect(JobSubmissionSchema.parse({ ...base, payload: undefined }).payload).toEqual({});
+
+    for (const repo_sha of ["abc123", "main", "HEAD", "a".repeat(39), "g".repeat(40)]) {
+      const result = JobSubmissionSchema.safeParse({ ...base, repo_sha });
+      expect(result.success, repo_sha).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.map((issue) => issue.path)).toContainEqual(["repo_sha"]);
+      }
+    }
+    expect(() => JobSubmissionSchema.parse({ ...base, payload: { tests_path: "x" } })).toThrow();
+    expect(() => JobSubmissionSchema.parse({ ...base, payload: { script: "sessions" } })).toThrow();
+  });
 });
 
 describe("project chambers", () => {
@@ -107,6 +142,82 @@ projects:
       setup_sql_path: "database/supabase/fixtures/atlas-02-contratto.sql",
       personas: { student: "c0470000-0000-4000-8000-1000000000a1" }
     });
+  });
+
+  const pgtapConfig = (chamberBlock: string, rootBlock = "") => `version: 1
+${rootBlock}chambers:
+  atlas-local:
+    target: local
+${chamberBlock}projects:
+  atlas:
+    chamber: atlas-local
+    capabilities: [pgtap]
+    repo: .
+    mode: live
+`;
+  const pgtapBlock = (testsPath: string, extra = "") => `    pgtap:
+      tests_path: ${testsPath}
+${extra}`;
+
+  test("fills the pgTAP chamber and broker blocks with their defaults", () => {
+    const config = loadConfig(writeConfig(pgtapConfig(pgtapBlock("supabase/tests"))));
+    expect(config.projects.atlas?.pgtap).toEqual({
+      tests_path: "supabase/tests",
+      start_timeout_ms: 300_000,
+      test_timeout_ms: 120_000
+    });
+    expect(config.pgtap).toEqual({
+      queue_timeout_ms: 120_000,
+      port_base: 56321,
+      min_free_gib: 5
+    });
+    // The CLI stack sits at 543xx; a broker stack there would collide with it.
+    expect(Math.floor(config.pgtap.port_base / 100)).not.toBe(543);
+  });
+
+  test("accepts explicit pgTAP timeouts and broker limits", () => {
+    const config = loadConfig(writeConfig(pgtapConfig(
+      pgtapBlock("supabase/tests", "      start_timeout_ms: 1000\n      test_timeout_ms: 2000\n"),
+      "pgtap:\n  queue_timeout_ms: 10\n  port_base: 60000\n  min_free_gib: 1.5\n"
+    )));
+    expect(config.projects.atlas?.pgtap).toEqual({
+      tests_path: "supabase/tests",
+      start_timeout_ms: 1000,
+      test_timeout_ms: 2000
+    });
+    expect(config.pgtap).toEqual({ queue_timeout_ms: 10, port_base: 60000, min_free_gib: 1.5 });
+  });
+
+  test("rejects a pgTAP project whose chamber has no pgtap block", () => {
+    expect(() => loadConfig(writeConfig(pgtapConfig("")))).toThrow(/pgtap/);
+  });
+
+  test("rejects pgTAP blocks with unknown keys or a tests path leaving the repository", () => {
+    for (const testsPath of ["/etc/tests", "../tests", "a/../b"]) {
+      expect(() => loadConfig(writeConfig(pgtapConfig(pgtapBlock(testsPath)))), testsPath).toThrow();
+    }
+    expect(() => loadConfig(writeConfig(pgtapConfig(
+      pgtapBlock("supabase/tests", "      timeout_ms: 5\n")
+    )))).toThrow();
+    expect(() => loadConfig(writeConfig(pgtapConfig(
+      pgtapBlock("supabase/tests"), "pgtap:\n  port: 60000\n"
+    )))).toThrow();
+    expect(() => loadConfig(writeConfig(`version: 1
+chambers:
+  remote:
+    target: remote
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/remote/secret
+      management_token: vault://supabase/remote/management
+      database_access: vault://supabase/remote/postgres
+    pgtap:
+      tests_path: supabase/tests
+projects:
+  atlas:
+    chamber: remote
+    capabilities: [data-api]
+`))).toThrow();
   });
 
   test("rejects writer password references that collide with another credential", () => {

@@ -87,6 +87,14 @@ const AdapterTestsPayloadSchema = z.object({
   setup_job_id: z.uuid().optional()
 }).strict();
 
+// A pgTAP run is fully described by the project and the commit: the caller
+// chooses nothing, so any key at all is a mistake (#41).
+const PgtapPayloadSchema = z.object({}).strict();
+
+// A prefix, a branch or HEAD would be resolved against whatever the repository
+// holds when the runner gets to the job, not what the hook saw (#41).
+const FULL_COMMIT_HASH = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
 export const JobSubmissionSchema = z
   .object({
     project: z.string().min(1).max(100),
@@ -96,11 +104,23 @@ export const JobSubmissionSchema = z
     idempotency_key: z.string().min(1).max(255)
   })
   .superRefine((submission, context) => {
+    if (
+      submission.operation === "pgtap.run" &&
+      !FULL_COMMIT_HASH.test(submission.repo_sha)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["repo_sha"],
+        message: "pgtap.run needs the full commit hash (40 or 64 hex characters)"
+      });
+    }
     const schema =
       submission.operation === "schema.inspect"
         ? SchemaInspectionPayloadSchema
         : submission.operation === "tests.run"
           ? AdapterTestsPayloadSchema
+        : submission.operation === "pgtap.run"
+          ? PgtapPayloadSchema
         : submission.operation === "migration.baseline"
           ? MigrationBaselinePayloadSchema
           : submission.operation === "types.generate"

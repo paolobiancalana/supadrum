@@ -20,6 +20,7 @@ const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
   "auth-admin",
   "sql",
   "adapter-tests",
+  "pgtap",
   "schema-inspection"
 ]);
 
@@ -144,8 +145,47 @@ const RemoteChamberSchema = z.object({
       VaultReferenceSchema
     )
     .default({}),
-  adapter_tests: z.never().optional()
+  adapter_tests: z.never().optional(),
+  pgtap: z.never().optional()
 });
+
+/** A path inside the registered repository: relative, and never climbing out of it. */
+const RepositoryPathSchema = z.string()
+  .regex(/^[a-zA-Z0-9_./-]+$/)
+  .refine((path) => !path.startsWith("/") && !path.split("/").includes(".."));
+
+/**
+ * What a pgTAP run needs from the chamber: where the tests live in the
+ * repository, and how long the disposable stack may take to start and to run
+ * them (#46: 300 s covers a cold image pull, 120 s is well over the ~2 s a
+ * suite takes). The other phase limits are fixed in code.
+ */
+const PgtapChamberSchema = z.object({
+  tests_path: RepositoryPathSchema,
+  start_timeout_ms: z.number().int().positive().default(300_000),
+  test_timeout_ms: z.number().int().positive().default(120_000)
+}).strict();
+
+/**
+ * Broker-wide pgTAP knobs; one set for every chamber because the runner
+ * executes one job at a time (#46).
+ *
+ * `queue_timeout_ms` is how long a queued run may wait before it is dropped
+ * unrun: 120 s covers two ordinary jobs ahead of a commit hook.
+ * `port_base` is where the scan for free ports starts. The Supabase CLI's own
+ * stack sits at 543xx and the usual second manual stack at 553xx, so 563xx
+ * stays clear of both while keeping the CLI's last digits (56321 for the API
+ * where the default is 54321), which keeps a port legible in logs.
+ * `min_free_gib` is the VM disk the `df` probe must report before a stack is
+ * created: a cold pull of the CLI's images is 3–4 GiB, and 5 leaves the
+ * headroom that keeps a disposable stack from filling the disk the manual
+ * stack shares.
+ */
+const PgtapBrokerSchema = z.object({
+  queue_timeout_ms: z.number().int().positive().default(120_000),
+  port_base: z.number().int().min(1024).max(65535).default(56321),
+  min_free_gib: z.number().positive().default(5)
+}).strict();
 
 const LocalChamberSchema = z
   .object({
@@ -175,10 +215,7 @@ const LocalChamberSchema = z
         writer_role: z.enum(["atlas_session_writer", "atlas_graph_writer"]).optional(),
         password_accounts: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
         database_logins: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).optional(),
-        setup_sql_path: z.string()
-          .regex(/^[a-zA-Z0-9_./-]+$/)
-          .refine((path) => !path.startsWith("/") && !path.split("/").includes(".."))
-          .optional(),
+        setup_sql_path: RepositoryPathSchema.optional(),
         personas: z.record(
           z.string().regex(/^[a-z][a-z0-9_]*$/),
           z.uuid()
@@ -187,7 +224,8 @@ const LocalChamberSchema = z
           new Set(Object.values(personas)).size === Object.keys(personas).length
         )
       }).strict()
-    ).optional()
+    ).optional(),
+    pgtap: PgtapChamberSchema.optional()
   })
   .strict();
 
@@ -203,13 +241,19 @@ const ConfigSchema = z.object({
   approval_mode: z.enum(["automatic", "manual"]).default("automatic"),
   vault_command: z.array(z.string().min(1)).min(1).optional(),
   chambers: z.record(z.string().min(1), ChamberSchema).default({}),
-  projects: z.record(z.string().min(1), InputProjectSchema)
+  projects: z.record(z.string().min(1), InputProjectSchema),
+  // prefault, not default: the empty block must still pick up its inner defaults.
+  pgtap: PgtapBrokerSchema.prefault({})
 });
 
 export type CredentialBundle = z.infer<typeof CredentialBundleSchema>;
 export type CommandTemplate = z.infer<typeof CommandTemplateSchema>;
 export type DeployTarget = z.infer<typeof DeployTargetSchema>;
 export type AdapterTestConfig = NonNullable<z.infer<typeof LocalChamberSchema>["adapter_tests"]>[string];
+export type PgtapChamberConfig = z.infer<typeof PgtapChamberSchema>;
+export type PgtapBrokerConfig = z.infer<typeof PgtapBrokerSchema>;
+/** What `loadConfig` reports when the operator config has no `pgtap` block. */
+export const pgtapBrokerDefaults: PgtapBrokerConfig = PgtapBrokerSchema.parse({});
 export type LocalPasswordAccount = NonNullable<z.infer<typeof LocalChamberSchema>["auth_password_accounts"]>[string];
 export type DatabaseLogin = NonNullable<z.infer<typeof LocalChamberSchema>["database_logins"]>[string];
 
@@ -222,6 +266,7 @@ export interface ChamberConfig {
   readonly adapter_tests?: Record<string, AdapterTestConfig>;
   readonly auth_password_accounts?: Record<string, LocalPasswordAccount>;
   readonly database_logins?: Record<string, DatabaseLogin>;
+  readonly pgtap?: PgtapChamberConfig;
 }
 export interface ProjectConfig extends ChamberConfig {
   readonly repo?: string;
@@ -252,6 +297,7 @@ export interface SupadrumConfig {
   readonly vault_command?: string[];
   readonly chambers: Record<string, ChamberConfig>;
   readonly projects: Record<string, ProjectConfig>;
+  readonly pgtap: PgtapBrokerConfig;
   readonly config_path: string;
   readonly database_path: string;
 }
@@ -366,6 +412,7 @@ export function loadConfig(path: string): SupadrumConfig {
             ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
             ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
             ...(chamber.database_logins ? { database_logins: chamber.database_logins } : {}),
+            ...(chamber.pgtap ? { pgtap: chamber.pgtap } : {}),
             project_ref: "",
             credentials: {
               secret_key: "",
@@ -440,6 +487,7 @@ export function loadConfig(path: string): SupadrumConfig {
       ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
       ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
       ...(chamber.database_logins ? { database_logins: chamber.database_logins } : {}),
+      ...(chamber.pgtap ? { pgtap: chamber.pgtap } : {}),
       capabilities: input.capabilities,
       ...(input.commands ? { commands: input.commands } : {}),
       mode:
@@ -461,6 +509,11 @@ export function loadConfig(path: string): SupadrumConfig {
     ) {
       throw new Error(
         `Local chamber ${chamberName} supports only the ${[...LOCAL_CAPABILITIES].join(", ")} capabilities with the supabase driver`
+      );
+    }
+    if (input.capabilities.includes("pgtap") && !chamber.pgtap) {
+      throw new Error(
+        `Project ${name} lists pgtap but chamber ${chamberName} has no pgtap block`
       );
     }
   }
@@ -491,6 +544,7 @@ export function loadConfig(path: string): SupadrumConfig {
       : {}),
     projects,
     chambers,
+    pgtap: parsed.pgtap,
     config_path: absolutePath,
     database_path: resolve(baseDirectory, parsed.database)
   };

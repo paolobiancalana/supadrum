@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import type { SupadrumConfig } from "../src/config.js";
+import { pgtapBrokerDefaults, type SupadrumConfig } from "../src/config.js";
 import {
   isBundledKeychainCommand,
   setupProjectCredentials,
@@ -22,6 +22,7 @@ const config: SupadrumConfig = {
   config_path: "/operator/config.yml",
   executor: "dry-run",
   approval_mode: "automatic",
+  pgtap: pgtapBrokerDefaults,
   vault_command: ["supadrum-vault", "keychain", "resolve"],
   chambers: {
     "example-ios": {

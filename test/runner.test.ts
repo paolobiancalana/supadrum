@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
-import type { SupadrumConfig } from "../src/config.js";
+import { pgtapBrokerDefaults, type SupadrumConfig } from "../src/config.js";
 import type {
   ExecutionResult,
   Job,
@@ -31,6 +31,7 @@ function projectConfig(): SupadrumConfig {
     config_path: "/tmp/supadrum.yml",
     executor: "command",
     approval_mode: "manual",
+    pgtap: pgtapBrokerDefaults,
     chambers: {
       alpha: {
         project_ref: "alpha-ref",
