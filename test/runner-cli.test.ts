@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -90,5 +90,37 @@ describe("runner CLI", () => {
       await running;
       store.close();
     }
+  });
+
+  test("keeps runner.pid beside the queue while it runs and removes it on stop", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "supadrum-runner-cli-"));
+    const configPath = join(directory, "supadrum.yml");
+    // The queue sits away from the config, in a directory nothing has made yet.
+    writeFileSync(
+      configPath,
+      configYaml(["alpha"]).replace("database: queue.sqlite", "database: data/queue.sqlite")
+    );
+    const pidPath = join(directory, "data", "runner.pid");
+    const running = runRunner(["--config", configPath, "--poll-ms", "10"]);
+    const store = new SqliteStore(join(directory, "data", "queue.sqlite"));
+
+    try {
+      const job = store.submit({
+        project: "alpha",
+        operation: "project.inspect",
+        payload: {},
+        repo_sha: "abc123",
+        idempotency_key: "alpha-while-running"
+      });
+      // A settled job proves the runner is serving the queue right now.
+      expect((await waitForSettled(store, job.id)).status).toBe("completed");
+      expect(readFileSync(pidPath, "utf8")).toBe(`${process.pid}\n`);
+    } finally {
+      process.emit("SIGTERM");
+      await running;
+      store.close();
+    }
+
+    expect(existsSync(pidPath)).toBe(false);
   });
 });

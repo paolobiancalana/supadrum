@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 import { configMtime, loadConfig } from "./config.js";
 import { isEntrypoint } from "./entrypoint.js";
@@ -35,6 +37,11 @@ export async function runRunner(args: readonly string[]): Promise<void> {
   const pollMs = numericOption(args, "--poll-ms", 250);
   let config = loadConfig(configPath);
   let mtime = configMtime(configPath);
+  // The runner's sign of life beside the queue: a caller that must not queue
+  // work nobody will run checks this pid. Nothing here enforces one runner.
+  const pidPath = join(dirname(config.database_path), "runner.pid");
+  mkdirSync(dirname(pidPath), { recursive: true });
+  writeFileSync(pidPath, `${process.pid}\n`);
   let stopping = false;
   const stop = () => {
     stopping = true;
@@ -89,6 +96,7 @@ export async function runRunner(args: readonly string[]): Promise<void> {
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
+    rmSync(pidPath, { force: true });
   }
 }
 
