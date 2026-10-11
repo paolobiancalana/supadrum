@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -290,6 +291,43 @@ describe("multi-step commands", () => {
 
     // Il file esiste solo se il secondo passo e' partito: e' la differenza fra
     // "build fallito" e "build fallito e spedito lo stesso".
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("refuses a step whose cwd leaves the verified repository before any step runs", async () => {
+    const executor = new CommandExecutor(process.cwd());
+    const elsewhere = mkdtempSync(join(tmpdir(), "supadrum-elsewhere-"));
+    const first = join(elsewhere, "first-ran");
+    const marker = join(elsewhere, "ran");
+    const verified: ProjectConfig = {
+      ...project,
+      repo: process.cwd(),
+      commands: {
+        "migration.plan": {
+          steps: [
+            {
+              argv: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(first)}, 'x')`],
+              cwd: "test"
+            },
+            {
+              argv: [process.execPath, "-e", `require('node:fs').writeFileSync('ran', 'x')`],
+              cwd: elsewhere
+            }
+          ],
+          env: {},
+          verify_repo_sha: true
+        }
+      }
+    };
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    await expect(
+      executor.execute({ ...job, repo_sha: head }, verified, credentials)
+    ).rejects.toThrow("leaves the verified repository");
+
+    // `repo_sha_verified: true` would otherwise vouch for a command that ran
+    // in a tree nobody verified (#25). Neither step ran, not even the first.
+    expect(existsSync(first)).toBe(false);
     expect(existsSync(marker)).toBe(false);
   });
 

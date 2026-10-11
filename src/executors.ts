@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 import type {
   CredentialBundle,
@@ -256,6 +256,19 @@ export class CommandExecutor implements Executor {
     }
 
     const steps = template.steps ?? [{ argv: template.argv ?? [] }];
+    // `repo_sha_verified` is a claim about every step: one that runs outside
+    // the verified tree would make the claim false, so it is refused before
+    // any step runs (#25).
+    for (const step of steps) {
+      if (!repositoryVerified || !step.cwd) continue;
+      const stepCwd = resolve(this.#baseDirectory, step.cwd);
+      const inside = relative(cwd, stepCwd);
+      if (inside.startsWith("..") || isAbsolute(inside)) {
+        throw new Error(
+          `Step cwd ${stepCwd} leaves the verified repository ${cwd}`
+        );
+      }
+    }
     const values = Object.values(credentials).filter(
       (value): value is string => typeof value === "string"
     );
