@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -379,6 +379,23 @@ describe("pgtap.run in the live executor", () => {
 
     expect(error.reason).toBe("tests_failed");
     expect(verification(error).cleanup_residue).toMatch(/volumes unverified/);
+  });
+
+  test("refuses to rewrite a config.toml that is a symlink, leaving its target untouched", async () => {
+    const target = join(mkdtempSync(join(tmpdir(), "supadrum-pgtap-target-")), "victim.toml");
+    writeFileSync(target, "untouched\n");
+    const { process, run } = setup((argv) => {
+      if (argv[0] !== "bash") return undefined;
+      const destination = String(argv.at(-1));
+      mkdirSync(join(destination, "supabase", "tests"), { recursive: true });
+      symlinkSync(target, join(destination, "supabase", "config.toml"));
+      return {};
+    });
+
+    await expect(run()).rejects.toThrow(/no regular file supabase\/config.toml/);
+
+    expect(readFileSync(target, "utf8")).toBe("untouched\n");
+    expect(process.ran("start")).toBe(false);
   });
 
   test("keeps the start output when start fails, in place of a test output", async () => {

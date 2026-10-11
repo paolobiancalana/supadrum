@@ -5,6 +5,7 @@ import {
   accessSync,
   constants,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   writeFileSync
@@ -845,6 +846,11 @@ export class LiveSupabaseExecutor implements Executor {
           throw new PgtapStop("tests_path_missing", `Tree ${job.repo_sha} has no ${chamber.tests_path}`);
         }
         const configPath = join(directory, "supabase", "config.toml");
+        // The tree is the agent's: a symlink here would make the rewrite
+        // below land outside the disposable folder.
+        if (!lstatSync(configPath, { throwIfNoEntry: false })?.isFile()) {
+          throw new Error(`Tree ${job.repo_sha} has no regular file supabase/config.toml`);
+        }
         const config = await buildPgtapConfig({
           tree: readFileSync(configPath, "utf8"),
           project: job.project,
