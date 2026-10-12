@@ -44,9 +44,9 @@ export const projectProfiles = {
     "schema-inspection",
     "project-management"
   ],
-  // pgtap needs a local chamber with a pgtap block; a registered project
+  // pgtap and stack need a local chamber with a pgtap block; a registered project
   // points at a remote one, so listing it would only fail loadConfig (#51).
-  admin: capabilityNames.filter((capability) => capability !== "pgtap")
+  admin: capabilityNames.filter((capability) => capability !== "pgtap" && capability !== "stack")
 } as const satisfies Record<string, readonly Capability[]>;
 
 export type ProjectProfile = keyof typeof projectProfiles;

@@ -87,9 +87,10 @@ const AdapterTestsPayloadSchema = z.object({
   setup_job_id: z.uuid().optional()
 }).strict();
 
-// A pgTAP run is fully described by the project and the commit: the caller
-// chooses nothing, so any key at all is a mistake (#41).
+// A pgTAP run or a served stack is fully described by the project and the
+// tree: the caller chooses nothing, so any key at all is a mistake (#41).
 const PgtapPayloadSchema = z.object({}).strict();
+const TREE_OPERATIONS = ["pgtap.run", "stack.serve"] as const;
 
 // repo_sha carries the tree OID the hook staged (#41). A prefix, a branch or
 // HEAD would be resolved against whatever the repository holds later.
@@ -105,13 +106,13 @@ export const JobSubmissionSchema = z
   })
   .superRefine((submission, context) => {
     if (
-      submission.operation === "pgtap.run" &&
+      (TREE_OPERATIONS as readonly string[]).includes(submission.operation) &&
       !FULL_OBJECT_NAME.test(submission.repo_sha)
     ) {
       context.addIssue({
         code: "custom",
         path: ["repo_sha"],
-        message: "pgtap.run needs the full tree object name (40 or 64 hex characters)"
+        message: `${submission.operation} needs the full tree object name (40 or 64 hex characters)`
       });
     }
     const schema =
@@ -119,7 +120,7 @@ export const JobSubmissionSchema = z
         ? SchemaInspectionPayloadSchema
         : submission.operation === "tests.run"
           ? AdapterTestsPayloadSchema
-        : submission.operation === "pgtap.run"
+        : submission.operation === "pgtap.run" || submission.operation === "stack.serve"
           ? PgtapPayloadSchema
         : submission.operation === "migration.baseline"
           ? MigrationBaselinePayloadSchema

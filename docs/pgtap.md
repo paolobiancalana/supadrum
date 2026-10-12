@@ -9,6 +9,9 @@ The command only queues a `pgtap.run` job (capability `pgtap`, no approval) and
 waits for the runner; the runner does the work. It reads no credential and the
 job payload is empty: the caller supplies nothing but the tree.
 
+For tests that need the whole stack (Playwright, Edge Functions), see
+[docs/stack.md](stack.md): same tree, same stack, kept up for one command.
+
 No hook ships in `examples/`. The hook is yours to write (see
 [Limits](#limits) for what it has to do).
 

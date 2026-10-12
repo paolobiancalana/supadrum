@@ -17,6 +17,7 @@ const TREE = "0123456789abcdef0123456789abcdef01234567";
 const PROBE_TAG = "public.ecr.aws/supabase/postgres:17.6.1.011";
 const DB_IMAGE = "public.ecr.aws/supabase/postgres:17.6.1.054";
 const STACK = "supadrum-tmp-atlas";
+const STATUS_ENV = "API_URL=\"http://127.0.0.1:56321\"\nDB_URL=\"postgresql://postgres:postgres@127.0.0.1:56322/postgres\"\n";
 const TREE_CONFIG = [
   'project_id = "atlas"',
   "",
@@ -83,6 +84,7 @@ class PgtapProcess implements LiveProcess {
     if (command === "supabase") {
       if (verb === "--version") return { stdout: "2.116.0\n" };
       if (verb === "start") return { stdout: "Started supabase local development setup.\n" };
+      if (verb === "status") return { stdout: STATUS_ENV };
       if (verb === "test") {
         const workdir = String(argv[argv.indexOf("--workdir") + 1]);
         const port = /\[db\]\nport = (\d+)/.exec(readFileSync(join(workdir, "supabase", "config.toml"), "utf8"))?.[1];
@@ -118,6 +120,10 @@ function pgtapJob(): Job {
   };
 }
 
+function stackJob(): Job {
+  return { ...pgtapJob(), operation: "stack.serve", capability: "stack", session_id: "session-1" };
+}
+
 function pgtapProject(repository: string, pgtap: Record<string, unknown> = {}): ProjectConfig {
   return {
     repo: repository,
@@ -149,7 +155,8 @@ function setup(override?: Override, files?: Record<string, string>, pgtap?: Reco
   const process = new PgtapProcess(override, files);
   const executor = new LiveSupabaseExecutor({ process, cacheRoot });
   const run = () => executor.execute(pgtapJob(), pgtapProject(repository, pgtap), credentials);
-  return { process, cacheRoot, run };
+  const serve = () => executor.execute(stackJob(), pgtapProject(repository, pgtap), credentials);
+  return { process, cacheRoot, run, serve, executor };
 }
 
 async function failure(run: () => Promise<unknown>): Promise<PgtapRunFailure> {
@@ -427,5 +434,85 @@ describe("pgtap.run in the live executor", () => {
 
     expect(error.result.output).toEqual({ exit_code: 1, stdout: "pulling\n", stderr: "port is already allocated\n" });
     expect(process.ran("test")).toBe(false);
+  });
+});
+
+describe("stack.serve in the live executor (#59)", () => {
+  test("prepares and starts a fuller stack, reports its status, and leaves it running", async () => {
+    const { process, cacheRoot, serve } = setup();
+
+    const result = await serve();
+
+    const argv = process.calls.map((call) => call.argv);
+    const directory = join(cacheRoot, STACK);
+    const start = argv.findIndex((args) => is(args, "supabase", "start"));
+    expect(argv[start]).toEqual([
+      "supabase", "start", "--workdir", directory, "--network-id", `supabase_network_${STACK}`,
+      "-x", "studio,logflare,vector,supavisor,postgres-meta"
+    ]);
+    expect(argv.slice(start)).toContainEqual(["supabase", "status", "--workdir", directory, "-o", "env"]);
+    expect(process.ran("test")).toBe(false);
+    // Nothing removed after start: the stack is the session's now.
+    expect(argv.slice(start).some(isCleanupListing)).toBe(false);
+    expect(existsSync(join(directory, "supabase", "config.toml"))).toBe(true);
+    // The status is the caller's, URL included: no redaction here.
+    expect(result.output).toEqual({ exit_code: 0, stdout: STATUS_ENV, stderr: "" });
+    expect(result.verification).toEqual({
+      target: "local",
+      tree_oid: TREE,
+      db_image: DB_IMAGE,
+      duration_ms: expect.any(Number),
+      phases: { prepare_ms: expect.any(Number), start_ms: expect.any(Number), test_ms: 0, cleanup_ms: 0 },
+      reason: null
+    });
+  });
+
+  test("serves a tree without the tests folder: there is nothing to run in it", async () => {
+    const { serve } = setup(undefined, { "supabase/config.toml": TREE_CONFIG });
+
+    await expect(serve()).resolves.toMatchObject({ verification: { reason: null } });
+  });
+
+  test("unmount removes the served stack by label and its folder, once", async () => {
+    const { process, cacheRoot, serve, executor } = setup();
+    await serve();
+    const before = process.calls.length;
+
+    await executor.unmount();
+
+    const argv = process.calls.slice(before).map((call) => call.argv);
+    expect(argv.some(isCleanupListing)).toBe(true);
+    expect(argv.some((args) => is(args, "docker", "network", "ls") && args.includes(`label=com.supabase.cli.project=${STACK}`))).toBe(true);
+    expect(existsSync(join(cacheRoot, STACK))).toBe(false);
+    const after = process.calls.length;
+    await executor.unmount();
+    expect(process.calls.length).toBe(after);
+  });
+
+  test("unmount without a served stack runs nothing", async () => {
+    const { process, executor } = setup();
+
+    await executor.unmount();
+
+    expect(process.calls).toEqual([]);
+  });
+
+  test.each<[string, PgtapReason, Override]>([
+    ["start fails", "start_failed", (argv) => is(argv, "supabase", "start") ? { exitCode: 1 } : undefined],
+    ["status fails", "start_failed", (argv) => is(argv, "supabase", "status") ? { exitCode: 1 } : undefined],
+    ["start times out", "phase_timeout", (argv) => is(argv, "supabase", "start") ? timedOut : undefined]
+  ])("cleans up at once when %s, and keeps nothing for unmount", async (_case, reason, override) => {
+    const { process, cacheRoot, serve, executor } = setup(override);
+
+    const error = await failure(serve);
+
+    expect(error.reason).toBe(reason);
+    const argv = process.calls.map((call) => call.argv);
+    const start = argv.findIndex((args) => is(args, "supabase", "start"));
+    expect(argv.slice(start).some(isCleanupListing)).toBe(true);
+    expect(existsSync(join(cacheRoot, STACK))).toBe(false);
+    const after = process.calls.length;
+    await executor.unmount();
+    expect(process.calls.length).toBe(after);
   });
 });

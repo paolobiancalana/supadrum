@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { loadConfig, type SupadrumConfig } from "./config.js";
+import { loadConfig, type ProjectConfig, type SupadrumConfig } from "./config.js";
 import {
   FULL_OBJECT_NAME,
   terminalJobStatuses,
@@ -20,12 +20,12 @@ export interface PgtapSeams {
   readonly sleep: (ms: number) => Promise<void>;
 }
 
-interface PgtapIo {
+export interface PgtapIo {
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
 }
 
-interface PgtapRuntime {
+export interface PgtapRuntime {
   readonly cwd: string;
   readonly homeDirectory: string;
   readonly environment: NodeJS.ProcessEnv;
@@ -49,7 +49,7 @@ function stop(io: PgtapIo, code: number, cause: string): number {
   return code;
 }
 
-function exitCodeFor(reason: PgtapReason): 1 | 3 | 4 | 5 {
+export function exitCodeFor(reason: PgtapReason): 1 | 3 | 4 | 5 {
   switch (reason) {
     case "tests_failed":
       return 1;
@@ -85,7 +85,7 @@ const fields = (value: unknown): Record<string, unknown> =>
     ? (value as Record<string, unknown>)
     : {};
 
-function runnerAlive(pidPath: string): boolean {
+export function runnerAlive(pidPath: string): boolean {
   let text: string;
   try {
     text = readFileSync(pidPath, "utf8").trim();
@@ -116,7 +116,7 @@ function tryCancel(store: SqliteStore, job: Job): boolean {
   }
 }
 
-function waitingFor(store: SqliteStore, job: Job, now: number): string {
+export function waitingFor(store: SqliteStore, job: Job, now: number): string {
   if (job.status === "granted" || job.status === "running" || job.status === "verifying") {
     return `in esecuzione, fase ${job.status}`;
   }
@@ -225,6 +225,67 @@ async function awaitJob(wait: Wait): Promise<number> {
   }
 }
 
+export interface TreeCommandAdmission {
+  readonly config: SupadrumConfig;
+  readonly pidPath: string;
+  readonly chamber: NonNullable<ProjectConfig["pgtap"]>;
+}
+
+/**
+ * The checks a tree command makes before it queues anything, as pgtap and
+ * stack share them: the config, the runner, the project and the OID. The
+ * refusal is the Italian cause for stderr.
+ */
+export function admitTreeCommand(
+  runtime: PgtapRuntime,
+  explicit: string | undefined,
+  alias: string,
+  oid: string,
+  capability: "pgtap" | "stack"
+): TreeCommandAdmission | string {
+  // Not resolveOperatorConfigPath: that one also picks up a supadrum.yml in
+  // the working directory, and a hook runs inside the very repository it checks.
+  const configPath = resolve(
+    runtime.cwd,
+    explicit ??
+      runtime.environment.SUPADRUM_CONFIG ??
+      join(
+        runtime.environment.XDG_CONFIG_HOME ?? join(runtime.homeDirectory, ".config"),
+        "supadrum",
+        "config.yml"
+      )
+  );
+  let config: SupadrumConfig;
+  try {
+    config = loadConfig(configPath);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  const pidPath = runnerPidPath(config.database_path);
+  if (!runnerAlive(pidPath)) {
+    return `il runner non gira (${pidPath} manca o il suo pid è morto): avviare supadrum-runner`;
+  }
+  const project = config.projects[alias];
+  if (!project) return `progetto sconosciuto: ${alias}`;
+  if (project.target !== "local") return `il progetto ${alias} non è local`;
+  if (!project.capabilities.includes(capability)) {
+    return `il progetto ${alias} non ha la capability ${capability}`;
+  }
+  const chamber = project.pgtap;
+  if (!chamber) return `la chamber ${project.chamber} non ha il blocco pgtap`;
+  if (project.mode !== "live") {
+    return `il progetto ${alias} è in mode ${project.mode}, serve live`;
+  }
+  if (config.executor !== "command") {
+    return `executor ${config.executor} nella config, serve command`;
+  }
+  if (!FULL_OBJECT_NAME.test(oid)) {
+    return `tree OID non valido: ${oid} (servono 40 o 64 caratteri esadecimali, non un prefisso o un ramo)`;
+  }
+  return { config, pidPath, chamber };
+}
+
 /**
  * The commit hook's entry: queue a pgtap.run for one tree, wait for it, and
  * turn its outcome into an exit code. It never throws — a hook must always
@@ -252,46 +313,9 @@ export async function runPgtap(
   const [alias, oid] = positional;
   if (!alias || !oid || positional.length !== 2) return refuse(`uso: ${USAGE}`);
 
-  // Not resolveOperatorConfigPath: that one also picks up a supadrum.yml in
-  // the working directory, and a hook runs inside the very repository it checks.
-  const configPath = resolve(
-    runtime.cwd,
-    explicit ??
-      runtime.environment.SUPADRUM_CONFIG ??
-      join(
-        runtime.environment.XDG_CONFIG_HOME ?? join(runtime.homeDirectory, ".config"),
-        "supadrum",
-        "config.yml"
-      )
-  );
-  let config: SupadrumConfig;
-  try {
-    config = loadConfig(configPath);
-  } catch (error) {
-    return refuse(error instanceof Error ? error.message : String(error));
-  }
-
-  const pidPath = runnerPidPath(config.database_path);
-  if (!runnerAlive(pidPath)) {
-    return refuse(`il runner non gira (${pidPath} manca o il suo pid è morto): avviare supadrum-runner`);
-  }
-  const project = config.projects[alias];
-  if (!project) return refuse(`progetto sconosciuto: ${alias}`);
-  if (project.target !== "local") return refuse(`il progetto ${alias} non è local`);
-  if (!project.capabilities.includes("pgtap")) {
-    return refuse(`il progetto ${alias} non ha la capability pgtap`);
-  }
-  const chamber = project.pgtap;
-  if (!chamber) return refuse(`la chamber ${project.chamber} non ha il blocco pgtap`);
-  if (project.mode !== "live") {
-    return refuse(`il progetto ${alias} è in mode ${project.mode}, serve live`);
-  }
-  if (config.executor !== "command") {
-    return refuse(`executor ${config.executor} nella config, serve command`);
-  }
-  if (!FULL_OBJECT_NAME.test(oid)) {
-    return refuse(`tree OID non valido: ${oid} (servono 40 o 64 caratteri esadecimali, non un prefisso o un ramo)`);
-  }
+  const admitted = admitTreeCommand(runtime, explicit, alias, oid, "pgtap");
+  if (typeof admitted === "string") return refuse(admitted);
+  const { config, pidPath, chamber } = admitted;
 
   let interrupted = false;
   const onSignal = () => {

@@ -397,6 +397,8 @@ const PGTAP_CLEANUP_MS = 60_000;
 /** Every service but the database: `test db` needs nothing else (#45). */
 const PGTAP_EXCLUDED_SERVICES =
   "gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor";
+/** A served stack keeps what a test suite may call; only the tooling is left out (#59). */
+const STACK_EXCLUDED_SERVICES = "studio,logflare,vector,supavisor,postgres-meta";
 const PGTAP_PROBE_REPOSITORY = "public.ecr.aws/supabase/postgres";
 
 type PgtapPhase = "prepare" | "start" | "test" | "cleanup";
@@ -606,11 +608,23 @@ export class LiveSupabaseExecutor implements Executor {
     };
   }
 
+  /** The stack a `stack.serve` left running, removed when its session ends. */
+  #served: { id: string; cwd: string; env: NodeJS.ProcessEnv } | null = null;
+
   async mount(): Promise<void> {}
 
   async drain(): Promise<void> {}
 
-  async unmount(): Promise<void> {}
+  async unmount(): Promise<void> {
+    const served = this.#served;
+    if (!served) return;
+    this.#served = null;
+    const run = phaseRunner(this.#process, PGTAP_CLEANUP_MS, this.#executables.supabase, served.cwd, served.env);
+    const residue = await removeDisposableStack(served.id, run.execute, this.#cacheRoot)
+      .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+    // ponytail: no job carries this outcome, the runner's stderr is the only reader.
+    if (residue) process.stderr.write(`stack ${served.id}: residuo dopo la pulizia: ${residue}\n`);
+  }
 
   async execute(
     job: Job,
@@ -618,7 +632,9 @@ export class LiveSupabaseExecutor implements Executor {
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
     // Before `#verifyRepository`: the job names a tree, not the checkout's HEAD.
-    if (job.operation === "pgtap.run") return this.#executePgtap(job, project);
+    if (job.operation === "pgtap.run" || job.operation === "stack.serve") {
+      return this.#executePgtap(job, project);
+    }
     if (job.operation === "tests.run") {
       if (project.target !== "local") {
         throw new Error("tests.run is available only on a local chamber");
@@ -769,7 +785,12 @@ export class LiveSupabaseExecutor implements Executor {
    * `verification.reason`; a cleanup residue is reported beside the verdict,
    * never instead of it.
    */
+  /**
+   * pgtap.run: prepare, start, test, cleanup. stack.serve: prepare and start
+   * only; the stack stays up for the session and `unmount` removes it (#59).
+   */
   async #executePgtap(job: Job, project: ProjectConfig): Promise<ExecutionResult> {
+    const serve = job.operation === "stack.serve";
     const repository = project.repo;
     const chamber = project.pgtap;
     if (!repository || !chamber) {
@@ -804,7 +825,7 @@ export class LiveSupabaseExecutor implements Executor {
       }
       throw new PgtapStop(
         "phase_timeout",
-        `pgtap.run ${name} phase exceeded its ${budgetMs / 1000} s limit` +
+        `${job.operation} ${name} phase exceeded its ${budgetMs / 1000} s limit` +
           (name === "start" ? "; first run after a Supabase CLI upgrade? Retry" : ""),
         name
       );
@@ -848,7 +869,7 @@ export class LiveSupabaseExecutor implements Executor {
         armed = true;
         mkdirSync(directory, { recursive: true });
         await extractTree(source, job.repo_sha, directory);
-        if (!existsSync(join(directory, chamber.tests_path))) {
+        if (!serve && !existsSync(join(directory, chamber.tests_path))) {
           throw new PgtapStop("tests_path_missing", `Tree ${job.repo_sha} has no ${chamber.tests_path}`);
         }
         const configPath = join(directory, "supabase", "config.toml");
@@ -864,15 +885,16 @@ export class LiveSupabaseExecutor implements Executor {
         });
         writeFileSync(configPath, config);
         // The stack keeps the CLI's default password, so only the URL around
-        // it is redacted: the bare word `postgres` would deface the TAP.
+        // it is redacted: the bare word `postgres` would deface the TAP. A
+        // served stack hands the URL to its caller instead.
         const port = databasePort(config);
-        if (port) secrets = [`postgresql://postgres:postgres@127.0.0.1:${port}/postgres`];
+        if (port && !serve) secrets = [`postgresql://postgres:postgres@127.0.0.1:${port}/postgres`];
         return createDisposableNetwork(id, run.execute);
       });
       await phase("start", chamber.start_timeout_ms, async (run) => {
         const started = await run.live.run({
           argv: [supabase, "start", "--workdir", directory, "--network-id", network,
-            "-x", PGTAP_EXCLUDED_SERVICES],
+            "-x", serve ? STACK_EXCLUDED_SERVICES : PGTAP_EXCLUDED_SERVICES],
           cwd: directory,
           env
         });
@@ -886,7 +908,31 @@ export class LiveSupabaseExecutor implements Executor {
           throw new PgtapStop("start_failed", `No database container ${container} after supabase start`);
         }
         dbImage = inspected.stdout;
+        if (!serve) return;
+        const status = await run.live.run({
+          argv: [supabase, "status", "--workdir", directory, "-o", "env"],
+          cwd: directory,
+          env
+        });
+        output = captured(status);
+        if (status.exitCode !== 0) {
+          throw new PgtapStop("start_failed", `supabase status failed with exit code ${status.exitCode}`);
+        }
       });
+      if (serve) {
+        this.#served = { id, cwd: repository, env };
+        return {
+          output,
+          verification: {
+            target: "local",
+            tree_oid: job.repo_sha,
+            db_image: dbImage,
+            duration_ms: Date.now() - startedAt,
+            phases,
+            reason: null
+          }
+        };
+      }
       const tested = await phase("test", chamber.test_timeout_ms, async (run) => {
         const result = await run.live.run({
           argv: [supabase, "test", "db", "--workdir", directory, chamber.tests_path],

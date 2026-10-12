@@ -90,6 +90,15 @@ describe("operation catalog", () => {
     });
   });
 
+  test("stack.serve runs under the stack capability without approval, and needs the same tree and empty payload (#59)", () => {
+    expect(operationCatalog["stack.serve"]).toEqual({ capability: "stack", approval: false });
+    const base = { project: "atlas", operation: "stack.serve", repo_sha: "a".repeat(40), idempotency_key: "atlas:stack", payload: {} };
+    expect(JobSubmissionSchema.parse(base).payload).toEqual({});
+    // A 7-character prefix is long enough for the field, not for a tree.
+    expect(JobSubmissionSchema.safeParse({ ...base, repo_sha: "abc1234" }).success).toBe(false);
+    expect(() => JobSubmissionSchema.parse({ ...base, payload: { services: "all" } })).toThrow();
+  });
+
   test("pgTAP runs need a full tree object name and a payload with no choices", () => {
     const base = {
       project: "atlas",
@@ -190,6 +199,14 @@ ${extra}`;
 
   test("rejects a pgTAP project whose chamber has no pgtap block", () => {
     expect(() => loadConfig(writeConfig(pgtapConfig("")))).toThrow(/pgtap/);
+  });
+
+  test("a project with stack needs the pgtap block and a stack-safe name as much as pgtap does (#59)", () => {
+    const withStack = (chamberBlock: string) => pgtapConfig(chamberBlock).replace("[pgtap]", "[stack]");
+    expect(() => loadConfig(writeConfig(withStack("")))).toThrow(/lists stack but chamber atlas-local has no pgtap block/);
+    expect(() => loadConfig(writeConfig(withStack(pgtapBlock("supabase/tests")).replace("  atlas:\n", "  Atlas:\n"))))
+      .toThrow(/lists stack, so its name/);
+    expect(loadConfig(writeConfig(withStack(pgtapBlock("supabase/tests")))).projects.atlas?.capabilities).toEqual(["stack"]);
   });
 
   test("rejects a pgTAP project whose name cannot become a disposable stack id", () => {

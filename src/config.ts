@@ -21,6 +21,7 @@ const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
   "sql",
   "adapter-tests",
   "pgtap",
+  "stack",
   "schema-inspection"
 ]);
 
@@ -511,16 +512,20 @@ export function loadConfig(path: string): SupadrumConfig {
         `Local chamber ${chamberName} supports only the ${[...LOCAL_CAPABILITIES].join(", ")} capabilities with the supabase driver`
       );
     }
-    if (input.capabilities.includes("pgtap") && !chamber.pgtap) {
+    // stack shares the pgtap block (its limits) and the stack id (#59).
+    const disposable = (["pgtap", "stack"] as const).find((capability) =>
+      input.capabilities.includes(capability)
+    );
+    if (disposable && !chamber.pgtap) {
       throw new Error(
-        `Project ${name} lists pgtap but chamber ${chamberName} has no pgtap block`
+        `Project ${name} lists ${disposable} but chamber ${chamberName} has no pgtap block`
       );
     }
     // The name becomes the disposable stack id, `supadrum-tmp-<name>`, which
     // Docker objects and the cleanup guard accept only in this alphabet.
-    if (input.capabilities.includes("pgtap") && !/^[a-z0-9-]+$/.test(name)) {
+    if (disposable && !/^[a-z0-9-]+$/.test(name)) {
       throw new Error(
-        `Project ${name} lists pgtap, so its name must use only lowercase letters, digits and hyphens`
+        `Project ${name} lists ${disposable}, so its name must use only lowercase letters, digits and hyphens`
       );
     }
   }

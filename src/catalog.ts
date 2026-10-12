@@ -10,6 +10,7 @@ export const capabilityNames = [
   "sql",
   "adapter-tests",
   "pgtap",
+  "stack",
   "project-management",
   "deploy"
 ] as const;
@@ -32,6 +33,7 @@ export const operationNames = [
   "sql.execute",
   "tests.run",
   "pgtap.run",
+  "stack.serve",
   "project.manage",
   "types.generate",
   "deploy.inspect",
@@ -75,6 +77,9 @@ export const operationCatalog = {
   // leaves the caller no choices: the blast radius is runner time, so a commit
   // hook can queue it without a human approving each run (#40).
   "pgtap.run": { capability: "pgtap", approval: false },
+  // The same disposable stack as pgtap.run, kept alive for the session that
+  // asked for it so the caller can run its own tests against it (#59).
+  "stack.serve": { capability: "stack", approval: false },
   "project.manage": { capability: "project-management", approval: true },
   "types.generate": { capability: "schema-inspection", approval: false },
   // Deploying is the one operation whose blast radius is the public internet:

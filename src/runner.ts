@@ -116,15 +116,20 @@ export class Runner {
         });
         continue;
       }
-      if (candidate.operation === "pgtap.run") {
+      if (
+        candidate.operation === "pgtap.run" ||
+        (candidate.operation === "session.open" && candidate.capability === "stack")
+      ) {
         // The command refuses a dry-run config before queueing; this is the
         // second check, for a job queued some other way.
         if (project.mode !== "live" || this.#config.executor !== "command") {
           this.#store.transition(candidate.id, "failed", null, {
-            error: "pgtap.run requires a live chamber and the command executor"
+            error: `${candidate.operation === "pgtap.run" ? "pgtap.run" : "a stack session"} requires a live chamber and the command executor`
           });
           continue;
         }
+      }
+      if (candidate.operation === "pgtap.run") {
         const waitedMs = this.#now().getTime() - new Date(candidate.created_at).getTime();
         if (waitedMs > this.#config.pgtap.queue_timeout_ms) {
           this.#store.transition(candidate.id, "failed", null, {
@@ -379,7 +384,9 @@ export class Runner {
     } catch (error) {
       return this.#fail(current.id, {
         lease_expires_at: null,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        // A served stack that failed keeps its reason and start output (#59).
+        ...(error instanceof PgtapRunFailure ? { result: error.result } : {})
       });
     }
   }

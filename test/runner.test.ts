@@ -295,6 +295,92 @@ describe("global scheduler", () => {
       }
     });
 
+    test("refuses a stack session on a dry-run chamber or executor, without the executor (#59)", async () => {
+      for (const config of [
+        { ...pgtapConfig(), executor: "dry-run" as const },
+        (() => {
+          const config = pgtapConfig();
+          config.projects.alpha = { ...config.projects.alpha!, mode: "dry-run" };
+          return config;
+        })()
+      ]) {
+        config.projects.alpha = { ...config.projects.alpha!, capabilities: ["pgtap", "stack"] };
+        const store = createStore();
+        const session = store.openSession({
+          project: "alpha", capability: "stack", repo_sha: "0123456789abcdef0123456789abcdef01234567",
+          idempotency_key: "alpha:stack", ttl_ms: 30_000
+        });
+        const executor = new RecordingExecutor();
+
+        await new Runner(store, config, new AvailableCredentials(), executor, { now }).tick();
+
+        expect(store.getJob(session.open_job_id)).toMatchObject({
+          status: "failed",
+          error: "a stack session requires a live chamber and the command executor"
+        });
+        expect(store.getSession(session.id).status).toBe("queued");
+        expect(executor.calls).toEqual([]);
+      }
+    });
+
+    test("serves a stack inside its session and unmounts the executor when the session closes (#59)", async () => {
+      const store = createStore();
+      const config = pgtapConfig();
+      config.projects.alpha = { ...config.projects.alpha!, capabilities: ["pgtap", "stack"] };
+      const session = store.openSession({
+        project: "alpha", capability: "stack", repo_sha: "0123456789abcdef0123456789abcdef01234567",
+        idempotency_key: "alpha:stack", ttl_ms: 30_000
+      });
+      const executor = new RecordingExecutor();
+      const runner = new Runner(store, config, new AvailableCredentials(), executor, { now });
+
+      await runner.tick();
+      expect(store.getSession(session.id).status).toBe("active");
+      const serve = store.submitSessionJob(session.id, { operation: "stack.serve", payload: {}, idempotency_key: "alpha:serve" });
+      await runner.tick();
+      expect(store.getJob(serve.id).status).toBe("completed");
+      expect(executor.calls).toEqual(["mount:alpha", "execute:alpha:stack.serve"]);
+      // The lease is the session's: a pgtap.run queued meanwhile waits.
+      submitPgtap(store);
+      await runner.tick();
+      expect(executor.calls).toHaveLength(2);
+
+      store.requestSessionClose(session.id);
+      await runner.tick();
+
+      expect(store.getSession(session.id).status).toBe("closed");
+      expect(executor.calls.slice(2)).toEqual(["drain", "unmount"]);
+    });
+
+    test("keeps the result of a failed stack.serve, start output included, on the session job (#59)", async () => {
+      const store = createStore();
+      const config = pgtapConfig();
+      config.projects.alpha = { ...config.projects.alpha!, capabilities: ["pgtap", "stack"] };
+      const session = store.openSession({
+        project: "alpha", capability: "stack", repo_sha: "0123456789abcdef0123456789abcdef01234567",
+        idempotency_key: "alpha:stack", ttl_ms: 30_000
+      });
+      const executor = new RecordingExecutor();
+      executor.execute = async () => {
+        throw new PgtapRunFailure("start_failed", "supabase start failed with exit code 1", {
+          output: { exit_code: 1, stdout: "pulling\n", stderr: "port taken\n" },
+          verification: { target: "local", reason: "start_failed", phase: "start" }
+        });
+      };
+      const runner = new Runner(store, config, new AvailableCredentials(), executor, { now });
+      await runner.tick();
+      const serve = store.submitSessionJob(session.id, { operation: "stack.serve", payload: {}, idempotency_key: "alpha:serve" });
+
+      await runner.tick();
+
+      expect(store.getJob(serve.id)).toMatchObject({
+        status: "failed",
+        error: "supabase start failed with exit code 1",
+        result: { output: { stderr: "port taken\n" }, verification: { reason: "start_failed", phase: "start" } }
+      });
+      expect(store.getSession(session.id).status).toBe("active");
+    });
+
     test("keeps the result of a failed run, reason included, on the job", async () => {
       const store = createStore();
       const queued = submitPgtap(store);
