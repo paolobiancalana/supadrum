@@ -27,6 +27,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "check": "npm run typecheck && npm test",
+    "ts": "npm run check",
+    "prepare": "git config core.hooksPath .githooks",
     "prepack": "npm run build",
     "smoke": "node dist/cli.js demo",
     "test": "vitest run",

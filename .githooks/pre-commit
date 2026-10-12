@@ -1,0 +1,3 @@
+#!/bin/sh
+# The TS gate: every commit passes the type-check and the suite.
+npm run check
