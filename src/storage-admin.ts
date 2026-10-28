@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   writeFileSync
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -135,18 +136,43 @@ async function listObjects(storage: Client, bucket: string): Promise<Entry[]> {
   return entries;
 }
 
-async function fetchObject(storage: Client, item: Item): Promise<Buffer> {
-  const response = await storage.call("GET", `/object/authenticated/${encodeURIComponent(item.bucket)}/${encodePath(item.path)}`);
-  if (!response.ok) throw new Error(`Storage download failed (${response.status})`);
-  let data: Buffer;
-  try { data = Buffer.from(await response.arrayBuffer()); }
-  catch { throw new Error("Storage download failed"); }
-  const declared = response.headers.get("content-length");
-  // A compressed body has the encoded length in the header and the listing, not the decoded one.
-  if (!response.headers.get("content-encoding")) {
-    if (declared !== null && Number(declared) !== data.length) throw new Error("Storage download was truncated");
-    if (item.bytes !== undefined && item.bytes !== data.length) throw new Error("Storage download does not match the listing");
+/** Reads a body but never more than `cap` bytes: an endless one is cut off, not buffered. */
+async function readCapped(response: Response, cap: number): Promise<Buffer> {
+  const reader = response.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (let part = await reader?.read(); part && !part.done; part = await reader!.read()) {
+      length += part.value.length;
+      if (length > cap) break;
+      chunks.push(part.value);
+    }
+  } catch { throw new Error("Storage download failed"); }
+  if (length > cap) {
+    await reader?.cancel().catch(() => {});
+    throw new Error("Storage download is larger than expected");
   }
+  return Buffer.concat(chunks, length);
+}
+
+/**
+ * One object, asked for as identity: a body Storage still encodes is refused,
+ * because its sizes would no longer say whether the download is whole.
+ */
+async function fetchObject(storage: Client, item: Item, cap: number): Promise<Buffer> {
+  const response = await storage.call("GET", `/object/authenticated/${encodeURIComponent(item.bucket)}/${encodePath(item.path)}`, {
+    headers: { "Accept-Encoding": "identity" }
+  });
+  if (!response.ok) throw new Error(`Storage download failed (${response.status})`);
+  const encoding = response.headers.get("content-encoding");
+  if (encoding !== null && encoding.trim().toLowerCase() !== "identity") {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("Storage served an encoded download");
+  }
+  const data = await readCapped(response, item.bytes ?? cap);
+  const declared = response.headers.get("content-length");
+  if (declared !== null && Number(declared) !== data.length) throw new Error("Storage download was truncated");
+  if (item.bytes !== undefined && item.bytes !== data.length) throw new Error("Storage download does not match the listing");
   return data;
 }
 
@@ -185,39 +211,58 @@ async function guardDest(context: StorageContext, requested: string, probe: stri
   if (stat && (!stat.isDirectory() || readdirSync(absolute).length > 0)) {
     throw new Error("Storage dest must be an empty folder or not exist yet");
   }
-  // `./` keeps a dest that starts with `:` from being read as pathspec magic.
-  if (!(await context.isIgnored(["."].concat(segments, probe).join("/")))) {
+  if (!(await ignored(context, join(resolve(context.repository), ...segments, probe)))) {
     throw new Error("Storage dest is not covered by .gitignore (git check-ignore)");
   }
   return absolute;
 }
 
-/** Creates a file that must not exist yet; a collision or a full disk says nothing about the name. */
-function writeNew(path: string, data: string | Uint8Array): void {
+/**
+ * Creates a file that must not exist yet, in a folder that still resolves
+ * under `dest`: a folder swapped for a symbolic link while the job runs is
+ * caught here. A collision or a full disk says nothing about the name.
+ */
+function writeNew(dest: string, path: string, data: string | Uint8Array): void {
   try {
     mkdirSync(dirname(path), { recursive: true });
+    // ponytail: check then write leaves a window a same-user process could still race; openat-style walks if that matters.
+    const root = realpathSync(dest);
+    const parent = realpathSync(dirname(path));
+    if (parent !== root && !parent.startsWith(root + sep)) throw new Error("outside dest");
     writeFileSync(path, data, { flag: "wx" });
   } catch { throw new Error("Storage file could not be written under dest"); }
 }
 
+/** `./` keeps a path that starts with `:` from being read as pathspec magic. */
+async function ignored(context: StorageContext, absolute: string): Promise<boolean> {
+  return context.isIgnored(["."].concat(relative(resolve(context.repository), absolute).split(sep)).join("/"));
+}
+
 /**
  * Downloads every item under `dest` and writes the MANIFEST (sha256, bytes,
- * path). Names are checked first so a bad one stops the job before any
- * download; one failed download fails the whole job.
+ * path). Names are checked first, and git must ignore every file the job
+ * will write (a `!` rule can re-include one), so a bad one stops the job
+ * before any download; one failed download fails the whole job.
  */
-async function saveAll(storage: Client, dest: string, items: readonly Item[]) {
+async function saveAll(context: StorageContext, storage: Client, dest: string, items: readonly Item[]) {
   const sorted = [...items].sort(byPath);
-  for (const item of sorted) localTarget(dest, item.bucket, item.path);
+  // ponytail: one git process per object; `check-ignore --stdin` when buckets hold thousands.
+  for (const item of sorted) {
+    if (!(await ignored(context, localTarget(dest, item.bucket, item.path)))) {
+      throw new Error("Storage dest is not covered by .gitignore (git check-ignore)");
+    }
+  }
   let bytes = 0;
   const lines: string[] = [];
   for (const item of sorted) {
-    const data = await fetchObject(storage, item);
-    writeNew(localTarget(dest, item.bucket, item.path), data);
+    // A delete has no listed size: what is left on the disk bounds the body instead.
+    const data = await fetchObject(storage, item, context.freeBytes(context.repository) - DISK_MARGIN);
+    writeNew(dest, localTarget(dest, item.bucket, item.path), data);
     bytes += data.length;
     lines.push(`${sha256(data)}\t${data.length}\t${full(item)}\n`);
   }
   const manifest = lines.join("");
-  writeNew(join(dest, "MANIFEST"), manifest);
+  writeNew(dest, join(dest, "MANIFEST"), manifest);
   return { objects: sorted.length, bytes, manifest_sha256: sha256(manifest), manifest_bytes: Buffer.byteLength(manifest) };
 }
 
@@ -235,7 +280,7 @@ async function list(context: StorageContext, storage: Client, dest: string | und
   const output: Record<string, unknown> = { action: "list", buckets, objects: all.length, bytes: sum(all) };
   if (target !== undefined) {
     const text = [...all].sort(byPath).map((entry) => `${full(entry)}\t${entry.bytes}\t${entry.updated}\n`).join("");
-    writeNew(join(target, "LIST"), text);
+    writeNew(target, join(target, "LIST"), text);
     output.list_sha256 = sha256(text);
     output.list_bytes = Buffer.byteLength(text);
   }
@@ -252,7 +297,7 @@ async function download(context: StorageContext, storage: Client, payload: Extra
   if (sum(items) + DISK_MARGIN > context.freeBytes(context.repository)) {
     throw new Error("Storage download does not fit on the disk");
   }
-  const saved = await saveAll(storage, dest, items);
+  const saved = await saveAll(context, storage, dest, items);
   return {
     output: { action: "download", buckets: names.length, ...saved },
     verification: { dest: relative(resolve(context.repository), dest) }
@@ -285,7 +330,7 @@ async function upload(context: StorageContext, storage: Client, payload: Extract
 
 async function remove(context: StorageContext, storage: Client, payload: Extract<StorageAdminPayload, { action: "delete" }>): Promise<StorageResult> {
   const dest = await guardDest(context, payload.dest, "MANIFEST");
-  const saved = await saveAll(storage, dest, payload.objects.map((path) => ({ bucket: payload.bucket, path })));
+  const saved = await saveAll(context, storage, dest, payload.objects.map((path) => ({ bucket: payload.bucket, path })));
   const removed = await storage.array(await storage.json("DELETE", `/object/${encodeURIComponent(payload.bucket)}`, { prefixes: payload.objects }));
   if (removed.length !== payload.objects.length) {
     throw new Error(`Storage deleted ${removed.length} of ${payload.objects.length} objects`);

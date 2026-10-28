@@ -77,8 +77,14 @@ class FakeStorage {
   duplicateListing = false;
   /** Objects whose listing claims one byte more than the body holds. */
   readonly wrongSize = new Set<string>();
-  /** Objects served with a content-encoding, whose content-length is the encoded size. */
-  readonly encoded = new Set<string>();
+  /** Objects served with this content-encoding header (the body itself is left as stored). */
+  readonly encoding = new Map<string, string>();
+  /** Objects whose body runs 16 KiB past what the listing says, chunk by chunk. */
+  readonly oversize = new Set<string>();
+  /** Bodies the client stopped reading before the end. */
+  cancelled = 0;
+  /** Runs when an object is served, before its body is read: a hook to change the disk mid-job. */
+  onDownload: ((key: string) => void) | undefined;
   constructor(readonly key: string, readonly base: string) {}
 
   put(bucket: string, path: string, content: string, type = "text/plain"): void {
@@ -144,9 +150,23 @@ class FakeStorage {
     if (this.failDownload.has(`${bucket}/${path}`)) return Response.json({ message: `boom ${this.key}` }, { status: 500 });
     const object = this.buckets.get(bucket)?.objects.get(path);
     if (!object) return Response.json({ message: "Object not found" }, { status: 404 });
-    const length = this.lieAboutLength.has(`${bucket}/${path}`) ? object.body.length + 10 : object.body.length;
+    const key = `${bucket}/${path}`;
+    this.onDownload?.(key);
+    if (this.oversize.has(key)) {
+      const chunks = [object.body, ...Array.from({ length: 16 }, () => Buffer.alloc(1024))];
+      const body = new ReadableStream<Uint8Array>({
+        pull: (controller) => {
+          const next = chunks.shift();
+          if (next) controller.enqueue(new Uint8Array(next)); else controller.close();
+        },
+        cancel: () => { this.cancelled += 1; }
+      });
+      return new Response(body, { headers: { "content-type": object.type } });
+    }
+    const length = this.lieAboutLength.has(key) ? object.body.length + 10 : object.body.length;
     const headers: Record<string, string> = { "content-type": object.type, "content-length": String(length) };
-    if (this.encoded.has(`${bucket}/${path}`)) headers["content-encoding"] = "identity";
+    const encoding = this.encoding.get(key);
+    if (encoding !== undefined) headers["content-encoding"] = encoding;
     return new Response(new Uint8Array(object.body), { headers });
   }
 
@@ -504,9 +524,30 @@ describe("storage.admin download", () => {
     storage.put("a", "1.txt", "one");
     await run({ action: "download", dest: "out/dl" });
     expect(readFileSync(join(repo, "out/dl/a/1.txt"), "utf8")).toBe("one");
-    expect(ignoreCalls).toHaveLength(1);
+    expect(ignoreCalls.map((call) => call.at(-1))).toEqual(["./out/dl/MANIFEST", "./out/dl/a/1.txt"]);
     expect(ignoreCalls[0]!.slice(-3)).toEqual(["-q", "--", "./out/dl/MANIFEST"]);
     expect(ignoreCalls[0]!.slice(0, 6)).toEqual(["git", "-c", "core.fsmonitor=false", "-C", repo, "check-ignore"]);
+  });
+
+  test("a ! rule that re-includes one object stops the job before any download", async () => {
+    const { repo, storage, run } = setup({ gitignore: "out/dl/*\n!out/dl/a\n" });
+    storage.put("a", "1.txt", "secret");
+    await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/check-ignore/);
+    expect(storage.count("GET", /\/object\/authenticated\//)).toBe(0);
+    expect(existsSync(join(repo, "out/dl"))).toBe(false);
+  });
+
+  test("a folder swapped for a symbolic link mid-job is never written through", async () => {
+    const { repo, storage, run } = setup();
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-swap-")));
+    storage.put("a", "1.txt", "one");
+    storage.put("b", "2.txt", "two");
+    storage.onDownload = (key) => {
+      if (key === "b/2.txt") symlinkSync(outside, join(repo, "out/dl/b"));
+    };
+    await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/written under dest/);
+    expect(readdirSync(outside)).toEqual([]);
+    expect(existsSync(join(repo, "out/dl/MANIFEST"))).toBe(false);
   });
 
   test("the repo's core.fsmonitor never runs when git is asked about dest", async () => {
@@ -591,14 +632,31 @@ describe("storage.admin download", () => {
     await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/truncated/i);
   });
 
-  test("a content-length or listing size that counts encoded bytes is not a truncation", async () => {
+  test("downloads ask for identity, and a body Storage still encodes is refused", async () => {
     const { repo, storage, run } = setup();
     storage.put("a", "one.txt", "12345");
+    storage.encoding.set("a/one.txt", "gzip");
+    await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/encoded download/);
+    const get = storage.requests.find((request) => /\/object\/authenticated\//.test(request.url));
+    expect(get?.headers.get("accept-encoding")).toBe("identity");
+    expect(existsSync(join(repo, "out/dl/a/one.txt"))).toBe(false);
+  });
+
+  test("identity is no encoding: its sizes are still checked", async () => {
+    const { storage, run } = setup();
+    storage.put("a", "one.txt", "12345");
+    storage.encoding.set("a/one.txt", "Identity");
     storage.lieAboutLength.add("a/one.txt");
-    storage.wrongSize.add("a/one.txt");
-    storage.encoded.add("a/one.txt");
-    await run({ action: "download", dest: "out/dl" });
-    expect(readFileSync(join(repo, "out/dl/a/one.txt"), "utf8")).toBe("12345");
+    await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/truncated/i);
+  });
+
+  test("a body that runs past the listed size is cut off, not buffered", async () => {
+    const { repo, storage, run } = setup();
+    storage.put("a", "one.txt", "12345");
+    storage.oversize.add("a/one.txt");
+    await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/larger than expected/);
+    expect(storage.cancelled).toBe(1);
+    expect(existsSync(join(repo, "out/dl/a/one.txt"))).toBe(false);
   });
 
   test("an object listed twice is an error, not a silent overwrite", async () => {
@@ -788,6 +846,19 @@ describe("storage.admin delete", () => {
     await expect(run(payload(["2026/a.png"]))).rejects.toThrow(/empty/i);
     expect(storage.requests).toHaveLength(0);
     expect(storage.has("photos", "2026/a.png")).toBe(true);
+  });
+
+  test("with no listed size, a body bigger than the free disk is cut off and nothing is deleted", async () => {
+    const margin = 256 * 1024 * 1024;
+    const ctx = setup({ free: margin + 3 });
+    ctx.storage.put("photos", "2026/a.png", "AAAA");
+    await expect(ctx.run(payload(["2026/a.png"]))).rejects.toThrow(/larger than expected/);
+    expect(ctx.storage.count("DELETE", /\/object\//)).toBe(0);
+    expect(ctx.storage.has("photos", "2026/a.png")).toBe(true);
+    const fits = setup({ free: margin + 4 });
+    fits.storage.put("photos", "2026/a.png", "AAAA");
+    await expect(fits.run(payload(["2026/a.png"]))).resolves.toBeDefined();
+    expect(fits.storage.has("photos", "2026/a.png")).toBe(false);
   });
 
   test("a server that removes fewer objects than asked is reported as an error", async () => {
