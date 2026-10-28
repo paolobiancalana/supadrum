@@ -441,6 +441,81 @@ the whole repository and remote schema are identical. Policy checks certify
 structure, not the business correctness of predicates. That requires separate
 tests with real identities.
 
+### Storage objects
+
+`storage.admin` lists, downloads, uploads and deletes Storage objects through
+the Storage REST API, with the chamber's own key: the remote `secret_key` and
+`project_ref`, or, on a local chamber, the service key from `supabase status`
+after the loopback preflight. It needs the `storage` capability, which local
+chambers may now grant, and it is approval-gated like `auth.admin`. Buckets are
+read-only: no action creates, changes or deletes a bucket. Upload and delete
+refuse a bucket named like a Storage route (`sign`, `move`, `copy`, …), which
+would turn the request into that route.
+
+Object paths and contents never appear in the job result, verification or
+errors. The result carries counts, bytes and sha256 digests; the paths exist
+only in files written under `dest`.
+
+`dest` is relative to the repository, confined to it, covered by
+`git check-ignore`, and empty or not yet existing. Anything else is refused
+before the first Storage request. Git is asked about a file under `dest`
+(`MANIFEST` or `LIST`), so a rule on the folder itself counts. The repository
+root, `.git` and any path through a symbolic link are refused.
+
+```json
+{ "action": "list" }
+{ "action": "list", "dest": "backups/storage-list" }
+```
+
+`list` returns, per bucket, `name`, `public`, `objects` and `bytes`, plus the
+totals. With `dest` it also writes `LIST` (`bucket/path`, bytes and date per
+line) and returns its `list_sha256` and `list_bytes`.
+
+```json
+{ "action": "download", "dest": "backups/storage-2026-10-27" }
+{ "action": "download", "dest": "backups/storage-2026-10-27", "buckets": ["avatars"] }
+```
+
+`download` fetches every bucket, or only those named, into `dest/<bucket>/<path>`
+and writes `MANIFEST` with sha256, bytes and `bucket/path` per line. The result
+holds `buckets`, `objects`, `bytes`, `manifest_sha256` and `manifest_bytes`. A
+server-side name that would leave `dest` (`..`, an empty or absolute segment)
+fails the job before the first download, and so does a listing whose total
+would leave less than 256 MiB free on the repository's disk. A body whose size
+differs from the listing fails the job.
+
+```json
+{
+  "action": "upload",
+  "bucket": "avatars",
+  "object": "team/logo.png",
+  "path": "assets/logo.png",
+  "digest": "<sha256 of assets/logo.png>",
+  "content_type": "image/png"
+}
+```
+
+`upload` sends one repository file. The payload pins its `digest`, as
+`sql.execute` does, and a mismatch is refused before any request. `content_type`
+is required. The file must not be reached through a symbolic link or sit in
+`.git`. An existing object stops the job unless `"upsert": true`. The
+result holds `objects`, `bytes`, `sha256` and `upsert`.
+
+```json
+{
+  "action": "delete",
+  "bucket": "avatars",
+  "objects": ["team/old-logo.png"],
+  "dest": "backups/storage-before-delete"
+}
+```
+
+`delete` takes exact object paths only: no prefixes, wildcards or whole
+buckets, and at most 100 per job. It first downloads every named object into
+`dest` with a `MANIFEST`, and deletes only if every download succeeded. The
+result holds `objects`, `deleted`, `bytes`, `manifest_sha256` and
+`manifest_bytes`.
+
 ## Job states
 
 ```text
@@ -506,8 +581,8 @@ repository and credential bundle before enabling only that alias. Consecutive
 aliases on one chamber reuse its mounted credentials. A different chamber
 causes drain and rotation. The global FIFO still grants only one job at a time.
 
-Credential-free local chambers may grant `auth-admin` in addition to
-`migrations`. The supported local action resets one active SNAP password
+Credential-free local chambers may grant `auth-admin` and `storage` in
+addition to `migrations`. The supported local action resets one active SNAP password
 credential to the public development profile without putting a password or
 hash in the queued payload:
 
@@ -763,7 +838,8 @@ not infer or repair schema compatibility and it has no direct CLI bypass.
 
 Live operations use built-in typed adapters for project inspection, migration
 planning/application, catalog-only schema inspection, Function deployment,
-operator-mapped Function Secrets, and digest-pinned repository SQL files.
+operator-mapped Function Secrets, digest-pinned repository SQL files, and
+Storage objects (`storage.admin`).
 Agents cannot supply arbitrary shell commands. The database URI and derived
 password are passed through environment only, never argv.
 

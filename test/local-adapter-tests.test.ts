@@ -195,6 +195,9 @@ describe("local adapter tests", () => {
     await expect(executor.execute(job(), project(repository), {} as never))
       .rejects.toThrow(/clean checkout/i);
     expect(process.calls.map((call) => call.argv[0])).toEqual(["git", "git"]);
+    // The repo's own core.fsmonitor would run a command of its choosing on `status`.
+    expect(process.calls.find((call) => call.argv.includes("status"))!.argv.slice(0, 4))
+      .toEqual(["git", "-c", "core.fsmonitor=false", "-C"]);
     expect(stored.size).toBe(0);
   });
 

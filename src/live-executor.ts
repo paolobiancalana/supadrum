@@ -8,6 +8,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  statfsSync,
   writeFileSync
 } from "node:fs";
 import { homedir } from "node:os";
@@ -59,6 +60,8 @@ import {
   parseSchemaInspectionPayload,
   schemaInspectionPsqlInput
 } from "./schema-inspection.js";
+import { runStorageAdmin } from "./storage-admin.js";
+import { parseStorageAdminPayload } from "./storage-payload.js";
 import { parseTypesGeneratePayload } from "./types-generate.js";
 import {
   analyzeMigrationHistory,
@@ -390,7 +393,15 @@ interface LiveExecutorOptions {
   readonly pgtap?: PgtapBrokerConfig;
   /** Parent of the disposable folders; tests point it away from `$HOME`. */
   readonly cacheRoot?: string;
+  /** Bytes free on the disk holding a path; tests fake a full disk. */
+  readonly freeBytes?: (path: string) => number;
 }
+
+/**
+ * Git reads the index for `status` and `check-ignore`, and that runs the
+ * repo's `core.fsmonitor`: a command any writer of `.git/config` chooses.
+ */
+const NO_FSMONITOR = ["-c", "core.fsmonitor=false"] as const;
 
 const PGTAP_PREPARE_MS = 60_000;
 const PGTAP_CLEANUP_MS = 60_000;
@@ -592,8 +603,13 @@ export class LiveSupabaseExecutor implements Executor {
   readonly #passwordVault: VaultBackend | undefined;
   readonly #pgtap: PgtapBrokerConfig;
   readonly #cacheRoot: string;
+  readonly #freeBytes: (path: string) => number;
 
   constructor(options: LiveExecutorOptions = {}) {
+    this.#freeBytes = options.freeBytes ?? ((path) => {
+      const disk = statfsSync(path);
+      return disk.bavail * disk.bsize;
+    });
     this.#pgtap = options.pgtap ?? pgtapBrokerDefaults;
     this.#cacheRoot = options.cacheRoot ?? join(homedir(), ".cache", "supadrum");
     this.#process = options.process ?? new NodeLiveProcess();
@@ -676,6 +692,9 @@ export class LiveSupabaseExecutor implements Executor {
       }
       if (job.operation === "types.generate") {
         return this.#generateTypes(job, project, repository, repositoryOid, null);
+      }
+      if (job.operation === "storage.admin") {
+        return this.#executeStorage(job, project, repository, repositoryOid, null);
       }
       return this.#executeLocalMigration(
         job,
@@ -771,6 +790,8 @@ export class LiveSupabaseExecutor implements Executor {
         );
       case "sql.execute":
         return this.#executeSql(job, project, databaseCredentials);
+      case "storage.admin":
+        return this.#executeStorage(job, project, repository, repositoryOid, credentials);
       case "session.open":
         throw new Error("Session opening is handled by the runner");
       default:
@@ -1097,7 +1118,7 @@ export class LiveSupabaseExecutor implements Executor {
 
   async #verifyCleanRepository(repository: string): Promise<void> {
     const status = await this.#process.run({
-      argv: [this.#executables.git, "-C", repository, "status", "--porcelain=v1", "--untracked-files=all"],
+      argv: [this.#executables.git, ...NO_FSMONITOR, "-C", repository, "status", "--porcelain=v1", "--untracked-files=all"],
       cwd: repository,
       env: { PATH: process.env.PATH }
     });
@@ -2111,6 +2132,68 @@ export class LiveSupabaseExecutor implements Executor {
         ...(credentials ? {} : { target: "local", local_preflight: true })
       }
     };
+  }
+
+  /**
+   * storage.admin: list, download, upload and delete objects. A remote chamber
+   * calls its project with the chamber's secret_key; a local one calls the
+   * loopback API with the service key of `supabase status`. All Storage logic
+   * is in storage-admin.ts, this only picks the host and the key.
+   */
+  async #executeStorage(
+    job: Job,
+    project: ProjectConfig,
+    repository: string,
+    repositoryOid: string,
+    credentials: ResolvedCredentials | null
+  ): Promise<ExecutionResult> {
+    if (job.capability !== "storage" || !project.capabilities.includes("storage")) {
+      throw new Error("Project lacks storage capability");
+    }
+    const payload = parseStorageAdminPayload(job.payload);
+    let base: string;
+    let key: string;
+    if (credentials) {
+      // A DNS label: anything else could move the request to another host.
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(project.project_ref)) {
+        throw new Error(`Project ${job.project} has an invalid project_ref`);
+      }
+      base = `https://${project.project_ref}.supabase.co/storage/v1`;
+      key = credentials.secret_key;
+    } else {
+      const database = await this.#assertLocalStack(repository, project.supabase_dir);
+      const local = validateLocalPasswordStatus(database.status);
+      base = `${local.apiUrl}/storage/v1`;
+      key = local.serviceKey;
+    }
+    try {
+      const result = await runStorageAdmin(payload, {
+        base, key, repository, request: this.#fetch, freeBytes: this.#freeBytes,
+        repositoryPath: (requested, what) => this.#repositoryPath(repository, requested, what),
+        isIgnored: async (path) => {
+          const check = await this.#process.run({
+            argv: [this.#executables.git, ...NO_FSMONITOR, "-C", repository, "check-ignore", "-q", "--", path],
+            cwd: repository,
+            env: { ...process.env }
+          });
+          if (check.exitCode === 0) return true;
+          if (check.exitCode === 1) return false;
+          throw new Error("Storage dest could not be checked with git check-ignore");
+        }
+      });
+      return {
+        output: result.output,
+        verification: {
+          repo_sha_verified: true,
+          repository_oid: repositoryOid,
+          target: credentials ? "remote" : "local",
+          ...(credentials ? {} : { local_preflight: true }),
+          ...result.verification
+        }
+      };
+    } catch (error) {
+      throw new Error(redact(error instanceof Error ? error.message : String(error), [key]));
+    }
   }
 
   async #executeSql(

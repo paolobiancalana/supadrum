@@ -27,6 +27,15 @@ credentials.
 
 Use `jobs.status` for a snapshot and `jobs.cancel` only before execution begins.
 
+## Storage
+
+`storage.admin` has four actions: `list`, `download`, `upload`, `delete`.
+Buckets are read-only. `download` and `delete` need a `dest` that is relative
+to the repository, git-ignored and empty or absent; `delete` takes at most 100
+exact object paths and saves them to `dest` first. `upload` pins the file's
+`digest` and needs `content_type`; an existing object needs `upsert: true`.
+The result carries counts, bytes and digests, never object paths or contents.
+
 ## Sessions
 
 Prefer atomic jobs. Use a session only when multiple interactive operations

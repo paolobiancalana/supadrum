@@ -11,9 +11,11 @@ import { BrokerError } from "./errors.js";
  * Supabase stack is the one place a developer legitimately reads and writes
  * freely; without it every local inspection has to go around the broker, which
  * is worse than allowing it through the broker's own audited path.
+ * `storage` is here for the same reason as `auth-admin`: its key is the
+ * service key `supabase status` prints for the running stack, not a stored one.
  * Deliberately excluded: anything that needs a stored credential (data-api,
- * storage, edge-functions, secrets, project-management) — a local stack has
- * none to resolve.
+ * edge-functions, secrets, project-management) — a local stack has none to
+ * resolve.
  */
 const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
   "migrations",
@@ -22,7 +24,8 @@ const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
   "adapter-tests",
   "pgtap",
   "stack",
-  "schema-inspection"
+  "schema-inspection",
+  "storage"
 ]);
 
 const VaultReferenceSchema = z
