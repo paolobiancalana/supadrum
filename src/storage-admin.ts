@@ -278,7 +278,7 @@ async function saveAll(context: StorageContext, storage: Client, dest: string, i
         const key = spelling.normalize("NFC").toUpperCase();
         const file = index === segments.length - 1;
         const previous = windowsTargets.get(key);
-        if (previous && (previous.spelling !== spelling || previous.file || file)) {
+        if (previous && (previous.spelling !== spelling || previous.file !== file)) {
           throw new Error("Storage names collide on Windows");
         }
         windowsTargets.set(key, { spelling, file });
