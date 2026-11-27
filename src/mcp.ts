@@ -26,6 +26,7 @@ import { BrokerError } from "./errors.js";
 import { resolveOperatorConfigPath } from "./projects.js";
 import { SqliteStore } from "./store.js";
 import { hasCompletedAdapterSetup, registeredAdapterTest } from "./local-adapter-tests.js";
+import { localSecretUpdate } from "./local-edge-payload.js";
 
 function publicJob(store: SqliteStore, id: string) {
   const job = store.getJob(id);
@@ -79,6 +80,23 @@ function assertAdapterTestRegistration(
   }
 }
 
+/** A malformed local secret update is refused at submission, not after the job queued for approval. */
+function assertLocalSecretUpdate(
+  config: SupadrumConfig,
+  projectName: string,
+  operation: string,
+  payload: Record<string, unknown>
+): void {
+  const project = config.projects[projectName];
+  if (operation !== "secrets.set" || project?.target !== "local") return;
+  try {
+    if (!project.local_runtime) throw new Error("not registered");
+    localSecretUpdate(payload, project.local_runtime.secrets);
+  } catch {
+    throw new BrokerError("invalid_input", "A local secret update must name every registered runtime secret, once each");
+  }
+}
+
 export type ConfigSource = SupadrumConfig | (() => SupadrumConfig);
 
 export function createHandlers(
@@ -117,6 +135,7 @@ export function createHandlers(
       const config = getConfig();
       assertProjectCapability(config, parsed.project, definition.capability);
       assertAdapterTestRegistration(config, store, parsed.project, parsed.operation, parsed.payload, parsed.repo_sha);
+      assertLocalSecretUpdate(config, parsed.project, parsed.operation, parsed.payload);
       let job = store.submit(parsed);
       if (job.requires_approval && job.approved_at === null) {
         job = store.transition(job.id, "waiting_approval");
@@ -189,6 +208,7 @@ export function createHandlers(
     }) {
       const session = store.getSession(input.session_id);
       assertAdapterTestRegistration(getConfig(), store, session.project, input.operation, input.payload, session.repo_sha);
+      assertLocalSecretUpdate(getConfig(), session.project, input.operation, input.payload);
       const job = store.submitSessionJob(input.session_id, input);
       return publicJob(store, job.id);
     },
@@ -254,8 +274,10 @@ async function callTool(run: () => unknown | Promise<unknown>) {
 
 export function createMcpServer(
   configSource: ConfigSource,
-  store: SqliteStore
+  store: SqliteStore,
+  portableToolNames = false
 ): McpServer {
+  const toolName = (name: string) => portableToolNames ? name.replaceAll(".", "_") : name;
   const handlers = createHandlers(configSource, store);
   const server = new McpServer({
     name: "supadrum",
@@ -263,7 +285,7 @@ export function createMcpServer(
   });
 
   server.registerTool(
-    "projects.list",
+    toolName("projects.list"),
     {
       description: "List configured projects without credential references",
       inputSchema: {}
@@ -271,7 +293,7 @@ export function createMcpServer(
     async () => callTool(() => handlers.projectsList())
   );
   server.registerTool(
-    "projects.inspect",
+    toolName("projects.inspect"),
     {
       description: "Inspect one redacted project chamber",
       inputSchema: { project: z.string().min(1) }
@@ -279,7 +301,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.projectsInspect(input))
   );
   server.registerTool(
-    "jobs.submit",
+    toolName("jobs.submit"),
     {
       description: "Submit one atomic Supabase operation",
       inputSchema: JobSubmissionSchema.shape
@@ -287,7 +309,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.jobsSubmit(input))
   );
   server.registerTool(
-    "jobs.wait",
+    toolName("jobs.wait"),
     {
       description: "Long-poll job events after a cursor",
       inputSchema: {
@@ -299,7 +321,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.jobsWait(input))
   );
   server.registerTool(
-    "jobs.status",
+    toolName("jobs.status"),
     {
       description: "Read current job status",
       inputSchema: { job_id: z.string().uuid() }
@@ -307,7 +329,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.jobsStatus(input))
   );
   server.registerTool(
-    "jobs.cancel",
+    toolName("jobs.cancel"),
     {
       description: "Cancel a job that has not started running",
       inputSchema: { job_id: z.string().uuid() }
@@ -315,7 +337,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.jobsCancel(input))
   );
   server.registerTool(
-    "sessions.open",
+    toolName("sessions.open"),
     {
       description: "Request a capability-scoped interactive lease",
       inputSchema: {
@@ -329,7 +351,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.sessionsOpen(input))
   );
   server.registerTool(
-    "sessions.exec",
+    toolName("sessions.exec"),
     {
       description: "Submit a structured operation inside an active lease",
       inputSchema: {
@@ -342,7 +364,7 @@ export function createMcpServer(
     async (input) => callTool(() => handlers.sessionsExec(input))
   );
   server.registerTool(
-    "sessions.close",
+    toolName("sessions.close"),
     {
       description: "Close a session and release its chamber",
       inputSchema: { session_id: z.string().uuid() }
@@ -405,7 +427,11 @@ export async function runMcp(
     undefined,
     config.approval_mode
   );
-  const server = createMcpServer(getConfig, store);
+  const server = createMcpServer(
+    getConfig,
+    store,
+    process.env.SUPADRUM_MCP_TOOL_NAMES === "portable"
+  );
   const transport = new StdioServerTransport();
   let storeClosed = false;
   const closeStore = () => {

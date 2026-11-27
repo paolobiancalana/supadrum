@@ -64,8 +64,8 @@ export interface VaultCliDependencies {
 }
 
 export class MissingVaultValueError extends Error {
-  constructor(reference: string) {
-    super(`Vault value is missing: ${reference}`);
+  constructor(reference?: string) {
+    super(reference ? `Vault value is missing: ${reference}` : "Vault value is missing");
     this.name = "MissingVaultValueError";
   }
 }
@@ -116,6 +116,7 @@ export const nodeProcessRunner: ProcessRunner = {
       child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
       child.on("error", reject);
+      child.stdin.on("error", reject);
       child.on("close", (code) => {
         resolve({
           exitCode: code ?? 1,
@@ -127,6 +128,42 @@ export const nodeProcessRunner: ProcessRunner = {
     });
   }
 };
+
+export class CommandVaultBackend implements VaultBackend {
+  constructor(
+    private readonly readCommand: readonly string[],
+    private readonly writeCommand?: readonly string[],
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+    private readonly runner: ProcessRunner = nodeProcessRunner
+  ) {}
+
+  async get(reference: string): Promise<string> {
+    const result = await this.runner.run({
+      argv: this.readCommand,
+      stdin: `${reference}\n`,
+      env: this.environment
+    }).catch(() => { throw new Error("Vault read failed"); });
+    if (result.exitCode === 44) throw new MissingVaultValueError();
+    const value = result.stdout.trim();
+    if (result.exitCode !== 0 || !value) {
+      throw new Error("Vault reference is not configured");
+    }
+    return value;
+  }
+
+  async put(reference: string, value: string): Promise<void> {
+    if (!this.writeCommand) throw new Error("Vault write command is not configured");
+    if (!value || value.trim() !== value) {
+      throw new Error("Vault value must be nonempty with no leading or trailing whitespace");
+    }
+    const result = await this.runner.run({
+      argv: this.writeCommand,
+      stdin: JSON.stringify({ reference, value }) + "\n",
+      env: this.environment
+    }).catch(() => { throw new Error("Vault write failed"); });
+    if (result.exitCode !== 0) throw new Error("Vault write failed");
+  }
+}
 
 export class MacOsKeychainBackend implements KeychainBackend {
   readonly #runner: ProcessRunner;
@@ -702,7 +739,14 @@ if (isEntrypoint(import.meta.url, entrypoint)) {
       stdout: (text) => process.stdout.write(text),
       stderr: (text) => process.stderr.write(text)
     },
-    { keychain: new MacOsKeychainBackend() }
+    {
+      get keychain() {
+        if (process.platform !== "darwin") {
+          throw new Error("This vault command requires macOS Keychain; configure an external vault_command");
+        }
+        return new MacOsKeychainBackend();
+      }
+    }
   )
     .then((code) => {
       process.exitCode = code;

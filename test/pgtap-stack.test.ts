@@ -13,7 +13,7 @@ import {
 const ok = (stdout = ""): CommandResult => ({ code: 0, stdout, stderr: "" });
 const failed: CommandResult = { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
 
-const id = "supadrum-tmp-presnap";
+const id = "supadrum-tmp-sampleapp";
 const label = `label=com.supabase.cli.project=${id}`;
 
 interface FakeObject {
@@ -79,36 +79,36 @@ function cacheWith(...directories: string[]): string {
 
 describe("disposable stack cleanup", () => {
   test.each([
-    "presnap",
+    "sampleapp",
     "supadrum-tmp-",
-    "supadrum-tmp-PreSnap",
+    "supadrum-tmp-Sampleapp",
     "supadrum-tmp-pre_snap",
     "supadrum-tmp-pre/snap",
-    "xsupadrum-tmp-presnap",
-    "supadrum-tmp-presnap\n"
+    "xsupadrum-tmp-sampleapp",
+    "supadrum-tmp-sampleapp\n"
   ])("refuses %j before any Docker call", async (unsafe) => {
-    const docker = fakeDocker(stack("presnap"));
+    const docker = fakeDocker(stack("sampleapp"));
     await expect(removeDisposableStack(unsafe, docker.execute, cacheWith()))
       .rejects.toThrow("not a disposable stack id");
     expect(docker.calls).toEqual([]);
   });
 
   test("leaves the cache directory of a refused id in place", async () => {
-    const cacheRoot = cacheWith("presnap");
-    await expect(removeDisposableStack("presnap", fakeDocker([]).execute, cacheRoot)).rejects.toThrow();
-    expect(existsSync(join(cacheRoot, "presnap"))).toBe(true);
+    const cacheRoot = cacheWith("sampleapp");
+    await expect(removeDisposableStack("sampleapp", fakeDocker([]).execute, cacheRoot)).rejects.toThrow();
+    expect(existsSync(join(cacheRoot, "sampleapp"))).toBe(true);
   });
 
   test("removes only the objects labelled with the exact id, and its directory", async () => {
-    const docker = fakeDocker([...stack("presnap"), ...stack(id)]);
-    const cacheRoot = cacheWith(id, "presnap");
+    const docker = fakeDocker([...stack("sampleapp"), ...stack(id)]);
+    const cacheRoot = cacheWith(id, "sampleapp");
 
     const residues = await removeDisposableStack(id, docker.execute, cacheRoot);
 
     expect(residues).toBe("");
-    expect(docker.remaining()).toEqual(stack("presnap"));
+    expect(docker.remaining()).toEqual(stack("sampleapp"));
     expect(existsSync(join(cacheRoot, id))).toBe(false);
-    expect(existsSync(join(cacheRoot, "presnap"))).toBe(true);
+    expect(existsSync(join(cacheRoot, "sampleapp"))).toBe(true);
   });
 
   test("never selects by name: an unlabelled object named after the id stays and is reported", async () => {
@@ -154,7 +154,7 @@ describe("disposable stack network", () => {
 
   test("refuses a non-disposable id before any Docker call", async () => {
     const docker = fakeDocker([]);
-    await expect(createDisposableNetwork("presnap", docker.execute))
+    await expect(createDisposableNetwork("sampleapp", docker.execute))
       .rejects.toThrow("not a disposable stack id");
     expect(docker.calls).toEqual([]);
   });

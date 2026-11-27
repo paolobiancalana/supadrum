@@ -7,16 +7,21 @@ import type {
   SupadrumConfig
 } from "./config.js";
 import type { ExecutionResult, Job } from "./domain.js";
+import { resolveNativeExecutable } from "./command-resolution.js";
+import { CommandVaultBackend } from "./vault-cli.js";
 import {
   LiveSupabaseExecutor,
   resolveExecutable
 } from "./live-executor.js";
+import { resolveNodeCommand } from "./command-resolution.js";
 import {
   MissingCredentialsError,
   type CredentialProvider,
   type Executor,
   type ResolvedCredentials
 } from "./runner.js";
+
+export { resolveExecutable } from "./command-resolution.js";
 
 interface ProcessResult {
   readonly exitCode: number;
@@ -113,11 +118,11 @@ export class ProjectModeCredentialProvider implements CredentialProvider {
 }
 
 export class VaultCommandCredentialProvider implements CredentialProvider {
-  readonly #command: readonly string[];
+  readonly #vault: CommandVaultBackend;
 
   constructor(command: readonly string[]) {
     if (command.length === 0) throw new Error("Vault command cannot be empty");
-    this.#command = command;
+    this.#vault = new CommandVaultBackend(command);
   }
 
   async resolve(
@@ -140,15 +145,7 @@ export class VaultCommandCredentialProvider implements CredentialProvider {
   }
 
   async resolveReference(reference: string): Promise<string> {
-    const result = await runProcess(this.#command, {
-      env: process.env,
-      stdin: `${reference}\n`
-    });
-    const value = result.stdout.trim();
-    if (result.exitCode !== 0 || value.length === 0) {
-      throw new Error("Vault reference is not configured");
-    }
-    return value;
+    return this.#vault.get(reference);
   }
 }
 
@@ -445,12 +442,18 @@ export function createRuntime(config: SupadrumConfig): {
   const liveExecutor = new LiveSupabaseExecutor({
     pgtap: config.pgtap,
     executables: {
-      git: hasLiveProject ? resolveExecutable("git") : "git",
+      git: hasLiveProject ? resolveNativeExecutable("git") : "git",
       supabase: hasLiveProject
-        ? resolveExecutable("supabase")
+        ? resolveNativeExecutable("supabase")
         : "supabase",
-      psql: hasLiveProject ? resolveExecutable("psql") : "psql"
+      psql: hasLiveProject ? resolveNativeExecutable("psql") : "psql",
+      ...(Object.values(config.projects).some((project) =>
+        project.capabilities.includes("adapter-tests")
+      ) ? { npm: resolveNodeCommand("npm").argv } : {})
     },
+    ...(config.vault_command && config.vault_write_command
+      ? { passwordVault: new CommandVaultBackend(config.vault_command, config.vault_write_command) }
+      : {}),
     ...(liveCredentials
       ? {
           resolveReference: (reference: string) =>

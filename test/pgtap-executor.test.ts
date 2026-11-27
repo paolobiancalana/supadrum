@@ -62,9 +62,10 @@ class PgtapProcess implements LiveProcess {
     if (command === "git") {
       if (argv[3] === "cat-file") return { stdout: "tree\n" };
       if (argv[3] === "rev-list") return { stdout: `${TREE}\n` };
+      if (argv.includes("archive")) return {};
       return { exitCode: 1, stderr: `unexpected git ${argv[3]}` };
     }
-    if (command === "bash") {
+    if (command === "tar") {
       const destination = String(argv.at(-1));
       for (const [path, content] of Object.entries(this.files)) {
         mkdirSync(dirname(join(destination, path)), { recursive: true });
@@ -200,7 +201,11 @@ describe("pgtap.run in the live executor", () => {
     expect(network).toBeGreaterThan(lastCleanupBefore);
     expect(argv.findIndex(isCreation)).toBe(network);
     // The tree is read by object only, never through the checkout.
-    expect(argv.filter((args) => args[0] === "git").map((args) => args[3])).toEqual(["cat-file", "rev-list"]);
+    const gitCalls = argv.filter((args) => args[0] === "git");
+    expect(gitCalls.slice(0, 2).map((args) => args[3])).toEqual(["cat-file", "rev-list"]);
+    expect(gitCalls).toHaveLength(3);
+    expect(gitCalls[2]).toContain("archive");
+    expect(gitCalls[2]?.at(-1)).toBe(TREE);
     expect(argv.some((args) => args.includes("--db-url") || args.includes("--linked") || args.includes("--project-ref"))).toBe(false);
     // Cleanup-after ran and removed the folder.
     expect(argv.slice(start).some(isCleanupListing)).toBe(true);
@@ -299,7 +304,7 @@ describe("pgtap.run in the live executor", () => {
   test.each<[string, PgtapReason, Override, Record<string, string>?]>([
     ["a commit instead of a tree", "tree_invalid", (argv) => argv[3] === "cat-file" ? { stdout: "commit\n" } : undefined],
     ["missing objects", "tree_incomplete", (argv) => argv[3] === "rev-list" ? { exitCode: 128 } : undefined],
-    ["a failed extraction", "extraction_failed", (argv) => argv[0] === "bash" ? { exitCode: 2 } : undefined],
+    ["a failed extraction", "extraction_failed", (argv) => argv[0] === "tar" ? { exitCode: 2 } : undefined],
     ["Docker down", "docker_unreachable", (argv) => is(argv, "docker", "info") ? { exitCode: 1 } : undefined],
     ["no Supabase CLI", "supabase_cli_missing", (argv) => is(argv, "supabase", "--version") ? { exitCode: 127 } : undefined],
     ["an old Supabase CLI", "supabase_cli_too_old", (argv) => is(argv, "supabase", "--version") ? { stdout: "2.115.9\n" } : undefined],
@@ -364,7 +369,7 @@ describe("pgtap.run in the live executor", () => {
 
       const argv = process.calls.map((call) => call.argv);
       expect(argv.some(isCreation)).toBe(false);
-      expect(argv.some((args) => args[0] === "bash")).toBe(false);
+      expect(argv.some((args) => args.includes("archive") || args[0] === "tar")).toBe(false);
     }
   });
 
@@ -413,7 +418,7 @@ describe("pgtap.run in the live executor", () => {
     const target = join(mkdtempSync(join(tmpdir(), "supadrum-pgtap-target-")), "victim.toml");
     writeFileSync(target, "untouched\n");
     const { process, run } = setup((argv) => {
-      if (argv[0] !== "bash") return undefined;
+      if (argv[0] !== "tar") return undefined;
       const destination = String(argv.at(-1));
       mkdirSync(join(destination, "supabase", "tests"), { recursive: true });
       symlinkSync(target, join(destination, "supabase", "config.toml"));

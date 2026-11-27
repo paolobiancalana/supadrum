@@ -52,7 +52,7 @@ describe("local Vite environment", () => {
 [api]
 port = 54321
 [auth]
-external_url = "https://dev.presnap.co/supabase"
+external_url = "https://dev.sampleapp.co/supabase"
 [storage]
 enabled = true
 `);
@@ -62,7 +62,7 @@ enabled = true
     writeLocalViteEnvironment(repository, 'ANON_KEY="local-public-key"\n');
 
     expect(readFileSync(join(repository, ".env.development.local"), "utf8"))
-      .toBe("UNCHANGED=yes\nVITE_SUPABASE_URL=https://dev.presnap.co/supabase\n" +
+      .toBe("UNCHANGED=yes\nVITE_SUPABASE_URL=https://dev.sampleapp.co/supabase\n" +
         "VITE_SUPABASE_ANON_KEY=local-public-key\n");
   });
 });

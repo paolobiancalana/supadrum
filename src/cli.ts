@@ -64,8 +64,8 @@ import { Runner } from "./runner.js";
 import { readMaskedSecret } from "./secret-prompt.js";
 import { SqliteStore } from "./store.js";
 import {
-  MacOsKeychainBackend,
-  nodeProcessRunner
+  CommandVaultBackend,
+  MacOsKeychainBackend
 } from "./vault-cli.js";
 import type { VaultBackend } from "./vault.js";
 
@@ -171,7 +171,12 @@ const processRuntime: CliRuntime = {
   promptSecret: {
     read: (label) => readMaskedSecret(label)
   },
-  keychain: () => new MacOsKeychainBackend(),
+  keychain: () => {
+    if (process.platform !== "darwin") {
+      throw new Error("macOS Keychain is unavailable; configure vault_command and vault_write_command");
+    }
+    return new MacOsKeychainBackend();
+  },
   startLocalStack: (repository, supabaseDir) =>
     startLocalStack(repository, undefined, supabaseDir)
 };
@@ -330,16 +335,13 @@ async function probeConfiguredCredentials(
   config: SupadrumConfig,
   environment: NodeJS.ProcessEnv = process.env
 ) {
+  const vault = config.vault_command
+    ? new CommandVaultBackend(config.vault_command, undefined, environment)
+    : undefined;
   return doctorProject(name, config, async (credential, reference) => {
-    if (!config.vault_command) return false;
+    if (!vault) return false;
     try {
-      const result = await nodeProcessRunner.run({
-        argv: config.vault_command,
-        stdin: `${reference}\n`,
-        env: environment
-      });
-      const value = result.stdout.trim();
-      if (result.exitCode !== 0 || value.length === 0) return false;
+      const value = await vault.get(reference);
       if (credential === "database_access") {
         try {
           databasePassword(value);
@@ -893,15 +895,18 @@ export async function runCli(
     if (!project) {
       throw new Error(`Unknown project: ${alias}`);
     }
-    if (!isBundledKeychainCommand(config.vault_command)) {
+    const externalVault = config.vault_command && config.vault_write_command
+      ? new CommandVaultBackend(config.vault_command, config.vault_write_command, runtime.environment)
+      : undefined;
+    if (!externalVault && !isBundledKeychainCommand(config.vault_command)) {
       throw new Error(
-        "Configured vault backend does not support interactive writes"
+        "Configured vault backend does not support interactive writes; configure vault_command and vault_write_command"
       );
     }
 
-    const keychain = runtime.keychain();
+    const vault = externalVault ?? runtime.keychain();
     io.stdout(`Supadrum credentials — ${alias}\n\n`);
-    io.stdout(formatCredentialSecurityNotice());
+    io.stdout(formatCredentialSecurityNotice(Boolean(externalVault)));
     const credentialGuides: Readonly<Record<string, () => string>> = {
       "Secret key": () =>
         formatSecretKeyGuide(alias, project.project_ref),
@@ -913,7 +918,7 @@ export async function runCli(
     await setupProjectCredentials({
       project: alias,
       config,
-      vault: keychain,
+      vault,
       ...(option(args, "--replace")
         ? {
             replace: [
@@ -939,7 +944,7 @@ export async function runCli(
     // still worth reporting is whether the repository and project ref check
     // out, which doctorProject decides on its own.
     const doctor = await doctorProject(alias, config, async () => true);
-    io.stdout(formatCredentialSetup(alias, doctor.ready));
+    io.stdout(formatCredentialSetup(alias, doctor.ready, Boolean(externalVault)));
     return 0;
   }
   if (command === "project" && args[1] === "doctor") {

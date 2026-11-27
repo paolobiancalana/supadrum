@@ -17,6 +17,7 @@ const LIST_PAGE = 1000;
 const REQUEST_TIMEOUT_MS = 300_000;
 /** Files `storage.admin` writes at the top of `dest`; no bucket may take their place. */
 const RESERVED = new Set(["MANIFEST", "LIST"]);
+const WINDOWS_DEVICE = /^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³])$/i;
 const MAX_PATH = 1024;
 /** Room left on the disk after a download, so the job never fills it to the last byte. */
 const DISK_MARGIN = 256 * 1024 * 1024;
@@ -53,6 +54,16 @@ const encodePath = (path: string) => path.split("/").map(encodeURIComponent).joi
 /** The filesystem here is case-insensitive: `.GIT` is the same folder as `.git`. */
 const isGit = (segment: string) => segment.toLowerCase() === ".git";
 
+function assertWindowsExportSegments(segments: readonly string[]): void {
+  if (segments.some((segment) =>
+    !safeSegment(segment) || segment.length > 255 ||
+    /[<>:"\\|?*]|[. ]$|~[0-9]+(?:\.|$)/.test(segment) ||
+    WINDOWS_DEVICE.test(segment.split(".", 1)[0]!.trimEnd())
+  )) {
+    throw new Error("Storage path contains a name unsafe for Windows export");
+  }
+}
+
 /**
  * Where an object lands under `dest`: bucket, then its path, every segment
  * plain. A name with `..`, an absolute path or an empty part never leaves
@@ -63,6 +74,7 @@ export function localTarget(dest: string, bucket: string, object: string): strin
   if (!segments.every(safeSegment) || segments.some(isGit) || RESERVED.has(bucket.toUpperCase())) {
     throw new Error("Storage name cannot be written under dest");
   }
+  if (process.platform === "win32") assertWindowsExportSegments(segments);
   return join(dest, ...segments);
 }
 
@@ -181,18 +193,23 @@ async function fetchObject(storage: Client, item: Item, cap: number): Promise<Bu
  * any depth, nor a symbolic link on the way: each could point the job at a
  * file outside the repository or inside git's own config.
  */
-function plainSegments(context: StorageContext, absolute: string, what: string): string[] {
+function plainSegments(context: StorageContext, absolute: string, what: string, windowsExport = false): string[] {
   const root = resolve(context.repository);
   const segments = relative(root, absolute).split(sep);
   if (segments[0] === "" || segments.some(isGit)) {
     throw new Error(`${what} must be inside the repository, not its root or .git`);
   }
+  if (windowsExport) assertWindowsExportSegments(segments);
   let walked = root;
   for (const segment of segments) {
-    walked = join(walked, segment);
-    const stat = lstatSync(walked, { throwIfNoEntry: false });
+    const next = join(walked, segment);
+    const stat = lstatSync(next, { throwIfNoEntry: false });
     if (!stat) break;
     if (stat.isSymbolicLink()) throw new Error(`${what} must not pass through a symbolic link`);
+    if (windowsExport && !readdirSync(walked).includes(segment)) {
+      throw new Error("Storage path uses an existing Windows filesystem alias");
+    }
+    walked = next;
   }
   return segments;
 }
@@ -206,7 +223,7 @@ function plainSegments(context: StorageContext, absolute: string, what: string):
  */
 async function guardDest(context: StorageContext, requested: string, probe: string): Promise<string> {
   const absolute = context.repositoryPath(requested, "Storage dest");
-  const segments = plainSegments(context, absolute, "Storage dest");
+  const segments = plainSegments(context, absolute, "Storage dest", process.platform === "win32");
   const stat = lstatSync(absolute, { throwIfNoEntry: false });
   if (stat && (!stat.isDirectory() || readdirSync(absolute).length > 0)) {
     throw new Error("Storage dest must be an empty folder or not exist yet");
@@ -222,10 +239,12 @@ async function guardDest(context: StorageContext, requested: string, probe: stri
  * under `dest`: a folder swapped for a symbolic link while the job runs is
  * caught here. A collision or a full disk says nothing about the name.
  */
-function writeNew(dest: string, path: string, data: string | Uint8Array): void {
+function writeNew(context: StorageContext, dest: string, path: string, data: string | Uint8Array): void {
   try {
+    if (process.platform === "win32") plainSegments(context, path, "Storage file", true);
     mkdirSync(dirname(path), { recursive: true });
     // ponytail: check then write leaves a window a same-user process could still race; openat-style walks if that matters.
+    if (process.platform === "win32") plainSegments(context, path, "Storage file", true);
     const root = realpathSync(dest);
     const parent = realpathSync(dirname(path));
     if (parent !== root && !parent.startsWith(root + sep)) throw new Error("outside dest");
@@ -246,23 +265,44 @@ async function ignored(context: StorageContext, absolute: string): Promise<boole
  */
 async function saveAll(context: StorageContext, storage: Client, dest: string, items: readonly Item[]) {
   const sorted = [...items].sort(byPath);
+  const windowsTargets = process.platform === "win32"
+    ? new Map<string, { spelling: string; file: boolean }>()
+    : undefined;
+  const targets = sorted.map((item) => {
+    const path = localTarget(dest, item.bucket, item.path);
+    if (windowsTargets) {
+      const segments = [item.bucket, ...item.path.split("/")];
+      let spelling = "";
+      for (const [index, segment] of segments.entries()) {
+        spelling += "/" + segment;
+        const key = spelling.normalize("NFC").toUpperCase();
+        const file = index === segments.length - 1;
+        const previous = windowsTargets.get(key);
+        if (previous && (previous.spelling !== spelling || previous.file || file)) {
+          throw new Error("Storage names collide on Windows");
+        }
+        windowsTargets.set(key, { spelling, file });
+      }
+    }
+    return { item, path };
+  });
   // ponytail: one git process per object; `check-ignore --stdin` when buckets hold thousands.
-  for (const item of sorted) {
-    if (!(await ignored(context, localTarget(dest, item.bucket, item.path)))) {
+  for (const { path } of targets) {
+    if (!(await ignored(context, path))) {
       throw new Error("Storage dest is not covered by .gitignore (git check-ignore)");
     }
   }
   let bytes = 0;
   const lines: string[] = [];
-  for (const item of sorted) {
+  for (const { item, path } of targets) {
     // A delete has no listed size: what is left on the disk bounds the body instead.
     const data = await fetchObject(storage, item, context.freeBytes(context.repository) - DISK_MARGIN);
-    writeNew(dest, localTarget(dest, item.bucket, item.path), data);
+    writeNew(context, dest, path, data);
     bytes += data.length;
     lines.push(`${sha256(data)}\t${data.length}\t${full(item)}\n`);
   }
   const manifest = lines.join("");
-  writeNew(dest, join(dest, "MANIFEST"), manifest);
+  writeNew(context, dest, join(dest, "MANIFEST"), manifest);
   return { objects: sorted.length, bytes, manifest_sha256: sha256(manifest), manifest_bytes: Buffer.byteLength(manifest) };
 }
 
@@ -280,7 +320,7 @@ async function list(context: StorageContext, storage: Client, dest: string | und
   const output: Record<string, unknown> = { action: "list", buckets, objects: all.length, bytes: sum(all) };
   if (target !== undefined) {
     const text = [...all].sort(byPath).map((entry) => `${full(entry)}\t${entry.bytes}\t${entry.updated}\n`).join("");
-    writeNew(target, join(target, "LIST"), text);
+    writeNew(context, target, join(target, "LIST"), text);
     output.list_sha256 = sha256(text);
     output.list_bytes = Buffer.byteLength(text);
   }

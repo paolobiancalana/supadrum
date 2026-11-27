@@ -78,35 +78,43 @@ export function formatProjectDoctor(
 
 export function formatCredentialSetup(
   project: string,
-  ready: boolean
+  ready: boolean,
+  externalVault = false
 ): string {
   return [
     "",
-    "✓ Credential bundle saved in macOS Keychain",
+    externalVault
+      ? "✓ Credential bundle saved in the configured vault"
+      : "✓ Credential bundle saved in macOS Keychain",
     ready ? "✓ Project ready" : "○ Project not ready",
     ...(ready ? [] : [`  supadrum project doctor ${project}`]),
     ""
   ].join("\n");
 }
 
-export function formatCredentialSecurityNotice(): string {
+export function formatCredentialSecurityNotice(externalVault = false): string {
   return [
     "Security",
     "",
     "  Supadrum is local and open source. It does not send secret values",
     "  to its maintainers or a hosted Supadrum service, and never places",
     "  them in MCP messages or LLM prompts.",
-    "  The masked CLI writes them to macOS Keychain, encrypted at rest",
-    "  under operating-system access controls.",
+    ...(externalVault
+      ? ["  The masked CLI sends them to the operator-configured vault over stdin."]
+      : ["  The masked CLI writes them to macOS Keychain, encrypted at rest",
+         "  under operating-system access controls."]),
     "",
     "  Secret values never enter jobs, the queue, config, the repository,",
     "  argv, shell history or CLI output. The broker resolves them only",
     "  in local process memory for operator-authorized command execution.",
     "",
-    "  This reduces accidental exposure compared with plaintext .env files.",
-    "  It is not a sandbox: a process with unrestricted shell access running",
-    "  as your macOS user shares that user's security boundary. Use a dedicated",
-    "  runner identity or policy-enforcing vault for hard agent isolation.",
+    ...(externalVault
+      ? ["  The vault command controls storage and access. Use an independently",
+         "  enforced vault policy or a dedicated runner identity for isolation."]
+      : ["  This reduces accidental exposure compared with plaintext .env files.",
+         "  It is not a sandbox: a process with unrestricted shell access running",
+         "  as your macOS user shares that user's security boundary. Use a dedicated",
+         "  runner identity or policy-enforcing vault for hard agent isolation."]),
     ""
   ].join("\n");
 }

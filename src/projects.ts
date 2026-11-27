@@ -392,7 +392,7 @@ function atomicWriteConfig(path: string, document: Document): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporaryPath = join(
     dirname(path),
-    `.${path.split("/").at(-1)}.supadrum-${randomUUID()}`
+    `.${basename(path)}.supadrum-${randomUUID()}`
   );
   let created = false;
   try {

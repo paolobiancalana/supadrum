@@ -14,7 +14,7 @@ import { BrokerError } from "./errors.js";
  * `storage` is here for the same reason as `auth-admin`: its key is the
  * service key `supabase status` prints for the running stack, not a stored one.
  * Deliberately excluded: anything that needs a stored credential (data-api,
- * edge-functions, secrets, project-management) — a local stack has none to
+ * project-management) — a local stack has none to
  * resolve.
  */
 const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
@@ -25,7 +25,9 @@ const LOCAL_CAPABILITIES: ReadonlySet<string> = new Set([
   "pgtap",
   "stack",
   "schema-inspection",
-  "storage"
+  "storage",
+  "edge-functions",
+  "secrets"
 ]);
 
 const VaultReferenceSchema = z
@@ -191,9 +193,29 @@ const PgtapBrokerSchema = z.object({
   min_free_gib: z.number().positive().default(5)
 }).strict();
 
+/**
+ * The committed SQL that schedules a stack's workers, and whether a stack start activates them. The scripts
+ * create their jobs active; activation stops them in the same session and starts them only after verifying.
+ */
+const LocalWorkersSchema = z.object({
+  schedule_sql: z.array(RepositoryPathSchema).min(1).refine(paths => new Set(paths).size === paths.length),
+  autostart: z.boolean().default(false)
+}).strict();
+
 const LocalChamberSchema = z
   .object({
     target: z.literal("local"),
+    managed_secrets: z.record(z.string().regex(/^(?!SUPABASE_)[A-Z][A-Z0-9_]*$/), VaultReferenceSchema).optional(),
+    local_worker_jobs: z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,63}$/)).min(1)
+      .refine(names => new Set(names).size === names.length).optional(),
+    local_runtime: z.object({ secrets: z.array(z.string().regex(/^(?!SUPABASE_)[A-Z][A-Z0-9_]*$/)).min(1)
+      .refine(names => new Set(names).size === names.length), probe: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/),
+      network: z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/).optional(),
+      workers: LocalWorkersSchema.optional() }).strict().optional(),
+    local_functions: z.record(z.string().regex(/^[a-zA-Z0-9_-]+$/), z.discriminatedUnion("identity", [
+      z.object({ identity: z.literal("anon") }).strict(),
+      z.object({ identity: z.literal("account"), account: z.string().regex(/^[a-z][a-z0-9_]*$/) }).strict()
+    ])).optional(),
     auth_password_accounts: z.record(
       z.string().regex(/^[a-z][a-z0-9_]*$/),
       z.object({
@@ -244,10 +266,14 @@ const ConfigSchema = z.object({
   executor: z.enum(["dry-run", "command"]).default("dry-run"),
   approval_mode: z.enum(["automatic", "manual"]).default("automatic"),
   vault_command: z.array(z.string().min(1)).min(1).optional(),
+  vault_write_command: z.array(z.string().min(1)).min(1).optional(),
   chambers: z.record(z.string().min(1), ChamberSchema).default({}),
   projects: z.record(z.string().min(1), InputProjectSchema),
   // prefault, not default: the empty block must still pick up its inner defaults.
   pgtap: PgtapBrokerSchema.prefault({})
+}).refine((config) => !config.vault_write_command || Boolean(config.vault_command), {
+  path: ["vault_write_command"],
+  message: "vault_write_command requires vault_command for write verification"
 });
 
 export type CredentialBundle = z.infer<typeof CredentialBundleSchema>;
@@ -267,6 +293,10 @@ export interface ChamberConfig {
   readonly deploy_target?: DeployTarget | undefined;
   readonly credentials: CredentialBundle;
   readonly managed_secrets?: Record<string, string>;
+  readonly local_functions?: Record<string, { identity: "anon" } | { identity: "account"; account: string }>;
+  readonly local_worker_jobs?: string[];
+  readonly local_runtime?: { secrets: string[]; probe: string; network?: string | undefined;
+    workers?: { schedule_sql: string[]; autostart: boolean } | undefined };
   readonly adapter_tests?: Record<string, AdapterTestConfig>;
   readonly auth_password_accounts?: Record<string, LocalPasswordAccount>;
   readonly database_logins?: Record<string, DatabaseLogin>;
@@ -299,6 +329,7 @@ export interface SupadrumConfig {
   readonly executor: "dry-run" | "command";
   readonly approval_mode: "automatic" | "manual";
   readonly vault_command?: string[];
+  readonly vault_write_command?: string[];
   readonly chambers: Record<string, ChamberConfig>;
   readonly projects: Record<string, ProjectConfig>;
   readonly pgtap: PgtapBrokerConfig;
@@ -333,9 +364,10 @@ export function loadConfig(path: string): SupadrumConfig {
   const parsed = ConfigSchema.parse(parse(readFileSync(absolutePath, "utf8")));
   const credentialRefs = new Set<string>();
   for (const chamber of Object.values(parsed.chambers)) {
-    if (chamber.target !== "remote") continue;
-    Object.values(chamber.credentials).forEach((ref) => { if (ref) credentialRefs.add(ref); });
-    Object.values(chamber.managed_secrets).forEach((ref) => credentialRefs.add(ref));
+    if (chamber.target === "remote") {
+      Object.values(chamber.credentials).forEach((ref) => { if (ref) credentialRefs.add(ref); });
+    }
+    Object.values(chamber.managed_secrets ?? {}).forEach((ref) => credentialRefs.add(ref));
   }
   for (const project of Object.values(parsed.projects)) {
     if (!project.credentials) continue;
@@ -407,12 +439,38 @@ export function loadConfig(path: string): SupadrumConfig {
     }
   }
   const baseDirectory = dirname(absolutePath);
+  for (const chamber of Object.values(parsed.chambers)) {
+    if (chamber.target !== "local") continue;
+    for (const entry of Object.values(chamber.local_functions ?? {})) {
+      if (entry.identity === "account" && !Object.hasOwn(chamber.auth_password_accounts ?? {}, entry.account)) {
+        throw new Error("Local function account is not registered");
+      }
+    }
+    // A restart that cannot resolve a secret or invoke its probe would stop the stack and then fail.
+    const runtime = chamber.local_runtime;
+    if (runtime) {
+      if (runtime.secrets.some(name => !Object.hasOwn(chamber.managed_secrets ?? {}, name))) {
+        throw new Error("Local runtime secret is not a managed secret");
+      }
+      if (!Object.hasOwn(chamber.local_functions ?? {}, runtime.probe)) {
+        throw new Error("Local runtime probe is not a registered local function");
+      }
+      // Activation schedules and enables the registered jobs; without names it would stop nothing.
+      if (runtime.workers && !chamber.local_worker_jobs) {
+        throw new Error("Local runtime workers need local_worker_jobs");
+      }
+    }
+  }
   const chambers: Record<string, ChamberConfig> = Object.fromEntries(
     Object.entries(parsed.chambers).map(([name, chamber]) => [
       name,
       chamber.target === "local"
         ? {
             target: "local",
+            ...(chamber.managed_secrets ? { managed_secrets: chamber.managed_secrets } : {}),
+            ...(chamber.local_worker_jobs ? { local_worker_jobs: chamber.local_worker_jobs } : {}),
+            ...(chamber.local_runtime ? { local_runtime: chamber.local_runtime } : {}),
+            ...(chamber.local_functions ? { local_functions: chamber.local_functions } : {}),
             ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
             ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
             ...(chamber.database_logins ? { database_logins: chamber.database_logins } : {}),
@@ -487,6 +545,9 @@ export function loadConfig(path: string): SupadrumConfig {
         ? { deploy_target: chamber.deploy_target }
         : {}),
       credentials: chamber.credentials,
+      ...(chamber.local_worker_jobs ? { local_worker_jobs: chamber.local_worker_jobs } : {}),
+      ...(chamber.local_runtime ? { local_runtime: chamber.local_runtime } : {}),
+      ...(chamber.local_functions ? { local_functions: chamber.local_functions } : {}),
       managed_secrets: chamber.managed_secrets ?? {},
       ...(chamber.adapter_tests ? { adapter_tests: chamber.adapter_tests } : {}),
       ...(chamber.auth_password_accounts ? { auth_password_accounts: chamber.auth_password_accounts } : {}),
@@ -556,6 +617,9 @@ export function loadConfig(path: string): SupadrumConfig {
     approval_mode: parsed.approval_mode,
     ...(vaultCommand
       ? { vault_command: vaultCommand }
+      : {}),
+    ...(parsed.vault_write_command
+      ? { vault_write_command: parsed.vault_write_command }
       : {}),
     projects,
     chambers,

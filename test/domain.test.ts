@@ -426,29 +426,29 @@ projects:
       writeConfig(`
 version: 1
 chambers:
-  materic-local:
+  exampleapp-local:
     target: local
 projects:
-  materic-ai-local:
-    repo: /tmp/materic.ai
-    chamber: materic-local
+  exampleapp-ai-local:
+    repo: /tmp/exampleapp.ai
+    chamber: exampleapp-local
     mode: live
     migrations: owner
     capabilities: [migrations]
 `)
     );
 
-    expect(config.projects["materic-ai-local"]).toMatchObject({
+    expect(config.projects["exampleapp-ai-local"]).toMatchObject({
       target: "local",
-      chamber: "materic-local",
+      chamber: "exampleapp-local",
       mode: "live",
       migrations: "owner"
     });
-    expect(inspectProject("materic-ai-local", config)).toEqual({
-      name: "materic-ai-local",
-      repo: "/tmp/materic.ai",
+    expect(inspectProject("exampleapp-ai-local", config)).toEqual({
+      name: "exampleapp-ai-local",
+      repo: "/tmp/exampleapp.ai",
       target: "local",
-      chamber: "materic-local",
+      chamber: "exampleapp-local",
       mode: "live",
       migrations: "owner",
       migration_driver: "supabase",
@@ -463,19 +463,19 @@ projects:
       writeConfig(`
 version: 1
 chambers:
-  materic-local:
+  exampleapp-local:
     target: local
 projects:
-  materic-ai-local:
-    repo: /tmp/materic.ai
-    chamber: materic-local
+  exampleapp-ai-local:
+    repo: /tmp/exampleapp.ai
+    chamber: exampleapp-local
     mode: live
     migrations: owner
     capabilities: [migrations, auth-admin]
 `)
     );
 
-    expect(inspectProject("materic-ai-local", config)).toMatchObject({
+    expect(inspectProject("exampleapp-ai-local", config)).toMatchObject({
       target: "local",
       capabilities: ["migrations", "auth-admin"],
       credentials: []

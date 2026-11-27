@@ -12,6 +12,7 @@ import { join } from "node:path";
 
 import {
   AGE_IDENTITY_REFERENCE,
+  CommandVaultBackend,
   MacOsKeychainBackend,
   MissingVaultValueError,
   SopsAgeBackend,
@@ -43,6 +44,74 @@ class RecordingRunner implements ProcessRunner {
     );
   }
 }
+
+test("writes to an operator command on stdin and keeps helper output private", async () => {
+  const runner = new RecordingRunner();
+  const reference = "vault://fixtures/project/value";
+  const value = "synthetic\nvalue with quotes \"";
+  const read = ["read-fixture", "--profile", "test"];
+  const write = ["write-fixture", "--profile", "test"];
+  const vault = new CommandVaultBackend(read, write, {}, runner);
+  runner.outcomes.push(
+    { exitCode: 44, stdout: "", stderr: "" },
+    { exitCode: 0, stdout: value, stderr: "" },
+    { exitCode: 0, stdout: value, stderr: "" },
+    { exitCode: 1, stdout: value, stderr: value }
+  );
+
+  const readOnly = new CommandVaultBackend(read, undefined, {}, runner);
+  await expect(readOnly.put(reference, value)).rejects.toThrow(/^Vault write command is not configured$/);
+  await expect(vault.put(reference, " " + value)).rejects.toThrow(/no leading or trailing whitespace/);
+  await expect(vault.get(reference)).rejects.toThrow(MissingVaultValueError);
+  await vault.put(reference, value);
+  await expect(vault.get(reference)).resolves.toBe(value);
+  await expect(vault.put(reference, value)).rejects.toThrow(/^Vault write failed$/);
+  expect(runner.invocations).toEqual([
+    { argv: read, stdin: reference + "\n", env: {} },
+    { argv: write, stdin: JSON.stringify({ reference, value }) + "\n", env: {} },
+    { argv: read, stdin: reference + "\n", env: {} },
+    { argv: write, stdin: JSON.stringify({ reference, value }) + "\n", env: {} }
+  ]);
+});
+
+test("resolves a write through real shell-free fixture helpers in a path with spaces", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "supadrum vault fixture "));
+  const helper = join(directory, "vault fixture.cjs");
+  const marker = join(directory, "written");
+  const reference = "vault://fixtures/project/value";
+  const value = "synthetic-value";
+  try {
+    await writeFile(helper, `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const [mode, marker] = process.argv.slice(2);
+      assert.equal(process.argv.length, 4);
+      const stdin = fs.readFileSync(0, "utf8");
+      const valueFor = (reference) => "synthetic-" + reference.split("/").at(-1);
+      if (mode === "write") {
+        const { reference, value } = JSON.parse(stdin);
+        assert.equal(value, valueFor(reference));
+        fs.writeFileSync(marker, "ok");
+        process.stderr.write(value);
+      } else if (fs.existsSync(marker)) {
+        process.stdout.write(valueFor(stdin.trim()));
+      } else {
+        process.exitCode = 44;
+      }
+    `);
+    const vault = new CommandVaultBackend(
+      [process.execPath, helper, "read", marker],
+      [process.execPath, helper, "write", marker],
+      {}
+    );
+    await expect(vault.get(reference)).rejects.toThrow(/^Vault value is missing$/);
+    await expect(vault.put(reference, value)).resolves.toBeUndefined();
+    await expect(vault.get(reference)).resolves.toBe(value);
+    expect(await readFile(marker, "utf8")).toBe("ok");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 class MemoryBackend implements VaultBackend {
   readonly values = new Map<string, string>();

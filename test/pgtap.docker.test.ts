@@ -289,10 +289,10 @@ describe.skipIf(!process.env.SUPADRUM_DOCKER_TESTS)("pgtap.run on a real Docker"
   });
 
   // The cleanup of #44 against a neighbour it must not touch. The spec says "objects labelled
-  // presnap next to supadrum-tmp-presnap", but a stack started by hand under that very project id
+  // sampleapp next to supadrum-tmp-sampleapp", but a stack started by hand under that very project id
   // is running on the machine this is meant to be run on, and a broken cleanup is exactly what
   // this test must be able to catch. So the neighbour is made up: pgtapnb, whose id is, like
-  // presnap's, the tail of the disposable id supadrum-tmp-pgtapnb. That is the shape that fools a
+  // sampleapp's, the tail of the disposable id supadrum-tmp-pgtapnb. That is the shape that fools a
   // filter by name or by "contains", and it cannot match anything of a real project.
   test("cleaning a disposable stack removes it and leaves the stack whose id ends its own", async () => {
     const neighbour = "pgtapnb";

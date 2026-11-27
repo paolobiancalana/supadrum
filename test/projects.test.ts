@@ -344,26 +344,26 @@ projects:
 
   test("creates a credential-free live chamber for a local Supabase stack", () => {
     const root = mkdtempSync(join(tmpdir(), "supadrum-local-add-"));
-    const repository = join(root, "materic-ai");
+    const repository = join(root, "exampleapp-ai");
     const configPath = join(root, "config", "config.yml");
     createGitRepository(repository);
 
     const report = addLocalProject({
-      alias: "materic-ai-local",
+      alias: "exampleapp-ai-local",
       repository,
       config_path: configPath
     });
 
     expect(report).toEqual({
       added: true,
-      alias: "materic-ai-local",
+      alias: "exampleapp-ai-local",
       config_path: configPath,
       repository: realpathSync(repository),
       target: "local"
     });
-    expect(loadConfig(configPath).projects["materic-ai-local"]).toMatchObject({
+    expect(loadConfig(configPath).projects["exampleapp-ai-local"]).toMatchObject({
       target: "local",
-      chamber: "materic-ai-local",
+      chamber: "exampleapp-ai-local",
       mode: "live",
       migrations: "owner",
       migration_driver: "supabase",
@@ -719,7 +719,7 @@ projects:
 
   test("without supabase_dir, projects behave exactly as before", () => {
     const root = mkdtempSync(join(tmpdir(), "supadrum-supabase-dir-default-"));
-    const repository = join(root, "presnap");
+    const repository = join(root, "sampleapp");
     createGitRepository(repository);
     const configPath = join(root, "config", "config.yml");
     mkdirSync(join(root, "config"), { recursive: true });
@@ -728,17 +728,17 @@ projects:
       `
 version: 1
 chambers:
-  presnap-local:
+  sampleapp-local:
     target: local
 projects:
-  presnap-local:
+  sampleapp-local:
     repo: ${repository}
-    chamber: presnap-local
+    chamber: sampleapp-local
     capabilities: [migrations, sql]
 `
     );
 
-    const project = loadConfig(configPath).projects["presnap-local"];
+    const project = loadConfig(configPath).projects["sampleapp-local"];
 
     expect(project?.supabase_dir).toBeUndefined();
   });

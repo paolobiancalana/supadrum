@@ -57,12 +57,12 @@ describe("local Supabase stack isolation", () => {
   });
 
   test("creates a project network bound to loopback before startup", async () => {
-    const repository = join(mkdtempSync(join(tmpdir(), "supadrum-start-")), "PreSnap");
+    const repository = join(mkdtempSync(join(tmpdir(), "supadrum-start-")), "Sampleapp");
     mkdirSync(join(repository, "supabase"), { recursive: true });
     writeFileSync(join(repository, "package.json"),
       '{"devDependencies":{"vite":"^7.0.0"}}');
     writeFileSync(join(repository, "supabase", "config.toml"),
-      '[auth]\nexternal_url = "https://dev-api.presnap.co"\n');
+      '[auth]\nexternal_url = "https://dev-api.sampleapp.co"\n');
     const calls: Array<{ command: string; args: readonly string[]; cwd?: string }> = [];
     const result = await startLocalStack(repository, async (command, args, cwd) => {
       calls.push({ command, args, ...(cwd ? { cwd } : {}) });
@@ -71,7 +71,7 @@ describe("local Supabase stack isolation", () => {
       return ok("credentials that must not escape");
     });
 
-    expect(localNetworkName(repository)).toMatch(/^supadrum-presnap-[a-f0-9]{8}-loopback$/);
+    expect(localNetworkName(repository)).toMatch(/^supadrum-sampleapp-[a-f0-9]{8}-loopback$/);
     expect(calls[1]?.args).toContain("com.docker.network.bridge.host_binding_ipv4=127.0.0.1");
     expect(calls[2]).toEqual({
       command: "supabase",
@@ -87,7 +87,7 @@ describe("local Supabase stack isolation", () => {
 
   test("refuses an existing network that could publish on the LAN", async () => {
     const execute = async (): Promise<CommandResult> => ok('[{"Options":{}}]');
-    await expect(startLocalStack("/workspace/presnap", execute))
+    await expect(startLocalStack("/workspace/sampleapp", execute))
       .rejects.toThrow("is not bound to loopback");
   });
 

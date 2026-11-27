@@ -10,6 +10,7 @@ import { MigrationBaselinePayloadSchema } from "./prisma-baseline.js";
 import { SchemaInspectionPayloadSchema } from "./schema-inspection.js";
 import { StorageAdminPayloadSchema } from "./storage-payload.js";
 import { TypesGeneratePayloadSchema } from "./types-generate.js";
+import { LocalFunctionPayload, LocalSecretCheckPayload } from "./local-edge-payload.js";
 
 export const jobStatusNames = [
   "queued",
@@ -117,7 +118,14 @@ export const JobSubmissionSchema = z
       });
     }
     const schema =
-      submission.operation === "schema.inspect"
+      submission.operation === "secrets.check"
+        ? LocalSecretCheckPayload
+        : submission.operation === "functions.invoke"
+        ? LocalFunctionPayload
+        : submission.operation === "functions.workers.stop" || submission.operation === "functions.workers.activate" ||
+          submission.operation === "functions.runtime.restart"
+          ? PgtapPayloadSchema
+        : submission.operation === "schema.inspect"
         ? SchemaInspectionPayloadSchema
         : submission.operation === "tests.run"
           ? AdapterTestsPayloadSchema

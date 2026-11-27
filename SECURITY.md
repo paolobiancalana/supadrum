@@ -41,8 +41,9 @@ on the current local stack. It passes only a dedicated writer URL,
 local Data API URL, verified `anon` key, and synthetic user JWTs to the test
 child. The local PostgreSQL admin URL is used only for fixed role-provisioning
 SQL; its password and the generated writer password are absent from the test
-environment. The writer password is stored in macOS Keychain and only a SCRAM
-verifier reaches PostgreSQL SQL. Replacing the broker-owned role fails if it
+environment. The writer password is stored in macOS Keychain or the
+operator-configured vault. Only a SCRAM verifier reaches PostgreSQL SQL.
+Replacing the broker-owned role fails if it
 has acquired direct grants or owns objects. The provisioner also checks
 effective application privileges, including grants through `PUBLIC`.
 It refuses an `atlas_session_writer` group with elevated role attributes before
@@ -82,8 +83,11 @@ cluster running PostgreSQL 16 or later.
 These checks do not prove the target repository's RLS or HTTP behavior. Run
 its real adapter suite against the intended local chamber and inspect the
 effective login role before treating that product gate as passed. The bundled
-writer-password vault backend for this operation is macOS Keychain; other
-backends need a separately reviewed writable adapter.
+writer-password vault backend is macOS Keychain. Other backends require an
+explicit `vault_write_command` paired with `vault_command`. The writer receives
+the reference and value as JSON over stdin and Supadrum verifies the write by
+reading it back. The configured helper is trusted operator code and governs
+storage, transport and access.
 
 This reduces the exposure surface compared with a plaintext `.env`: a coding
 agent with repository access can read an `.env`, while it cannot resolve a
@@ -132,7 +136,8 @@ fixed reference `vault://supadrum/keys/age`.
 
 `supadrum project credentials set` accepts values only from an interactive TTY,
 masks input, and restores terminal state after success, cancellation, EOF, or
-failure. It prompts only for missing Keychain entries and verifies every write
+failure. It prompts only for missing entries unless replacement is requested
+and verifies every write
 before reporting readiness. JavaScript strings cannot be reliably erased from
 memory; the guarantee is process isolation and non-persistence, not memory
 zeroization.

@@ -1,0 +1,144 @@
+name: CLI portability
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.os }} Node 22
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.5
+          cache: npm
+      - name: Pin npm for Windows native builds
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm install --global npm@11.21.3
+          if ($LASTEXITCODE -ne 0) { throw 'Installing pinned npm failed' }
+          if ((npm --version).Trim() -ne '11.21.3') { throw 'Unexpected npm version' }
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npx vitest run --testTimeout=30000 test/cli.test.ts test/mcp.test.ts test/local-stack.test.ts test/agent-setup.test.ts test/vault-cli.test.ts test/local-adapter-tests.test.ts test/local-password-auth.test.ts test/command-resolution.test.ts test/storage-admin.test.ts
+      - name: Smoke packed MCP tarball
+        shell: pwsh
+        if: runner.os == 'Windows'
+        env:
+          CI_EXPECT_WIN32_X64: "1"
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Expected Windows x64' }
+          $packDirectory = Join-Path $env:RUNNER_TEMP 'supadrum packed tarball'
+          New-Item -ItemType Directory -Force -Path $packDirectory | Out-Null
+          $packed = npm pack --json --pack-destination $packDirectory | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $packed.filename) { throw 'npm pack failed' }
+          $tarball = Join-Path $packDirectory $packed.filename
+          npm exec -- node scripts/smoke-packed-tarball.mjs $tarball
+          if ($LASTEXITCODE -ne 0) { throw 'Packed MCP smoke failed' }
+      - name: Smoke packed MCP tarball
+        if: runner.os != 'Windows'
+        run: |
+          pack_dir="$(mktemp -d)"
+          npm pack --json --pack-destination "$pack_dir" > "$pack_dir/pack.json"
+          tarball="$pack_dir/$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[0].filename)' "$pack_dir/pack.json")"
+          npm exec -- node scripts/smoke-packed-tarball.mjs "$tarball"
+
+  wsl2:
+    name: WSL2 Ubuntu Linux Node 22
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify WSL2 and Ubuntu kernel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          wsl --status
+          $list = (wsl --list --quiet 2>&1 | Out-String) -replace "`0", ''
+          if ($LASTEXITCODE -ne 0 -or $list -notmatch '(?im)^\s*\*?\s*Ubuntu[^\r\n]*$') {
+            wsl --install --distribution Ubuntu --no-launch --web-download
+            if ($LASTEXITCODE -ne 0) { throw 'Ubuntu WSL installation failed; runner may require reboot.' }
+          }
+          $kernel = wsl --distribution Ubuntu --user root --exec uname -r
+          if ($LASTEXITCODE -ne 0) { throw 'Ubuntu WSL2 uname failed; runner may require reboot.' }
+          $kernel = ($kernel -join "`n") -replace "`0", ''
+          if ($kernel -notmatch '(?i)(WSL2|microsoft-standard)') { throw 'Ubuntu kernel does not identify as WSL2.' }
+      - name: Install verified Node in WSL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nodeVersion = 'v22.23.5'
+          $nodeScript = @'
+          set -eu
+          version="$1"
+          archive="node-${version}-linux-x64.tar.xz"
+          cd /tmp
+          curl --fail --location --silent --show-error "https://nodejs.org/dist/${version}/${archive}" -o "$archive"
+          curl --fail --location --silent --show-error "https://nodejs.org/dist/${version}/SHASUMS256.txt" -o SHASUMS256.txt
+          grep "  ${archive}$" SHASUMS256.txt | sha256sum --check --status
+          mkdir -p /opt/node
+          tar -xJf "$archive" --strip-components=1 -C /opt/node
+          test "$(/opt/node/bin/node -p 'process.platform + "/" + process.arch')" = linux/x64
+          '@
+          $nodeFile = Join-Path $env:RUNNER_TEMP 'install-node-wsl.sh'
+          [IO.File]::WriteAllText($nodeFile, $nodeScript.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          $wslNodeFile = (wsl --distribution Ubuntu --user root --exec wslpath -u $nodeFile).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Converting Node installer path failed.' }
+          wsl --distribution Ubuntu --user root --exec bash $wslNodeFile $nodeVersion
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Node install in WSL failed.' }
+      - name: Build and smoke packed MCP in WSL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = Join-Path $env:RUNNER_TEMP 'supadrum-wsl.bundle'
+          git bundle create $bundle HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Creating source Git bundle failed.' }
+          $wslBundle = (wsl --distribution Ubuntu --user root --exec wslpath -u $bundle).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Converting bundle path failed.' }
+          $checkoutSha = (git rev-parse HEAD).Trim()
+          $buildScript = @'
+          set -eu
+          bundle="$1"
+          checkout_sha="$2"
+          root="$(mktemp -d /tmp/supadrum-wsl.XXXXXX)"
+          git clone --quiet --no-checkout "$bundle" "$root"
+          cd "$root"
+          git checkout --quiet --detach "$checkout_sha"
+          test "$(git rev-parse HEAD)" = "$checkout_sha"
+          stat -f -c 'Linux build filesystem: %T' "$root"
+          export PATH="/opt/node/bin:$PATH"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends build-essential python3
+          npm ci
+          npm run build
+          npm run typecheck
+          pack_dir="$(mktemp -d '/tmp/supadrum packed smoke.XXXXXX')"
+          npm pack --json --pack-destination "$pack_dir" > "$pack_dir/pack.json"
+          tarball="$pack_dir/$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[0].filename)' "$pack_dir/pack.json")"
+          NPM_CONFIG_USERCONFIG=/dev/null npm exec -- node scripts/smoke-packed-tarball.mjs "$tarball"
+          '@
+          $buildFile = Join-Path $env:RUNNER_TEMP 'build-smoke-wsl.sh'
+          [IO.File]::WriteAllText($buildFile, $buildScript.Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          $wslBuildFile = (wsl --distribution Ubuntu --user root --exec wslpath -u $buildFile).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Converting build script path failed.' }
+          wsl --distribution Ubuntu --user root --exec bash $wslBuildFile $wslBundle $checkoutSha
+          if ($LASTEXITCODE -ne 0) { throw 'WSL build or packed MCP smoke failed.' }

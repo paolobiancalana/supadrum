@@ -8,7 +8,7 @@ import type { Job } from "../src/domain.js";
 import { LiveSupabaseExecutor, type LiveProcessInput } from "../src/live-executor.js";
 
 const userId = "5eed0000-0000-4000-8000-000000000001";
-const email = "giulia@alfa.test";
+const email = "testaccount@alfa.test";
 const password = "local-password-canary-very-long";
 const secret = "jwt-secret-canary-32-characters-long";
 const oid = "abc123deadbeefabc123deadbeefabc123deadbe";
@@ -31,25 +31,25 @@ function project(repo: string): ProjectConfig {
     credentials: { secret_key: "", management_token: "", database_access: "" },
     capabilities: ["auth-admin", "adapter-tests"], mode: "live", migrations: "consumer",
     migration_driver: "supabase",
-    auth_password_accounts: { giulia: { user_id: userId, email, password_ref: "vault://atlas/local/giulia" } },
+    auth_password_accounts: { testaccount: { user_id: userId, email, password_ref: "vault://atlas/local/testaccount" } },
     adapter_tests: { login: {
       npm_script: "test:login", writer_password_ref: "vault://atlas/local/writer",
       personas: { student: userId, staff: "5eed0000-0000-4000-8000-000000000003", outsider: "5eed0000-0000-4000-8000-000000000004" },
-      password_accounts: ["giulia"]
+      password_accounts: ["testaccount"]
     } }
   };
 }
 function job(operation: "auth.admin" | "tests.run"): Job {
   return {
     id: "job-1", project: "atlas", operation,
-    payload: operation === "auth.admin" ? { adapter: "supabase-password", action: "upsert", account: "giulia" } : { script: "login" },
+    payload: operation === "auth.admin" ? { adapter: "supabase-password", action: "upsert", account: "testaccount" } : { script: "login" },
     repo_sha: "abc123", idempotency_key: `atlas:${operation}`, capability: operation === "auth.admin" ? "auth-admin" : "adapter-tests",
     requires_approval: true, session_id: null, status: "running", created_at: "2026-09-22T00:00:00Z",
     updated_at: "2026-09-22T00:00:00Z", lease_expires_at: null, approved_at: null,
     approved_by: null, result: null, error: null
   };
 }
-function harness() {
+function harness(vaultMode: "read-write" | "read-only" | "absent" = "read-write") {
   const repo = mkdtempSync(join(tmpdir(), "supadrum-auth-"));
   const calls: LiveProcessInput[] = [];
   const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
@@ -61,17 +61,24 @@ function harness() {
   let identityPresent = true;
   let vaultReads = 0;
   let reconcileExit = 0;
-  const vault = new Map([["vault://atlas/local/giulia", password]]);
+  const vault = new Map([["vault://atlas/local/testaccount", password]]);
+  const get = async (reference: string) => {
+    vaultReads++;
+    return vault.get(reference) ?? "";
+  };
   const executor = new LiveSupabaseExecutor({
+    executables: { npm: ["npm"] },
     process: { async run(input) {
       calls.push(input);
       if (input.argv[0] === "git" && input.argv.includes("rev-parse")) return { exitCode: 0, stdout: `${oid}\n${oid}\n`, stderr: "" };
       if (input.argv[0] === "git" && input.argv.includes("status")) return { exitCode: 0, stdout: "", stderr: "" };
       if (input.argv.includes("status")) return { exitCode: 0, stdout: JSON.stringify(statusValue), stderr: "" };
       if (input.argv[0] === "psql") return { exitCode: reconcileExit, stdout: "", stderr: "placeholder mismatch" };
-      return { exitCode: 0, stdout: `${input.env.SUPADRUM_AUTH_GIULIA_PASSWORD ?? ""} ${Buffer.from(password).toString("base64")}`, stderr: password };
+      return { exitCode: 0, stdout: `${input.env.SUPADRUM_AUTH_TESTACCOUNT_PASSWORD ?? ""} ${Buffer.from(password).toString("base64")}`, stderr: password };
     } },
-    passwordVault: { async get(reference) { vaultReads++; return vault.get(reference) ?? ""; }, async put(reference, value) { vault.set(reference, value); } },
+    ...(vaultMode === "read-write"
+      ? { passwordVault: { get, async put(reference: string, value: string) { vault.set(reference, value); } } }
+      : vaultMode === "read-only" ? { resolveReference: get } : {}),
     fetch: async (input, init) => {
       const url = String(input);
       requests.push({ url, init });
@@ -97,17 +104,34 @@ function harness() {
 }
 
 describe("local Supabase password accounts", () => {
+  test("uses only the configured resolver for Linux Auth and fails before stack access without it", async () => {
+    const readOnly = harness("read-only");
+    const absent = harness("absent");
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...descriptor, value: "linux" });
+    try {
+      await expect(readOnly.executor.execute(job("auth.admin"), readOnly.config, {} as never))
+        .resolves.toMatchObject({ verification: { login_verified: true } });
+      expect(readOnly.vaultReads()).toBe(1);
+      await expect(absent.executor.execute(job("auth.admin"), absent.config, {} as never))
+        .rejects.toThrow(/Local Auth passwords require vault_command/);
+      expect(absent.calls.every(({ argv }) => argv[0] === "git")).toBe(true);
+      expect(absent.requests).toEqual([]);
+    } finally {
+      Object.defineProperty(process, "platform", descriptor);
+    }
+  });
   test("config rejects duplicate account IDs", () => {
     const dir = mkdtempSync(join(tmpdir(), "supadrum-auth-config-"));
     const file = join(dir, "config.yaml");
-    writeFileSync(file, `version: 1\nchambers:\n  local:\n    target: local\n    auth_password_accounts:\n      giulia: {user_id: ${userId}, email: ${email}, password_ref: vault://atlas/local/giulia}\n      other: {user_id: ${userId}, email: other@alfa.test, password_ref: vault://atlas/local/other}\nprojects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [auth-admin], mode: live}\n`);
+    writeFileSync(file, `version: 1\nchambers:\n  local:\n    target: local\n    auth_password_accounts:\n      testaccount: {user_id: ${userId}, email: ${email}, password_ref: vault://atlas/local/testaccount}\n      other: {user_id: ${userId}, email: other@alfa.test, password_ref: vault://atlas/local/other}\nprojects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [auth-admin], mode: live}\n`);
     expect(() => loadConfig(file)).toThrow(/duplicate|shared/i);
   });
 
   test("config refuses one vault password shared by two different accounts", () => {
     const dir = mkdtempSync(join(tmpdir(), "supadrum-auth-config-"));
     const file = join(dir, "config.yaml");
-    writeFileSync(file, `version: 1\nchambers:\n  local:\n    target: local\n    auth_password_accounts:\n      giulia: {user_id: ${userId}, email: ${email}, password_ref: vault://atlas/local/shared}\n      sara: {user_id: 5eed0000-0000-4000-8000-000000000004, email: sara@beta.test, password_ref: vault://atlas/local/shared}\nprojects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [auth-admin], mode: live}\n`);
+    writeFileSync(file, `version: 1\nchambers:\n  local:\n    target: local\n    auth_password_accounts:\n      testaccount: {user_id: ${userId}, email: ${email}, password_ref: vault://atlas/local/shared}\n      sara: {user_id: 5eed0000-0000-4000-8000-000000000004, email: sara@beta.test, password_ref: vault://atlas/local/shared}\nprojects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [auth-admin], mode: live}\n`);
     expect(() => loadConfig(file)).toThrow(/duplicate|shared/i);
   });
 
@@ -200,8 +224,8 @@ describe("local Supabase password accounts", () => {
     const h = harness();
     const result = await h.executor.execute(job("tests.run"), h.config, {} as never);
     const child = h.calls.find((call) => call.argv[0] === "npm");
-    expect(child?.env.SUPADRUM_AUTH_GIULIA_EMAIL).toBe(email);
-    expect(child?.env.SUPADRUM_AUTH_GIULIA_PASSWORD).toBe(password);
+    expect(child?.env.SUPADRUM_AUTH_TESTACCOUNT_EMAIL).toBe(email);
+    expect(child?.env.SUPADRUM_AUTH_TESTACCOUNT_PASSWORD).toBe(password);
     expect(h.calls.filter((call) => call.argv[0] !== "npm").every((call) => !Object.values(call.env).includes(password))).toBe(true);
     expect(JSON.stringify(result)).not.toContain(password);
     expect(JSON.stringify(result)).not.toContain(Buffer.from(password).toString("base64"));

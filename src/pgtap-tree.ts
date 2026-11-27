@@ -1,4 +1,7 @@
 import type { LiveProcess } from "./live-executor.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /**
  * Verification and extraction of the git tree that `pgtap.run` tests.
@@ -39,15 +42,21 @@ export interface TreeSource {
 // options in the same position.
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
-// One constant script. The executable, repository, OID and destination reach
-// it only as positional parameters, so no path can inject shell syntax. The
-// neutral configuration keeps the user's and the system's filters (git-lfs
-// smudge, for one) from running in the runner while `git archive` converts
-// blobs.
-const EXTRACT_SCRIPT =
-  'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "$1" -C "$2" ' +
-  "-c filter.lfs.smudge= -c filter.lfs.required=false " +
-  'archive --format=tar "$3" | tar -x -f - -C "$4"';
+const TREE_COMMAND_TIMEOUT_MS = 60_000;
+
+function treeProcessEnvironment(config: string): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    GIT_CONFIG_GLOBAL: config,
+    GIT_CONFIG_NOSYSTEM: "1"
+  };
+  if (process.platform === "win32") {
+    for (const name of ["SystemRoot", "TEMP", "TMP"]) {
+      if (process.env[name]) environment[name] = process.env[name];
+    }
+  }
+  return environment;
+}
 
 function assertFullOid(oid: string): void {
   if (!FULL_OID.test(oid)) {
@@ -93,26 +102,49 @@ export async function extractTree(
   destination: string
 ): Promise<void> {
   assertFullOid(oid);
-  const result = await source.process.run({
-    argv: [
-      "bash",
-      "-o",
-      "pipefail",
-      "-c",
-      EXTRACT_SCRIPT,
-      "bash",
-      source.git,
-      source.repository,
-      oid,
-      destination
-    ],
-    cwd: source.repository,
-    env: { PATH: process.env.PATH }
-  });
-  if (result.exitCode !== 0) {
-    throw new PgtapTreeError(
-      "extraction_failed",
-      `Extracting tree ${oid} failed with exit code ${result.exitCode}: ${result.stderr.trim()}`
-    );
+  const directory = await mkdtemp(join(tmpdir(), "supadrum-tree-"));
+  const archive = join(directory, "tree.tar");
+  const config = join(directory, "gitconfig.empty");
+  const deadline = Date.now() + TREE_COMMAND_TIMEOUT_MS;
+  try {
+    await writeFile(config, "", { encoding: "utf8", mode: 0o600 });
+    const archived = await source.process.run({
+      argv: [
+        source.git,
+        "-C",
+        source.repository,
+        "-c",
+        "filter.lfs.smudge=",
+        "-c",
+        "filter.lfs.required=false",
+        "archive",
+        "--format=tar",
+        `--output=${archive}`,
+        oid
+      ],
+      cwd: source.repository,
+      env: treeProcessEnvironment(config),
+      timeoutMs: Math.max(deadline - Date.now(), 1)
+    });
+    if (archived.exitCode !== 0 || archived.timedOut) {
+      throw new PgtapTreeError(
+        "extraction_failed",
+        `Creating tree archive ${oid} failed with exit code ${archived.exitCode}: ${archived.stderr.trim()}`
+      );
+    }
+    const extracted = await source.process.run({
+      argv: ["tar", "-xf", archive, "-C", destination],
+      cwd: source.repository,
+      env: treeProcessEnvironment(config),
+      timeoutMs: Math.max(deadline - Date.now(), 1)
+    });
+    if (extracted.exitCode !== 0 || extracted.timedOut) {
+      throw new PgtapTreeError(
+        "extraction_failed",
+        `Extracting tree ${oid} failed with exit code ${extracted.exitCode}: ${extracted.stderr.trim()}`
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 }

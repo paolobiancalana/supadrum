@@ -10,7 +10,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const TOML_START = "# >>> supadrum managed: start";
 const TOML_END = "# <<< supadrum managed: end";
@@ -45,7 +45,7 @@ function atomicWrite(path: string, source: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporaryPath = join(
     dirname(path),
-    `.${path.split("/").at(-1)}.supadrum-${randomUUID()}`
+    `.${basename(path)}.supadrum-${randomUUID()}`
   );
   const mode = existsSync(path) ? statSync(path).mode & 0o777 : 0o644;
   let created = false;

@@ -22,8 +22,8 @@ const status = {
   "anon key": anonKey,
   "JWT secret": jwtSecret
 };
-const costOwner = "cost_owner_paolobiancalana";
-const operator = "operator_paolobiancalana";
+const costOwner = "cost_owner_sampledeveloper";
+const operator = "operator_sampledeveloper";
 
 function project(repository: string, logins = [costOwner, operator]): ProjectConfig {
   return {
@@ -31,8 +31,8 @@ function project(repository: string, logins = [costOwner, operator]): ProjectCon
     credentials: { secret_key: "", management_token: "", database_access: "" },
     capabilities: ["adapter-tests"], mode: "live", migrations: "consumer", migration_driver: "supabase",
     database_logins: {
-      [costOwner]: { role: "atlas_cost_owner", person: "paolobiancalana", password_ref: "vault://tests/local/cost-owner" },
-      [operator]: { role: "atlas_session_operator", person: "paolobiancalana", password_ref: "vault://tests/local/operator" }
+      [costOwner]: { role: "atlas_cost_owner", person: "sampledeveloper", password_ref: "vault://tests/local/cost-owner" },
+      [operator]: { role: "atlas_session_operator", person: "sampledeveloper", password_ref: "vault://tests/local/operator" }
     },
     adapter_tests: {
       reconciler: {
@@ -118,15 +118,15 @@ describe("personal database logins", () => {
     const { executor, process, stored, repository } = setup();
     const result = await executor.execute(job, project(repository), {} as never);
     const child = process.calls.at(-1)!;
-    const url = new URL(child.env.ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL ?? "");
+    const url = new URL(child.env.ATLAS_LOGIN_COST_OWNER_SAMPLEDEVELOPER_DATABASE_URL ?? "");
     expect(url.username).toBe(`supadrum_atlas_${costOwner}`);
     expect(decodeURIComponent(url.password)).toBe(stored.get("vault://tests/local/cost-owner"));
-    expect(new URL(child.env.ATLAS_LOGIN_OPERATOR_PAOLOBIANCALANA_DATABASE_URL ?? "").username)
+    expect(new URL(child.env.ATLAS_LOGIN_OPERATOR_SAMPLEDEVELOPER_DATABASE_URL ?? "").username)
       .toBe(`supadrum_atlas_${operator}`);
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain(stored.get("vault://tests/local/cost-owner"));
     expect(serialized).not.toContain(stored.get("vault://tests/local/operator"));
-    expect(serialized).not.toContain("supadrum_atlas_cost_owner_paolobiancalana:");
+    expect(serialized).not.toContain("supadrum_atlas_cost_owner_sampledeveloper:");
     expect(serialized).not.toContain("SCRAM-SHA-256");
     expect(result.output).toMatchObject({ stderr: expect.stringContaining("[REDACTED]") });
   });
@@ -136,8 +136,8 @@ describe("personal database logins", () => {
     const result = await executor.execute(job, project(repository), {} as never);
     expect(result.verification).toMatchObject({
       database_logins: [
-        { login: `supadrum_atlas_${costOwner}`, role: "atlas_cost_owner", person: "paolobiancalana" },
-        { login: `supadrum_atlas_${operator}`, role: "atlas_session_operator", person: "paolobiancalana" }
+        { login: `supadrum_atlas_${costOwner}`, role: "atlas_cost_owner", person: "sampledeveloper" },
+        { login: `supadrum_atlas_${operator}`, role: "atlas_session_operator", person: "sampledeveloper" }
       ]
     });
   });
@@ -146,7 +146,7 @@ describe("personal database logins", () => {
     const { executor, process, repository } = setup();
     await executor.execute(job, project(repository, [operator]), {} as never);
     expect(provisioning(process, costOwner)).toBeUndefined();
-    expect(process.calls.at(-1)!.env.ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL).toBeUndefined();
+    expect(process.calls.at(-1)!.env.ATLAS_LOGIN_COST_OWNER_SAMPLEDEVELOPER_DATABASE_URL).toBeUndefined();
   });
 
   test("a failed login guard disables that login, names the failed check and never starts the tests", async () => {
@@ -202,10 +202,10 @@ describe("personal database logins", () => {
     const { executor, process, repository } = setup();
     const config = project(repository, [costOwner]);
     const logins = { ...config.database_logins!,
-      cost_owner_giulia: { role: "atlas_cost_owner" as const, person: "giulia", password_ref: "vault://tests/local/giulia" } };
+      cost_owner_testaccount: { role: "atlas_cost_owner" as const, person: "testaccount", password_ref: "vault://tests/local/testaccount" } };
     await executor.execute(job, { ...config, database_logins: logins }, {} as never);
     const sql = provisioning(process, costOwner)?.stdin ?? "";
-    expect(sql).toContain(`array['supadrum_atlas_${costOwner}', 'supadrum_atlas_cost_owner_giulia']::text[]`);
+    expect(sql).toContain(`array['supadrum_atlas_${costOwner}', 'supadrum_atlas_cost_owner_testaccount']::text[]`);
   });
 
   // Names only: the behaviour of each check is proved on PostgreSQL in personal-login-guard.pg.test.ts.
@@ -237,36 +237,36 @@ describe("personal login registration", () => {
     `      ${name}: {role: ${role}, person: ${person}, password_ref: ${ref}}\n`;
 
   test("loads a person's login for each role and a script that selects them", () => {
-    const config = loadConfig(write(`    database_logins:\n${login("cost_owner_paolo", "atlas_cost_owner", "paolo", "vault://a/c")}${login("operator_paolo", "atlas_session_operator", "paolo", "vault://a/o")}${script("cost_owner_paolo, operator_paolo")}`));
-    expect(config.projects.atlas?.database_logins?.operator_paolo).toMatchObject({ role: "atlas_session_operator", person: "paolo" });
+    const config = loadConfig(write(`    database_logins:\n${login("cost_owner_testowner", "atlas_cost_owner", "testowner", "vault://a/c")}${login("operator_testowner", "atlas_session_operator", "testowner", "vault://a/o")}${script("cost_owner_testowner, operator_testowner")}`));
+    expect(config.projects.atlas?.database_logins?.operator_testowner).toMatchObject({ role: "atlas_session_operator", person: "testowner" });
   });
 
   test("refuses two logins for the same person in the same role", () => {
-    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/1")}${login("cost_paolo", "atlas_cost_owner", "paolo", "vault://a/2")}`)))
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://a/1")}${login("cost_testowner", "atlas_cost_owner", "testowner", "vault://a/2")}`)))
       .toThrow(/one login per person and role/i);
   });
 
   test("refuses a role other than the two human roles", () => {
-    expect(() => loadConfig(write(`    database_logins:\n${login("writer_paolo", "atlas_session_writer", "paolo", "vault://a/w")}`))).toThrow();
+    expect(() => loadConfig(write(`    database_logins:\n${login("writer_testowner", "atlas_session_writer", "testowner", "vault://a/w")}`))).toThrow();
   });
 
   test("refuses a password reference shared with another login or with the writer", () => {
-    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/same")}${login("operator_paolo", "atlas_session_operator", "paolo", "vault://a/same")}`)))
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://a/same")}${login("operator_testowner", "atlas_session_operator", "testowner", "vault://a/same")}`)))
       .toThrow(/shared/i);
-    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://atlas/local/writer")}${script("owner_paolo")}`)))
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://atlas/local/writer")}${script("owner_testowner")}`)))
       .toThrow(/shared/i);
   });
 
   test("refuses a script that selects an unregistered login, or one login twice", () => {
-    expect(() => loadConfig(write(script("ghost_paolo")))).toThrow(/not registered: ghost_paolo/);
-    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/o")}${script("owner_paolo, owner_paolo")}`)))
+    expect(() => loadConfig(write(script("ghost_testowner")))).toThrow(/not registered: ghost_testowner/);
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://a/o")}${script("owner_testowner, owner_testowner")}`)))
       .toThrow(/duplicate adapter test database login/i);
   });
 
   test("refuses a login name that does not end with its person", () => {
-    expect(() => loadConfig(write(`    database_logins:\n${login("writer", "atlas_cost_owner", "paolo", "vault://a/w")}`)))
+    expect(() => loadConfig(write(`    database_logins:\n${login("writer", "atlas_cost_owner", "testowner", "vault://a/w")}`)))
       .toThrow(/must end with _<person>/);
-    expect(() => loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "giulia", "vault://a/w")}`)))
+    expect(() => loadConfig(write(`    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testaccount", "vault://a/w")}`)))
       .toThrow(/must end with _<person>/);
     expect(loadConfig(write(`    database_logins:\n${login("owner_anna_maria", "atlas_cost_owner", "anna-maria", "vault://a/w")}`))
       .projects.atlas?.database_logins?.owner_anna_maria).toBeDefined();
@@ -275,16 +275,16 @@ describe("personal login registration", () => {
   test("refuses persons one of which ends with another, so the login name names one person", () => {
     expect(() => loadConfig(write(`    database_logins:\n${login("owner_maria", "atlas_cost_owner", "maria", "vault://a/1")}${login("operator_anna_maria", "atlas_session_operator", "anna-maria", "vault://a/2")}`)))
       .toThrow(/must not end with one another/);
-    expect(loadConfig(write(`    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/1")}${login("owner_paolobiancalana", "atlas_cost_owner", "paolobiancalana", "vault://a/2")}${login("operator_amaria", "atlas_session_operator", "amaria", "vault://a/3")}${login("operator_maria", "atlas_session_operator", "maria", "vault://a/4")}`))
-      .projects.atlas?.database_logins?.owner_paolobiancalana).toBeDefined();
+    expect(loadConfig(write(`    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://a/1")}${login("owner_sampledeveloper", "atlas_cost_owner", "sampledeveloper", "vault://a/2")}${login("operator_amaria", "atlas_session_operator", "amaria", "vault://a/3")}${login("operator_maria", "atlas_session_operator", "maria", "vault://a/4")}`))
+      .projects.atlas?.database_logins?.owner_sampledeveloper).toBeDefined();
   });
 
   test("refuses a password reference shared with a local auth account or a remote credential", () => {
-    expect(() => loadConfig(write(`    auth_password_accounts:\n      giulia: {user_id: 5eed0000-0000-4000-8000-000000000001, email: g@alfa.test, password_ref: vault://a/auth}\n    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://a/auth")}`)))
+    expect(() => loadConfig(write(`    auth_password_accounts:\n      testaccount: {user_id: 5eed0000-0000-4000-8000-000000000001, email: g@alfa.test, password_ref: vault://a/auth}\n    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://a/auth")}`)))
       .toThrow(/shared/i);
     const dir = mkdtempSync(join(tmpdir(), "supadrum-logins-config-"));
     const file = join(dir, "config.yaml");
-    writeFileSync(file, `version: 1\nchambers:\n  remote:\n    project_ref: abcdefghijklmnopqrst\n    credentials: {secret_key: vault://r/secret, management_token: vault://r/mgmt, database_access: vault://r/db}\n  local:\n    target: local\n    database_logins:\n${login("owner_paolo", "atlas_cost_owner", "paolo", "vault://r/db")}projects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [adapter-tests], mode: live}\n`);
+    writeFileSync(file, `version: 1\nchambers:\n  remote:\n    project_ref: abcdefghijklmnopqrst\n    credentials: {secret_key: vault://r/secret, management_token: vault://r/mgmt, database_access: vault://r/db}\n  local:\n    target: local\n    database_logins:\n${login("owner_testowner", "atlas_cost_owner", "testowner", "vault://r/db")}projects:\n  atlas: {repo: ${dir}, chamber: local, capabilities: [adapter-tests], mode: live}\n`);
     expect(() => loadConfig(file)).toThrow(/shared/i);
   });
 });

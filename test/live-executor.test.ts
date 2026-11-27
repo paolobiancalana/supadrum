@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readFileSync,
+  statSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -479,7 +483,7 @@ describe("live Supabase executor", () => {
 
     expect(
       resolveExecutable("supabase", { PATH: directory })
-    ).toBe(executable);
+    ).toBe(realpathSync(executable));
   });
 
   test("derives a decoded PostgreSQL password without returning the URI", () => {
@@ -613,6 +617,68 @@ describe("live Supabase executor", () => {
         credentials
       )
     ).rejects.toThrow("Types output file must be inside the project repository");
+  });
+
+  test("refuses a types output under Git metadata and preserves its contents", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    mkdirSync(join(repository, ".git"));
+    const destination = join(repository, ".git", "config");
+    writeFileSync(destination, "fixture git configuration");
+    const executor = new LiveSupabaseExecutor({ process: new TypesProcess() });
+
+    await expect(executor.execute(
+      runningJob("types.generate", { output: ".git/config" }),
+      liveProject(repository),
+      credentials
+    )).rejects.toThrow(/Types output file/);
+    expect(readFileSync(destination, "utf8")).toBe("fixture git configuration");
+  });
+
+  test("refuses junction and hard-link destinations before running the generator", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const outside = mkdtempSync(join(tmpdir(), "supadrum-types-outside-"));
+    const file = join(outside, "types.ts");
+    writeFileSync(file, "user contents");
+    symlinkSync(outside, join(repo, "linked"), "junction");
+    linkSync(file, join(repo, "linked.ts"));
+    const process = new TypesProcess();
+    const executor = new LiveSupabaseExecutor({ process });
+    for (const output of ["linked/types.ts", "linked.ts"]) {
+      await expect(executor.execute(
+        runningJob("types.generate", { output }), liveProject(repo), credentials
+      )).rejects.toThrow(/Types output file/);
+    }
+    expect(process.calls.every(({ argv }) => argv[0] === "git")).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe("user contents");
+  });
+
+  test("preserves concurrent user edits to a types output", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const file = join(repo, "types.ts");
+    writeFileSync(file, "old contents");
+    const child = new TypesProcess();
+    const executor = new LiveSupabaseExecutor({ process: {
+      run(input) {
+        if (input.argv[0] === "supabase") writeFileSync(file, "new user contents");
+        return child.run(input);
+      }
+    } });
+    await expect(executor.execute(
+      runningJob("types.generate", { output: "types.ts" }), liveProject(repo), credentials
+    )).rejects.toThrow(/changed during generation/);
+    expect(readFileSync(file, "utf8")).toBe("new user contents");
+  });
+
+  test("regenerates an unchanged types file while preserving POSIX permissions", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "supadrum-types-"));
+    const file = join(repo, "types.ts");
+    writeFileSync(file, "previous contents");
+    if (process.platform !== "win32") chmodSync(file, 0o640);
+    await new LiveSupabaseExecutor({ process: new TypesProcess() }).execute(
+      runningJob("types.generate", { output: "types.ts" }), liveProject(repo), credentials
+    );
+    expect(readFileSync(file, "utf8")).toContain("export type Database");
+    if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o640);
   });
 
   test("generates types from a local chamber after the loopback preflight", async () => {
@@ -871,7 +937,7 @@ describe("live Supabase executor", () => {
       runningJob("auth.admin", {
         action: "reset-password",
         adapter: "snap-password",
-        email: "codex.local@materic.test",
+        email: "codex.local@exampleapp.test",
         profile: "local-development"
       }),
       Object.assign(localProject(repository), {
@@ -893,7 +959,7 @@ describe("live Supabase executor", () => {
       PGUSER: "postgres",
       PGSSLMODE: "disable"
     });
-    expect(command?.stdin).toContain("codex.local@materic.test");
+    expect(command?.stdin).toContain("codex.local@exampleapp.test");
     expect(command?.stdin).toContain("$argon2id$");
     expect(command?.stdin).toContain("GET DIAGNOSTICS");
     expect(command?.stdin).not.toContain("TestPassword1234");
@@ -954,7 +1020,7 @@ describe("live Supabase executor", () => {
       runningJob("auth.admin", {
         action: "recreate-test-user",
         adapter: "snap-password",
-        email: "test@materic.dev",
+        email: "test@exampleapp.dev",
         profile: "local-development",
         organization: "snap-dev-ready"
       }),
@@ -970,7 +1036,7 @@ describe("live Supabase executor", () => {
       ["psql", ...SCHEMA_INSPECTION_PSQL_ARGS]
     ]);
     const command = process.calls[2];
-    expect(command?.stdin).toContain("test@materic.dev");
+    expect(command?.stdin).toContain("test@exampleapp.dev");
     expect(command?.stdin).toContain("a1b2c3d4-0002-4000-8000-000000000001");
     expect(command?.stdin).toContain("Expected the SNAP Dev organization");
     expect(command?.stdin).toContain("onboarding_completed = true");
@@ -1001,7 +1067,7 @@ describe("live Supabase executor", () => {
         runningJob("auth.admin", {
           action: "reset-password",
           adapter: "snap-password",
-          email: "codex.local@materic.test",
+          email: "codex.local@exampleapp.test",
           profile: "operator-secret"
         }),
         Object.assign(localProject(repository), {
@@ -1167,7 +1233,7 @@ describe("live Supabase executor", () => {
   test("plans Prisma migrations with migrate status and DATABASE_URL only in environment", async () => {
     const repository = mkdtempSync(join(tmpdir(), "supadrum-prisma-"));
     const process = new RecordingProcess();
-    const executor = new LiveSupabaseExecutor({ process });
+    const executor = new LiveSupabaseExecutor({ process, executables: { prisma: "prisma" } });
 
     const result = await executor.execute(
       runningJob("migration.plan", {}),
@@ -1408,7 +1474,23 @@ describe("live Supabase executor", () => {
       credentials
     );
 
-    expect(process.calls[1]?.argv[0]).toBe(executable);
+    expect(process.calls[1]?.argv[0]).toBe(realpathSync(executable));
+  });
+
+  test("uses Node with the repository Prisma JS entrypoint on native platforms", async () => {
+    const repository = mkdtempSync(join(tmpdir(), "supadrum-prisma-js-"));
+    const packageDirectory = join(repository, "node_modules", "prisma");
+    const entrypoint = join(packageDirectory, "build", "index.js");
+    mkdirSync(dirname(entrypoint), { recursive: true });
+    writeFileSync(join(packageDirectory, "package.json"), JSON.stringify({ bin: { prisma: "build/index.js" } }));
+    writeFileSync(entrypoint, "");
+    const process = new RecordingProcess();
+    const executor = new LiveSupabaseExecutor({
+      process,
+      resolveCommand: () => ({ argv: [globalThis.process.execPath, entrypoint], path: dirname(globalThis.process.execPath) })
+    });
+    await executor.execute(runningJob("migration.plan", {}), liveProject(repository, "prisma"), credentials);
+    expect(process.calls[1]?.argv).toEqual([globalThis.process.execPath, entrypoint, "migrate", "status"]);
   });
 
   test("rejects SQL paths outside the repository before starting psql", async () => {

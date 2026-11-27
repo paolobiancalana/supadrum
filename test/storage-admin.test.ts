@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   symlinkSync,
   writeFileSync
 } from "node:fs";
@@ -46,6 +47,16 @@ const LOCAL_STATUS = {
   "service_role key": LOCAL_SERVICE_KEY,
   "JWT secret": JWT_SECRET
 };
+
+async function onWindows<T>(run: () => T | Promise<T>): Promise<T> {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+  try {
+    return await run();
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
+}
 
 /** A real git repository whose .gitignore covers `out/`, committed, so HEAD is a real OID. */
 function makeRepo(gitignore = "out/\n") {
@@ -398,6 +409,69 @@ describe("storage.admin list", () => {
 });
 
 describe("storage.admin download", () => {
+  test("writes distinct Win32 targets that share a directory", async () => {
+    const { repo, storage, run } = setup();
+    storage.put("a", "shared/one.txt", "one");
+    storage.put("a", "shared/two.txt", "two");
+    await onWindows(async () => {
+      await expect(run({ action: "download", dest: "out/dl" }))
+        .resolves.toMatchObject({ output: { objects: 2 } });
+    });
+    expect(readdirSync(join(repo, "out/dl/a/shared")).sort()).toEqual(["one.txt", "two.txt"]);
+  });
+
+  test.each([
+    "..\\..\\elsewhere\\file.txt", "file.txt:stream", "CON.txt", "LPT².txt",
+    "LOCALE~1.txt", "file.txt.", ".git ", "a?.txt"
+  ])("refuses unsafe Win32 object name %s before requesting any body", async (name) => {
+    const { repo, storage, run } = setup();
+    storage.put("a", "first.txt", "one");
+    storage.put("a", name, "two");
+    await onWindows(async () => {
+      await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/Windows/);
+    });
+    expect(storage.count("GET", /object\/authenticated/)).toBe(0);
+    expect(existsSync(join(repo, "out/dl"))).toBe(false);
+  });
+
+  test.each([
+    ["File.txt", "file.TXT"],
+    ["Folder/one.txt", "folder/two.txt"],
+    ["file", "File/nested.txt"]
+  ])("refuses equivalent Win32 targets %s and %s before requesting any body", async (first, second) => {
+    const { repo, storage, run } = setup();
+    storage.put("a", first, "one");
+    storage.put("a", second, "two");
+    await onWindows(async () => {
+      await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/Windows/);
+    });
+    expect(storage.count("GET", /object\/authenticated/)).toBe(0);
+    expect(existsSync(join(repo, "out/dl"))).toBe(false);
+  });
+
+  test("refuses a Win32 destination alias before any request", async () => {
+    const { storage, run } = setup();
+    await onWindows(async () => {
+      await expect(run({ action: "download", dest: "out/dl." })).rejects.toThrow(/Windows/);
+    });
+    expect(storage.requests).toHaveLength(0);
+  });
+
+  test("will not write through a replaced Windows destination", async () => {
+    const { repo, storage, run } = setup();
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "supadrum export outside ")));
+    mkdirSync(join(repo, "out/dl"), { recursive: true });
+    storage.put("a", "first.txt", "one");
+    storage.onDownload = () => {
+      renameSync(join(repo, "out/dl"), join(repo, "out/original"));
+      symlinkSync(outside, join(repo, "out/dl"), "junction");
+    };
+    await onWindows(async () => {
+      await expect(run({ action: "download", dest: "out/dl" })).rejects.toThrow(/written under dest/);
+    });
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
   test("writes every bucket's objects and a MANIFEST; the result holds counts only", async () => {
     const { repo, storage, run } = setup();
     storage.put("photos", "2026/club-secret.png", "PNGDATA");
@@ -775,6 +849,17 @@ describe("storage.admin delete", () => {
     return ctx;
   }
   const payload = (objects: string[], dest = "out/del") => ({ action: "delete", bucket: "photos", objects, dest });
+
+  test("refuses Win32 aliases in a backup before fetching or deleting anything", async () => {
+    const { repo, storage, run } = seeded();
+    storage.put("photos", "2026/a.png:stream", "alias");
+    await onWindows(async () => {
+      await expect(run(payload(["2026/a.png", "2026/a.png:stream"]))).rejects.toThrow(/Windows/);
+    });
+    expect(storage.requests).toHaveLength(0);
+    expect(storage.has("photos", "2026/a.png")).toBe(true);
+    expect(existsSync(join(repo, "out/del"))).toBe(false);
+  });
 
   test("downloads every object first, then deletes exactly those", async () => {
     const { repo, storage, run } = seeded();

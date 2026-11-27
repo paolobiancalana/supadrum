@@ -5,10 +5,11 @@ projects. Agents declare a project and an atomic intent; the runner owns
 credentials, chamber rotation, execution, and verification. By default it does
 not add a second human decision gate after a capability has been granted.
 
-Projects that ship code can also declare the `deploy` capability: `deploy.plan`
-rehearses (pull, build) and `deploy.apply` ships, both through operator-owned
-argv and an optional `deploy_token` credential, so a production deploy leaves
-the same audited trail as a migration.
+Projects that ship application builds can also declare the `deploy`
+capability: `deploy.inspect` reads deployments, `deploy.plan` rehearses
+(pull, build), and `deploy.apply` ships through operator-owned `commands`
+templates and an optional `deploy_token` credential, leaving the same audited
+trail as a migration.
 
 No resolved credential—and no `vault://` reference—enters a job payload or the
 durable queue.
@@ -56,16 +57,43 @@ flowchart LR
     Q --> R["supadrum-runner"]
     R -->|"reference on stdin"| V["Operator vault"]
     V -->|"value in memory"| R
-    R -->|"operator-owned argv"| S["Supabase / Postgres"]
+    R -->|"typed adapter / operator argv"| S["Supabase / Postgres / Deploy"]
     O["Operator CLI"] -->|"approve (manual mode only)"| Q
 ```
 
 ## What works
 
-- Complete project credential bundles: secret key, Management API token, and
-  PostgreSQL access.
-- Capability gates for Data API, Auth Admin, Storage, Realtime, Edge Functions,
-  secrets, migrations, schema inspection, SQL, and project management.
+- Complete remote credential bundles: `secret_key`, `management_token`,
+  `database_access`, plus optional `deploy_token`.
+- Fourteen catalog capabilities (`data-api`, `auth-admin`, `storage`,
+  `realtime`, `edge-functions`, `secrets`, `migrations`, `schema-inspection`,
+  `sql`, `adapter-tests`, `pgtap`, `stack`, `project-management`, `deploy`)
+  covering 26 operations:
+  - **Safe `executor: dry-run` (default)** accepts every catalog operation for
+    queuing, policy, and verification testing with zero external side effects.
+  - **Live Supabase / local execution (`executor: command`, `mode: live`)** runs
+    built-in typed adapters (`LiveSupabaseExecutor`) with output redaction and
+    repository SHA/OID verification.
+  - **Live `deploy.*` execution** routes to operator-owned `commands` YAML argv
+    templates (`CommandExecutor`) with optional Vercel `deploy_target` pinning
+    (`VERCEL_ORG_ID` and `VERCEL_PROJECT_ID`).
+- **Implemented live vs dry-run boundaries:**
+  - `data.query` (`data-api`), `realtime.admin` (`realtime`), and
+    `project.manage` (`project-management`) are accepted in `dry-run`, but
+    currently have no live adapter (`No live adapter` in `live` mode).
+  - Remote live chambers execute `project.inspect`, `migration.plan`,
+    `migration.baseline` (Prisma), `migration.apply`, `types.generate`,
+    `schema.inspect`, `functions.deploy`, `secrets.set`, `sql.execute`,
+    `storage.admin`, and operator-configured `deploy.*`.
+  - Local chambers (`target: local`) allow 10 capabilities (`migrations`,
+    `auth-admin`, `sql`, `adapter-tests`, `pgtap`, `stack`, `schema-inspection`,
+    `storage`, `edge-functions`, `secrets`) and require
+    `migration_driver: supabase`. `migration.diff`, `auth.admin`, `tests.run`,
+    `pgtap.run`, `stack.serve`, `functions.invoke`, `functions.workers.stop`,
+    `functions.workers.activate`, `functions.runtime.restart`, and
+    `secrets.check` are local-only; `functions.deploy` is remote-only;
+    `schema.inspect` currently supports remote chambers with `database_access`
+    and is not wired for `target: local` yet.
 - Durable FIFO jobs with idempotency, event cursors, optional manual approvals,
   cancellation, verification, and expired-lease recovery.
 - FIFO skipping of `waiting_credentials` and `waiting_approval` jobs without
@@ -75,23 +103,70 @@ flowchart LR
 - Interactive capability-scoped sessions with optional manual approval,
   heartbeat, TTL, and automatic release.
 - A stdio MCP server with the nine tools from the original design.
-- Safe `dry-run` execution and opt-in real command execution with output
-  redaction and repository-SHA verification.
+  For clients that reject dots in tool names, set
+  `SUPADRUM_MCP_TOOL_NAMES=portable` in that server process. The catalog then
+  uses underscores (for example, `projects_inspect`). Job operation IDs are
+  independent of this setting.
 - A Codex plugin bundle with a mandatory Supadrum workflow skill.
-
-Supadrum deliberately does not embed a second Supabase client or hard-code
-deployment commands. In real mode, operators own exact argv templates in YAML.
-This keeps agents away from both credentials and authentication decisions while
-letting each team pin the CLI behavior it has validated.
 
 ## Requirements
 
-- Node.js 22 or newer; Node.js 24 LTS is recommended.
-- macOS Keychain for the lightweight local vault backend, or pinned
-  installations of SOPS and age for the portable encrypted-file backend.
-- An external vault CLI for other real deployments. It must accept one
-  `vault://` reference on stdin and print only the resolved value on stdout.
-- `supabase`, `psql`, or other executables used by your command templates.
+- Node.js 22 or newer; Node.js 24 LTS is recommended. On Linux (`arm64`) with
+  Node.js 22, the bundled `better-sqlite3` (`13.0.2`) native addon requires
+  `glibc >= 2.38` (such as Ubuntu 24.04 or Debian 13).
+- macOS Keychain for the bundled local `keychain` backend and bundled `sops`
+  age identity custody (`darwin`), or external stdin/stdout helpers via
+  `vault_command` (reads) and optional `vault_write_command` (writes for
+  `supadrum project credentials set` and local `tests.run`; required off macOS
+  where interactive credential setup or adapter-test password provisioning is used).
+- `git`, `supabase` (`2.116.0` or newer for `pgtap`/`stack`), `psql`, `docker`
+  (for local stacks, `pgtap`, and `stack`), `tar` (for pgTAP), and `prisma` when
+  `migration_driver: prisma`.
+
+## Platform validation status
+
+- **macOS (`darwin`):** primary operator environment where bundled `keychain`
+  (`security`), `defaultVaultCommand`, `sops` age Keychain bootstrap, and
+  local `tests.run` / `auth.admin` Keychain custody are implemented and used.
+- **Native Windows x64 (`win32`/`x64`) — private validation at revision `b80beac`:**
+  - Verified on `windows-2025` (Node.js 22, `npm@11.21.3`): `npm ci`,
+    `npm run build`, `npm run typecheck`, targeted Vitest suites
+    (`test/cli.test.ts`, `test/mcp.test.ts`, `test/local-stack.test.ts` — 3
+    files, 94 tests), and packed-tarball install into a space-containing path
+    with stdio MCP smoke (`projects.inspect` and
+    `SUPADRUM_MCP_TOOL_NAMES=portable` `projects_inspect` on a synthetic
+    `dry-run` project).
+  - Scope boundary: establishes that `npm ci` works, build/typecheck pass, the
+    tested CLI/setup path handling and SQLite queue work, and packed-tarball
+    stdio MCP works. Does not cover the remaining Vitest files, live
+    Docker/Supabase/PostgreSQL execution, pgTAP/stack, or vault resolution.
+- **WSL2 (`linux`/`x64`) — private validation at revision `4dc938d`:**
+  - Verified inside Ubuntu on WSL2 (`microsoft-standard-WSL2`, Node.js
+    `v22.23.5`, `npm` `10.9.9`, `build-essential` and `python3` installed, Linux
+    filesystem checkout): `npm ci`, `npm run build`, `npm run typecheck`,
+    `npm pack`, and packed-tarball stdio MCP smoke (`projects.inspect` and
+    `SUPADRUM_MCP_TOOL_NAMES=portable` `projects_inspect` on a synthetic
+    `dry-run` project).
+  - Scope boundary: establishes WSL2 Linux dependency install (`npm ci`), build,
+    typecheck, and packed-tarball MCP stdio transport from a Linux filesystem.
+    Does not cover Vitest suites, `/mnt/` Windows-mounted checkouts, integrated
+    local stack execution, or vault resolution.
+- **Linux ARM64 (`linux`/`arm64`) — observed `glibc >= 2.38` requirement:**
+  - Observed on Debian 12 (`linux`/`arm64`, Node.js 22): `better-sqlite3`
+    `13.0.2` loads its prebundled native addon requiring `GLIBC_2.38` and fails
+    even when source builds are requested.
+  - Distribution requirement: use a distribution providing `glibc >= 2.38`
+    (for example, Ubuntu 24.04 or Debian 13).
+- **Outstanding cross-platform gaps in this repository:**
+  - Bundled Keychain and SOPS age identity custody require macOS. Linux and
+    Windows use the external vault commands below. A real provider and live
+    adapter execution still need platform validation.
+  - Live Windows execution still needs end-to-end verification across native
+    executables, Docker, pgTAP, and NTFS permissions. File modes such as
+    `0o600` and `0o700` do not set NTFS access-control lists.
+  - Integrated WSL2 local stack execution (`supabase start`, Docker loopback,
+    Vite `.env.development.local`, `supadrum-runner`, pgTAP, disposable stacks)
+    is pending end-to-end verification.
 
 ## Quick start
 
@@ -108,17 +183,25 @@ supadrum demo
 for a matching Git repository in the current directory, beside it, and under
 the common `~/Documents`, `~/Developer`, and `~/Projects` roots. It discovers
 the Supabase project ref from linked CLI metadata or an allow-listed public
-Supabase URL. Conflicting refs stop registration instead of guessing.
-
-The happy path is one command:
+Supabase URL (plus `.vercel/project.json` for optional deploy target pinning).
+Conflicting metadata stops registration instead of guessing.
 
 ```bash
 cd /path/to/supadrum
 supadrum project add example-ios
 ```
 
-If discovery is incomplete, the wizard asks only for the missing repository or
-project ref. Flags make the same flow deterministic for scripts:
+For a local Supabase stack, `--local` creates a local chamber (`target: local`)
+and live project with `migrations` enabled:
+
+```bash
+supadrum project add example-local --local --repo /absolute/path/to/example
+supadrum project start example-local
+```
+
+If discovery is incomplete for a remote project, the wizard asks only for the
+missing repository or project ref. Flags make registration deterministic for
+scripts:
 
 ```bash
 supadrum project add example-ios \
@@ -129,33 +212,38 @@ supadrum project add example-ios \
 ```
 
 The wizard creates an owner-only (`0600`) dry-run config, records the absolute
-repository as project SSOT, generates the complete credential references, and
-checks which vault values are available without printing them. It also makes
-the target repository Codex-ready:
+repository, generates the credential references, and probes vault readiness
+without printing values. On `darwin`, `project add` sets `vault_command` to the
+bundled Keychain resolver when none is configured. It also makes the target
+repository Codex-ready:
 
 - `.agents/skills/supadrum/` receives the bundled workflow skill;
 - `.codex/config.toml` receives an owner-independent, repository-scoped
   `supadrum` MCP entry pointing at the absolute operator config;
 - `AGENTS.md` receives a small managed block requiring Supadrum for every
   Supabase task;
-- existing direct Supabase MCP entries are preserved but disabled.
+- existing direct Supabase MCP entries are preserved with `enabled = false`.
 
 These writes are idempotent and preserve unrelated Codex settings and agent
 instructions. Start a new Codex task after registration so it discovers the
-skill and MCP server. Use `--no-agent-setup` only when Codex is not the target
-agent or its configuration is managed separately.
+skill and MCP server. Pass `--no-agent-setup` to skip agent configuration.
 
-The default `development` profile enables Data API, Storage, Edge Functions,
-migrations, schema inspection, and project inspection. Capability grants are
-the authorization boundary; jobs run automatically unless the operator sets
+Available remote registration profiles are `inspect` (`data-api`,
+`schema-inspection`, `project-management`), `development` (`data-api`,
+`storage`, `edge-functions`, `migrations`, `schema-inspection`,
+`project-management` — default), and `admin` (all catalog capabilities except
+`pgtap` and `stack`, which require `target: local`). Capability grants are the
+authorization boundary; jobs run automatically unless the operator sets
 `approval_mode: manual`.
 
-Manage registered projects with:
+Manage registered projects and runs with:
 
 ```bash
 supadrum project list
 supadrum project setup example-ios
 supadrum project inspect example-ios
+supadrum project start example-local
+supadrum project capabilities set example-ios storage edge-functions schema-inspection
 supadrum project credentials set example-ios
 supadrum project credentials set example-ios --replace database_access
 supadrum project migrations owner example-ios
@@ -163,62 +251,121 @@ supadrum project migrations driver example-ios prisma
 supadrum project live example-ios
 supadrum project dry-run example-ios
 supadrum project doctor --all
+supadrum status <job-id>
+supadrum approve <job-id> --actor operator --config ./supadrum.yml
+supadrum pgtap example-local <tree-oid>
+supadrum stack example-local <tree-oid> -- npm run test:e2e
 ```
 
 `supadrum project setup <alias>` also installs or repairs the Codex agent
-configuration by default. Pass `--no-agent-setup` to leave the repository
-untouched.
+configuration by default (pass `--no-agent-setup` to skip). `doctor` and
+`credentials set` check the three required Supabase credentials (`secret_key`,
+`management_token`, `database_access`); optional `deploy_token` is set via
+`credentials set` when declared on the project or chamber and is not probed by
+`doctor`.
 
 Configuration lookup is, in order: `--config`, `SUPADRUM_CONFIG`, a local
 `supadrum.yml`, a local `.supadrum/config.yml`, then
 `$XDG_CONFIG_HOME/supadrum/config.yml` or
-`~/.config/supadrum/config.yml`. `supadrum init` remains available for manual
-configuration and also writes mode `0600`.
+`~/.config/supadrum/config.yml`. (`supadrum pgtap` and `supadrum stack`
+deliberately skip repo-local `supadrum.yml` and `.supadrum/config.yml` so
+repository files cannot supply broker configuration inside hooks.)
+`supadrum init` creates a starter `supadrum.yml` with mode `0600`.
 
 Start both processes; they use the same configuration discovery:
 
 ```bash
-supadrum-runner
+supadrum-runner [--once] [--poll-ms 250]
 supadrum-mcp
 ```
 
+`supadrum-runner` writes `runner.pid` beside `database_path` and restarts its
+loop when the config file changes while idle (which closes any active session).
+`supadrum-mcp` keeps `database_path` and `approval_mode` fixed for the process
+lifetime and hot-reloads project/capability changes per request on config mtime
+change (keeping the last valid config if a broken edit is saved).
+
 For repositories registered through `project add/setup`, Codex starts
-`supadrum-mcp` from the generated project configuration. The standalone
+`supadrum-mcp` from `.codex/config.toml`. The standalone
 [`examples/mcp.json`](examples/mcp.json) remains available for other MCP
 clients.
 
 ## Vault backends
 
-Supadrum ships two open-source resolver paths. Agents use neither directly:
-only the runner invokes the configured resolver.
+The runner and operator CLI can use an external resolver via `vault_command`
+on macOS, Linux, and Windows. It receives one `vault://` reference on stdin
+and returns only the value on stdout. Exit code 44 means an absent entry.
+Other failures abort credential setup. Agents cannot invoke the resolver
+through MCP.
 
-For local macOS development, complete a registered project's credential bundle
-through masked prompts:
+For masked credential setup or local adapter tests that store generated
+passwords, configure an explicit `vault_write_command` alongside
+`vault_command`. Both are argv lists. Use a native executable or an explicit
+interpreter and script path. Supadrum starts the writer without a shell and
+sends one JSON line with `reference` and `value` on stdin. The value must be
+nonempty without leading or trailing whitespace. Exit zero signals a write,
+which Supadrum verifies through the resolver. Helper output is kept out of
+job and CLI results. The helper and its storage policy are operator-owned.
+Local Auth on Linux and Windows needs only the resolver.
+
+macOS keeps Keychain as the default for local adapter tests and Auth unless
+an external writer is explicitly configured.
+
+```yaml
+version: 1
+executor: command
+vault_command: [/absolute/path/to/vault-read, --profile, prod]
+vault_write_command: [/absolute/path/to/vault-write, --profile, prod]
+
+chambers:
+  example-platform:
+    project_ref: abcdefghijklmnopqrst
+    credentials:
+      secret_key: vault://supabase/example-platform/secret
+      management_token: vault://supabase/example-platform/management
+      database_access: vault://supabase/example-platform/postgres
+
+projects:
+  example-web:
+    repo: /absolute/path/to/example-web
+    chamber: example-platform
+    mode: live
+    capabilities:
+      - migrations
+```
+
+To populate a registered project's credential bundle through masked prompts
+(using Keychain on macOS, or `vault_write_command` alongside `vault_command`):
 
 ```bash
 supadrum project credentials set example
 supadrum project doctor example
 ```
 
-The command asks only for missing values, validates database access as a
-complete PostgreSQL URI, writes each one directly to Keychain, and verifies the
-round trip. `--replace` deliberately rotates one existing entry. Values never
-enter argv, shell history, config, or CLI output.
+The command asks only for missing values, validates `database_access` as a
+complete PostgreSQL URI, writes each value to Keychain or the configured
+`vault_write_command`, and verifies the round trip via the resolver. `--replace`
+deliberately rotates one existing entry. Values never enter argv, shell history,
+config, or CLI output.
 
-For deliberate non-interactive automation, `keychain put` still accepts one
-value on stdin:
+For non-interactive automation on macOS, `keychain put` accepts one value on
+stdin and `keychain import` migrates an existing Keychain generic-password
+item:
 
 ```bash
 printf '%s' "$VALUE" |
   supadrum-vault keychain put vault://supabase/example/management
 
-vault_command: [supadrum-vault, keychain, resolve]
+supadrum-vault keychain import vault://supabase/example/management \
+  --service existing-service --account "$USER"
 ```
 
-`keychain put` prints reference metadata only. The value is encoded in process
-memory and sent to macOS `security -i` over stdin, never argv or shell history.
+Configure `vault_command: [supadrum-vault, keychain, resolve]`. `keychain put`
+and `keychain import` print reference metadata only; values are encoded in
+process memory and sent to macOS `security -i` over stdin.
 
-For a portable encrypted file, bootstrap an age identity into Keychain:
+For SOPS/age encrypted bundles on macOS (`darwin`), bootstrap an age identity
+into macOS Keychain (`vault://supadrum/keys/age`):
 
 ```bash
 supadrum-vault sops bootstrap-age
@@ -236,14 +383,19 @@ vault_command:
 ```
 
 See [`examples/sops-age`](examples/sops-age/README.md) for setup and threat
-model details. SOPS and age are operator-installed tools, not npm
-dependencies. OpenBao, Infisical, and other vaults remain compatible through
-the same stdin/stdout resolver contract.
+model details. **macOS boundary:** SOPS and age are operator-installed tools,
+not npm dependencies, and bundled `supadrum-vault` (`keychain`,
+`sops bootstrap-age`, `sops resolve`, and `migrate dotenv`) requires `darwin`
+and fails outside macOS because private age identity custody
+(`vault://supadrum/keys/age`) is hardwired to macOS Keychain. On Linux and
+Windows, wire external SOPS wrappers, OpenBao, Infisical, or OS secret-store
+helpers through `vault_command` (and `vault_write_command` when interactive
+setup or adapter-test writes are needed).
 
-For initial ingestion, `supadrum-vault migrate dotenv` copies only explicit
-`--map NAME=vault://reference` entries to Keychain and a verified SOPS backup.
-It previews by default; `--apply` atomically removes those plaintext
-assignments after every round-trip succeeds.
+For initial ingestion on macOS, `supadrum-vault migrate dotenv` copies only
+explicit `--map NAME=vault://reference` entries to Keychain and a verified
+SOPS backup. It previews by default; `--apply` atomically removes those
+plaintext assignments after every round-trip succeeds.
 
 ## MCP surface
 
@@ -252,18 +404,20 @@ projects.list()
 projects.inspect(project)
 
 jobs.submit(project, operation, payload, repo_sha, idempotency_key)
-jobs.wait(job_id, cursor, timeout_ms)
+jobs.wait(job_id, cursor, timeout_ms)   # cursor >= 0 (default 0), timeout_ms 0..30000 (default 30000)
 jobs.status(job_id)
 jobs.cancel(job_id)
 
-sessions.open(project, capability, repo_sha, idempotency_key, ttl_ms)
+sessions.open(project, capability, repo_sha, idempotency_key, ttl_ms)  # ttl_ms 1000..900000 (default 60000)
 sessions.exec(session_id, operation, payload, idempotency_key)
 sessions.close(session_id)
 ```
 
 The default `approval_mode: automatic` queues authorized jobs immediately.
 Operators who explicitly set `approval_mode: manual` add a human gate to
-mutating jobs. Approval intentionally does not exist in MCP:
+mutating jobs (and to `sessions.open` when the leased capability covers any
+approval-gated operation; once open, `sessions.exec` submits jobs with
+`requires_approval: false`). Approval intentionally does not exist in MCP:
 
 ```bash
 supadrum approve <job-id> --actor operator --config ./supadrum.yml
@@ -286,44 +440,47 @@ an agent can tell a denial from a not-yet:
 }
 ```
 
-`retryable` is true only when repeating the identical call could succeed
-without the caller changing anything — today that means `session_not_active`,
-where the lease exists but its open job has not been granted yet. Every other
-code asks the caller to do something different: `unknown_project`,
-`unknown_job`, `unknown_session`, `capability_denied`,
+`retryable` is `true` only for `session_not_active` (the lease exists, but its
+open job has not been granted yet). Every other `BrokerErrorCode` has
+`retryable: false` and requires a different caller input or state change:
+`unknown_project`, `unknown_job`, `unknown_session`, `capability_denied`,
 `approval_not_required`, `invalid_input`, `idempotency_conflict`,
-`job_state_conflict`, `session_state_conflict`.
+`job_state_conflict`, `session_state_conflict`, and `internal_invariant`.
 
-`internal_invariant` is the exception that is nobody's fault but the broker's
-— it means Supadrum rejected its own state transition, and retrying will not
-help. A failure with no code at all is a crash, not a protocol answer.
+`internal_invariant` indicates the broker rejected its own state transition; a
+failure with no code at all is an unhandled crash, not a protocol answer.
 
 ### Generated types
 
-`types.generate` writes the TypeScript types of one schema into a file inside
-the project repository, through the Supabase CLI and the management token the
-runner already holds. Same `schema-inspection` capability, no approval; the
-generated text stays on disk — the result carries only its path, digest and
-size. Local chambers generate from the running stack after the loopback
-preflight.
+`types.generate` writes the TypeScript types of one schema (`public` by
+default) into a repository file via `supabase gen types typescript`, using
+`management_token` on remote chambers or `--local` after loopback preflight
+on local chambers. Same `schema-inspection` capability, no approval; the
+generated text stays on disk and only its relative path, SHA-256 digest, and
+byte count return in `verification` (`jobs.submit` arguments):
 
 ```json
 {
   "project": "example-web",
   "operation": "types.generate",
-  "payload": { "output": "src/types/supabase.ts", "schema": "public" }
+  "payload": { "output": "src/types/supabase.ts", "schema": "public" },
+  "repo_sha": "abc123",
+  "idempotency_key": "example-web:abc123:types-public"
 }
 ```
 
 ### Read-only schema contracts
 
-`schema.inspect` lets an agent verify exact database requirements without
-supplying SQL or receiving PostgreSQL credentials. It has its own
-`schema-inspection` capability and never requires approval:
+`schema.inspect` verifies database contracts using parameterized, read-only
+catalog queries (`default_transaction_read_only=on`, `statement_timeout=5000`,
+`lock_timeout=1000`, `PGSSLMODE=require`) against remote `database_access`
+chambers with the `schema-inspection` capability (no approval, supports both
+`supabase` and `prisma` migration history; not yet wired for `target: local`).
+Example `jobs.submit` call:
 
 ```json
 {
-  "project": "example-ios",
+  "project": "example-remote",
   "operation": "schema.inspect",
   "payload": {
     "checks": [
@@ -357,11 +514,12 @@ supplying SQL or receiving PostgreSQL credentials. It has its own
     ]
   },
   "repo_sha": "abc123",
-  "idempotency_key": "example-ios:abc123:schema-contract-v1"
+  "idempotency_key": "example-remote:abc123:schema-contract-v1"
 }
 ```
 
-The same operation can certify structural RLS state and effective privileges:
+The same operation's `payload` can also certify structural RLS state and
+effective privileges:
 
 ```json
 {
@@ -420,69 +578,51 @@ Privilege checks use PostgreSQL's effective privilege predicates, so inherited
 and `PUBLIC` grants are included. Supported schema privileges are `USAGE` and
 `CREATE`; relation privileges are `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
 `TRUNCATE`, `REFERENCES`, `TRIGGER`, and `MAINTAIN`; routine privileges support
-`EXECUTE`. `MAINTAIN` requires PostgreSQL 17 or later, so verify the target
-server version before requesting it. A negative requirement uses
-`"granted": false`.
+`EXECUTE`. `MAINTAIN` requires PostgreSQL 17 or later. A negative requirement
+uses `"granted": false`.
 
 The runner verifies the requested repository SHA before database access and
-executes only built-in, parameterized catalog queries in read-only
-transactions. Routine checks match PostgreSQL functions (`prokind = 'f'`),
-which is the object kind exposed as a Supabase RPC; procedures and aggregates
-do not satisfy them.
-
-Requests contain 1–100 checks. Their serialized JSON is limited to 64 KiB,
-PostgreSQL identifiers to 63 UTF-8 bytes, and routine signatures to 64
-arguments of at most 255 UTF-8 bytes each. A completed result with
-`compatible: false` means one or more submitted requirements are unsatisfied.
-That can mean a missing object or role, a structural mismatch, or an effective
-privilege different from the requested value. It is not an execution failure,
-and `compatible` applies only to the submitted checks; it does not claim that
-the whole repository and remote schema are identical. Policy checks certify
-structure, not the business correctness of predicates. That requires separate
-tests with real identities.
+matches routines that are functions (`prokind = 'f'`, exposed as Supabase RPCs).
+Requests contain 1–100 checks, serialized `checks` JSON is capped at 64 KiB
+(`65536` UTF-8 bytes), PostgreSQL identifiers at 63 UTF-8 bytes, and routine
+signatures at 64 arguments of at most 255 UTF-8 bytes each. A completed result
+with `compatible: false` reports unsatisfied requirements without failing the
+job; policy checks verify structure, not predicate semantics.
 
 ### Storage objects
 
-`storage.admin` lists, downloads, uploads and deletes Storage objects through
-the Storage REST API, with the chamber's own key: the remote `secret_key` and
-`project_ref`, or, on a local chamber, the service key from `supabase status`
-after the loopback preflight. It needs the `storage` capability, which local
-chambers may now grant, and it is approval-gated like `auth.admin`. Buckets are
-read-only: no action creates, changes or deletes a bucket. Upload and delete
-refuse a bucket named like a Storage route (`sign`, `move`, `copy`, …), which
-would turn the request into that route.
+`storage.admin` lists, downloads, uploads, and deletes Storage objects through
+the Storage REST API using `secret_key` and `project_ref` on remote chambers,
+or the verified loopback service key from `supabase status` on local chambers.
+It requires the `storage` capability and is approval-gated. Buckets are
+read-only, and upload/delete refuse bucket names matching Storage routes
+(`sign`, `upload`, `list`, `info`, `public`, `authenticated`, `move`, `copy`).
 
-Object paths and contents never appear in the job result, verification or
-errors. The result carries counts, bytes and sha256 digests; the paths exist
-only in files written under `dest`.
-
-`dest` is relative to the repository, confined to it, covered by
-`git check-ignore`, and empty or not yet existing. Anything else is refused
-before the first Storage request. Git is asked about a file under `dest`
-(`MANIFEST` or `LIST`), so a rule on the folder itself counts. The repository
-root, `.git` and any path through a symbolic link are refused.
+Object paths and contents never appear in the job result, verification, or
+errors: results carry counts, byte totals, and SHA-256 digests, while paths
+stay only in files written under `dest`. `dest` must be relative to the
+repository, confined to it, covered by `git check-ignore`, empty or absent, and
+not `.git` (case-insensitive) or reached through a symlink.
 
 ```json
 { "action": "list" }
 { "action": "list", "dest": "backups/storage-list" }
 ```
 
-`list` returns, per bucket, `name`, `public`, `objects` and `bytes`, plus the
-totals. With `dest` it also writes `LIST` (`bucket/path`, bytes and date per
-line) and returns its `list_sha256` and `list_bytes`.
+`list` pages buckets 1,000 entries at a time and returns per-bucket `name`,
+`public`, `objects`, and `bytes`, plus totals. With `dest` it also writes `LIST`
+(`bucket/path`, bytes, timestamp) and returns `list_sha256` and `list_bytes`.
 
 ```json
 { "action": "download", "dest": "backups/storage-2026-10-27" }
 { "action": "download", "dest": "backups/storage-2026-10-27", "buckets": ["avatars"] }
 ```
 
-`download` fetches every bucket, or only those named, into `dest/<bucket>/<path>`
-and writes `MANIFEST` with sha256, bytes and `bucket/path` per line. The result
-holds `buckets`, `objects`, `bytes`, `manifest_sha256` and `manifest_bytes`. A
-server-side name that would leave `dest` (`..`, an empty or absolute segment)
-fails the job before the first download, and so does a listing whose total
-would leave less than 256 MiB free on the repository's disk. A body whose size
-differs from the listing fails the job.
+`download` requests `Accept-Encoding: identity` (300 s timeout per request,
+1,024-char object path limit), enforces `256 MiB` free disk headroom before
+fetching, verifies body size against `Content-Length` and listing bytes, saves
+objects under `dest/<bucket>/<path>`, and writes `MANIFEST` (`sha256`, bytes,
+`bucket/path`).
 
 ```json
 {
@@ -490,16 +630,13 @@ differs from the listing fails the job.
   "bucket": "avatars",
   "object": "team/logo.png",
   "path": "assets/logo.png",
-  "digest": "<sha256 of assets/logo.png>",
+  "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "content_type": "image/png"
 }
 ```
 
-`upload` sends one repository file. The payload pins its `digest`, as
-`sql.execute` does, and a mismatch is refused before any request. `content_type`
-is required. The file must not be reached through a symbolic link or sit in
-`.git`. An existing object stops the job unless `"upsert": true`. The
-result holds `objects`, `bytes`, `sha256` and `upsert`.
+`upload` pins the SHA-256 `digest` of a repository file (no `.git` or symlink)
+and requires `content_type`; an existing object fails unless `"upsert": true`.
 
 ```json
 {
@@ -510,11 +647,9 @@ result holds `objects`, `bytes`, `sha256` and `upsert`.
 }
 ```
 
-`delete` takes exact object paths only: no prefixes, wildcards or whole
-buckets, and at most 100 per job. It first downloads every named object into
-`dest` with a `MANIFEST`, and deletes only if every download succeeded. The
-result holds `objects`, `deleted`, `bytes`, `manifest_sha256` and
-`manifest_bytes`.
+`delete` accepts up to 100 distinct exact object paths (no prefixes or
+wildcards), downloads all named objects into `dest` with `MANIFEST` first, and
+deletes only if every download succeeded.
 
 ## Job states
 
@@ -533,10 +668,17 @@ lease_expired
 
 Only `completed` means success.
 
-`waiting_approval` is used by explicit `approval_mode: manual` deployments and
-by jobs persisted before an operator switched to automatic mode. An automatic
-runner records `approved_by: policy:automatic` while reconciling those legacy
-jobs, then continues normal execution.
+- The runner grants one active job at a time with a default `60000` ms lease;
+  stale `granted`, `running`, or `verifying` jobs transition to
+  `lease_expired` on `Runner.tick()`.
+- `jobs.cancel` cancels `queued`, `waiting_credentials`, `waiting_approval`, or
+  `granted` jobs, and rejects `running` or `verifying` jobs with
+  `job_state_conflict`.
+- If a credential check fails while `running` (`MissingCredentialsError`), the
+  job returns to `waiting_credentials` so it does not block other FIFO work.
+- `waiting_approval` is used by `approval_mode: manual` and legacy queued jobs;
+  an automatic runner records `approved_by: policy:automatic` when releasing
+  legacy jobs.
 
 ## Configuration
 
@@ -544,6 +686,7 @@ Start from [`examples/supadrum.yml`](examples/supadrum.yml). Physical Supabase
 backends are chambers; logical applications point to them:
 
 ```yaml
+version: 1
 approval_mode: automatic
 
 chambers:
@@ -571,160 +714,167 @@ projects:
     mode: live
     migrations: consumer
     capabilities:
-      - data-api
+      - storage
       - edge-functions
       - schema-inspection
 ```
 
-Projects default to `dry-run`; `supadrum project live <alias>` validates the
-repository and credential bundle before enabling only that alias. Consecutive
-aliases on one chamber reuse its mounted credentials. A different chamber
-causes drain and rotation. The global FIFO still grants only one job at a time.
+Projects default to `dry-run` (unless `executor: command` is set and `mode` is
+omitted); `supadrum project live <alias>` validates the repository and core
+credential bundle before enabling only that alias. Consecutive aliases on one
+chamber reuse its mounted credentials. A different chamber causes drain and
+rotation. The global FIFO grants only one job (or active session) at a time.
 
-Credential-free local chambers may grant `auth-admin` and `storage` in
-addition to `migrations`. The supported local action resets one active SNAP password
-credential to the public development profile without putting a password or
-hash in the queued payload:
+### Local chambers, Edge Functions, and workers
 
-```json
-{
-  "action": "reset-password",
-  "adapter": "snap-password",
-  "email": "developer@example.test",
-  "profile": "local-development"
-}
+Local chambers (`target: local`) operate against a loopback Docker/Supabase
+stack without stored chamber credentials (`supadrum project start <alias>`
+ensures a `127.0.0.1`-bound Docker network, starts `supabase`, and updates
+Vite `.env.development.local` when `auth.external_url` is configured). They
+support the 10 local capabilities (`migrations`, `auth-admin`, `sql`,
+`adapter-tests`, `pgtap`, `stack`, `schema-inspection`, `storage`,
+`edge-functions`, `secrets`) with `migration_driver: supabase`. Note that
+`schema.inspect` currently has no local live adapter even though
+`schema-inspection` is accepted for `types.generate`.
+
+Local chambers can also register operator-owned Edge Functions, runtime
+secrets, and `pg_cron` worker jobs:
+
+```yaml
+version: 1
+executor: command
+vault_command: [supadrum-vault, keychain, resolve]
+
+chambers:
+  example-local:
+    target: local
+    managed_secrets:
+      WEBHOOK_TOKEN: vault://examples/local/webhook-token
+    local_worker_jobs:
+      - dispatch-notifications
+    local_functions:
+      healthcheck:
+        identity: anon
+      user-sync:
+        identity: account
+        account: user_one
+    local_runtime:
+      secrets: [WEBHOOK_TOKEN]
+      probe: healthcheck
+      network: supadrum-example-loopback
+      workers:
+        schedule_sql:
+          - supabase/workers/schedule.sql
+        autostart: true
+    auth_password_accounts:
+      user_one:
+        user_id: 00000000-0000-4000-8000-000000000001
+        email: user1@example.test
+        password_ref: vault://examples/local/user-one
+
+projects:
+  example-local:
+    repo: /absolute/path/to/example-local
+    chamber: example-local
+    mode: live
+    migrations: owner
+    capabilities:
+      - migrations
+      - sql
+      - storage
+      - edge-functions
+      - secrets
+      - auth-admin
 ```
 
-The `local-development` profile is local-only and maps to the documented test
-password `TestPassword1234`. The operation requires a loopback database,
-updates exactly one password credential, clears login lockout state, and aborts
-the transaction when the account is missing or ambiguous.
-
-`{"action":"inspect-organizations","adapter":"snap-auth"}` performs a
-read-only local inspection returning only organization id, name, slug,
-onboarding state, and product/document-ingest counts.
+- `functions.invoke` (`edge-functions`, approval-gated) POSTs JSON (max 64 KiB
+  request/response) to a registered function in `local_functions` on loopback,
+  returning only HTTP status and response byte count.
+- `secrets.check` (`secrets`, approval-gated) verifies that named
+  `managed_secrets` resolve without revealing values or references.
+- `secrets.set` (`secrets` + `edge-functions`, approval-gated) on `target: local`
+  must name every secret in `local_runtime.secrets` and delegates to
+  `functions.runtime.restart`.
+- `functions.runtime.restart` stops registered `local_worker_jobs`, re-verifies
+  the `127.0.0.1`-bound Docker network before and after `supabase stop` /
+  `supabase start --network-id` (passing resolved `local_runtime.secrets` in
+  process env for `[edge_runtime.secrets]` in `supabase/config.toml`), calls the
+  `probe` function, and activates workers only when `autostart: true`.
+- `functions.workers.stop` / `functions.workers.activate` toggle only
+  `local_worker_jobs` via committed `schedule_sql` files (max 256 KiB, read from
+  the pinned `repo_sha`, rejecting any backslash `\`).
 
 ### Local Supabase Auth password accounts
 
-For a local demo whose seed already contains `auth.users` placeholders, register
-the exact Auth user ID and email in the **operator-owned** local chamber config.
-The password reference is metadata; the password itself lives only in the vault.
-For example, the Project Atlas seed contains these four accounts:
+For a local demo whose seed already contains `auth.users` placeholders linked to
+`public.users`, register the exact Auth user ID and email in
+`auth_password_accounts` on the `target: local` chamber (the password itself
+lives only in the vault). Use
+`supadrum-vault keychain put vault://examples/local/user-one` at an operator
+terminal to store a unique password (`>= 12` chars), then submit the
+approval-gated `auth.admin` job:
+
+```json
+{
+  "project": "example-local",
+  "operation": "auth.admin",
+  "payload": {
+    "adapter": "supabase-password",
+    "action": "upsert",
+    "account": "user_one"
+  },
+  "repo_sha": "abc123",
+  "idempotency_key": "example-local:abc123:auth-user-one"
+}
+```
+
+The broker verifies `auth.users` and `public.users`, normalizes missing GoTrue
+fields on that row, updates password and email confirmation through local Auth
+Admin, and verifies password login (`POST /auth/v1/token?grant_type=password`
+and `GET /auth/v1/user`) before reporting `completed`.
+
+### Pinned local adapter tests and personal database logins
+
+`tests.run` is available only on a live `target: local` chamber with
+`adapter-tests`. The operator registers an npm script, `writer_password_ref`,
+optional `writer_role` (`atlas_session_writer` or `atlas_graph_writer`),
+optional `setup_sql_path`, `personas` (must include `student`, `staff`,
+`outsider`), and optional `password_accounts` / `database_logins`. Personal
+database logins (`role` must be `atlas_cost_owner` or `atlas_session_operator`,
+name ending with `_<person>` with hyphens turned to underscores, and no
+person name a suffix of another) ensure `session_user` identifies who acted:
 
 ```yaml
+version: 1
+executor: command
+vault_command: [supadrum-vault, keychain, resolve]
+
 chambers:
-  project-atlas:
+  example-local:
     target: local
     auth_password_accounts:
-      giulia:
-        user_id: 5eed0000-0000-4000-8000-000000000001
-        email: giulia@alfa.test
-        password_ref: vault://atlas/local/giulia
-      marco:
-        user_id: 5eed0000-0000-4000-8000-000000000002
-        email: marco@alfa.test
-        password_ref: vault://atlas/local/marco
-      admin:
-        user_id: 5eed0000-0000-4000-8000-000000000003
-        email: admin@alfa.test
-        password_ref: vault://atlas/local/admin
-      sara:
-        user_id: 5eed0000-0000-4000-8000-000000000004
-        email: sara@beta.test
-        password_ref: vault://atlas/local/sara
-projects:
-  project-atlas:
-    repo: /absolute/path/to/project-atlas
-    supabase_dir: database
-    chamber: project-atlas
-    mode: live
-    capabilities: [auth-admin, adapter-tests, sql]
-```
-
-Use `supadrum-vault keychain put vault://atlas/local/giulia` at an operator
-terminal to store a unique password for each account. Then submit the approval-gated
-`auth.admin` job with payload
-`{"adapter":"supabase-password","action":"upsert","account":"giulia"}`.
-The payload cannot choose an ID, email, URL, or password. The broker requires
-the registered placeholder ID and email to match both `auth.users` and its
-`public.users` link. It normalizes missing GoTrue fields on that one row, then
-updates it through Auth Admin with a confirmed email and the vault password.
-It proves password login against local Auth and verifies the returned signed
-JWT has that ID before reporting `completed`. Repeating the job resets the
-same account. If the placeholder is absent or mismatched, apply the intended
-seed through Supadrum first; the broker does not guess an ID or create an
-unlinked application user.
-
-To pass login credentials to a registered `tests.run` script, add
-`password_accounts: [giulia, marco, admin, sara]` to that script's
-`adapter_tests` entry. Only the pinned child receives the selected
-`SUPADRUM_AUTH_<NAME>_EMAIL` and `_PASSWORD` variables. For these scripts the
-broker returns the exit code and suppresses both captured streams, including
-any encoded form of a password. Treat the child script as trusted code and keep its test
-artifacts free of credential dumps. Use the real login in an acceptance test
-before relying on a PWA or demo login; synthetic persona JWTs used by other
-adapter tests do not prove password access.
-
-Atlas tickets that need a human actor (the cost owner who waives a verification,
-the operator who resolves a closing) select personal database logins instead of
-a shared one. Register one login per person and role in the chamber, then list
-the ones a script needs:
-
-```yaml
-chambers:
-  example-local:
-    target: local
+      user_one:
+        user_id: 00000000-0000-4000-8000-000000000001
+        email: user1@example.test
+        password_ref: vault://examples/local/user-one
     database_logins:
-      cost_owner_paolobiancalana:
+      cost_owner_alex:
         role: atlas_cost_owner
-        person: paolobiancalana
-        password_ref: vault://examples/local/cost-owner-paolobiancalana
-    adapter_tests:
-      reconciler:
-        # ...writer_password_ref, personas as above
-        database_logins: [cost_owner_paolobiancalana]
-```
-
-The login name must end with `_<person>` (dashes become underscores), and no
-person may end with another (`maria` and `anna-maria` would share a suffix). The child
-then receives `ATLAS_LOGIN_COST_OWNER_PAOLOBIANCALANA_DATABASE_URL` for the
-PostgreSQL login `supadrum_atlas_cost_owner_paolobiancalana`, member of only
-`atlas_cost_owner`. The role must already exist in the target schema; if it
-does not, or if the guard in [SECURITY.md](SECURITY.md) refuses, the job fails
-before the script starts. The configuration file is not versioned: when you
-register a login there, add its row to
-[docs/database-logins.md](docs/database-logins.md) and commit that. To retire a
-login, remove it from the configuration, commit to the target repository a SQL
-file that drops the role and run it with a broker `sql.execute` job (which runs
-only versioned files, by digest), delete its Keychain entry, and mark the ledger
-row retired; until the role is dropped, the guard refuses
-every run of that human role, because the role then has an unregistered member.
-
-To prove the guard on a real PostgreSQL (16 or later), point
-`SUPADRUM_THROWAWAY_PG_URL` at a disposable loopback cluster (never a Supabase
-stack: the test creates and drops Atlas-named roles and the `app` schema) and
-run `npx vitest run test/personal-login-guard.pg.test.ts`.
-
-### Pinned local adapter tests
-
-`tests.run` is available only for a live local chamber with the
-`adapter-tests` capability. The operator registers an npm script and synthetic
-persona IDs in the chamber configuration; a job may select only its registered
-name, not supply argv, environment, SQL, or credentials:
-
-```yaml
-chambers:
-  example-local:
-    target: local
+        person: alex
+        password_ref: vault://examples/local/cost-owner-alex
     adapter_tests:
       sessions:
         npm_script: test:adapter
         writer_password_ref: vault://examples/local/writer-password
+        writer_role: atlas_session_writer
         setup_sql_path: database/supabase/fixtures/adapter-contract.sql
+        password_accounts: [user_one]
+        database_logins: [cost_owner_alex]
         personas:
-          student: 00000000-0000-4000-8000-000000000001
-          staff: 00000000-0000-4000-8000-000000000002
-          outsider: 00000000-0000-4000-8000-000000000003
+          student: 00000000-0000-4000-8000-000000000011
+          staff: 00000000-0000-4000-8000-000000000012
+          outsider: 00000000-0000-4000-8000-000000000013
+
 projects:
   example:
     repo: /absolute/path/to/example
@@ -735,142 +885,173 @@ projects:
 ```
 
 For a suite with `setup_sql_path`, first submit `sql.execute` for that
-repository file with its SHA-256 digest and the same `repo_sha`; wait until the
-job is **completed**. Then submit `tests.run` with payload
-`{"script":"sessions","setup_job_id":"<completed SQL job UUID>"}`. The broker
-checks that the SQL job completed successfully for the same project, commit,
-registered path, and exact fixture blob digest. A failed or mismatched setup
-blocks the test job. Immediately before the script, the broker reapplies that
-registered, committed fixture to the current local stack. Fixture SQL must be
-idempotent; this replay keeps a restarted or recreated stack from silently
-reusing an old setup job. A job cannot select arbitrary SQL.
+repository file with its SHA-256 `digest` at the same `repo_sha`; once
+completed, submit `tests.run` with
+`{"script":"sessions","setup_job_id":"<completed SQL job UUID>"}`. Before
+running, the broker verifies `HEAD === repo_sha`, a clean git checkout, and a
+loopback Supabase stack; replays `setup_sql_path`; provisions fresh random
+passwords in macOS Keychain (or `vault_command` + `vault_write_command`, both
+required off macOS) and sends only SCRAM-SHA-256 verifiers to PostgreSQL; and
+checks role attributes, function ACLs, and absence of table/column/sequence/create
+grants (see [`SECURITY.md`](SECURITY.md)).
 
-Before running the script, the broker requires HEAD to resolve exactly to
-`repo_sha`, a clean tracked and untracked checkout, and a loopback Supabase
-stack. It recreates the broker-owned login as a member only of
-`atlas_session_writer`, stores its random password in the local macOS Keychain,
-and checks its effective `app` function and application-table privileges.
-Plaintext is never sent in provisioning SQL: PostgreSQL receives a SCRAM
-verifier. The test process receives only `ATLAS_WRITER_DATABASE_URL`,
-`ATLAS_DATA_API_URL`, `ATLAS_ANON_KEY`, and short-lived
-`ATLAS_<PERSONA>_JWT` values, plus basic process variables. The anon key must
-be a locally signed JWT with the `anon` role; the JWT signing secret remains
-inside the broker. A nonzero test exit fails the job while preserving its exit
-code and redacted stdout/stderr in the result. The child script is trusted
-code at the pinned commit, not a sandboxed workload.
-When a script declares `password_accounts`, that same child additionally gets
-the selected `SUPADRUM_AUTH_<NAME>_EMAIL` and `_PASSWORD` variables.
+The test child receives `ATLAS_WRITER_DATABASE_URL` (direct stack DB port, not
+the pooler), `ATLAS_DATA_API_URL`, `ATLAS_ANON_KEY`, `ATLAS_<PERSONA>_JWT`,
+selected `SUPADRUM_AUTH_<NAME>_EMAIL` / `SUPADRUM_AUTH_<NAME>_PASSWORD` (when
+`password_accounts` is used, captured `stdout`/`stderr` are suppressed), and
+selected `ATLAS_LOGIN_<NAME>_DATABASE_URL` (for PostgreSQL role
+`supadrum_atlas_<name>`). Record and retire personal database logins in
+[`docs/database-logins.md`](docs/database-logins.md).
 
-`ATLAS_WRITER_DATABASE_URL` is the stack's **direct** database port (the
-`DB URL` of `supabase status`), never the connection pooler, so a session
-opened on it is the one that holds an advisory lock and the one that releases
-it. The URL is built at run time from the Keychain password and never written
-to a file; the broker redacts it from the captured streams. The script may
-open it more than once (two concurrent runtimes contend for the lock against
-the stack's own `max_connections`, 100 by default, shared with no other
-project) and sets TCP keepalives itself, per session, since
-`tcp_keepalives_idle`, `_interval` and `_count` are user-settable: pass
-`?options=-c%20tcp_keepalives_idle%3D30` or run `SET` after connecting, then
-read them back with `current_setting`.
+To prove the personal-login guard on a real PostgreSQL 16+ cluster, point
+`SUPADRUM_THROWAWAY_PG_URL` at a disposable loopback cluster and run
+`npx vitest run test/personal-login-guard.pg.test.ts`.
 
-Auth Admin can also recreate or reactivate the test user in the known local
-`SNAP Dev` tenant, mark that tenant ready for application access, attach the
-user as owner, reset the same public development password, and revoke stale
-sessions:
+### Disposable pgTAP and stack runs
 
-```json
-{
-  "action": "recreate-test-user",
-  "adapter": "snap-password",
-  "email": "test@materic.dev",
-  "profile": "local-development",
-  "organization": "snap-dev-ready"
-}
+`pgtap.run` (`pgtap` capability) and `stack.serve` (`stack` capability) extract
+a full 40- or 64-character hex git **tree OID** into `~/.cache/supadrum`
+(`supadrum-tmp-<alias>`) and boot a disposable loopback Docker Supabase stack on
+free ports starting at `pgtap.port_base` (`56321`), leaving manual local stacks
+untouched. Both require `executor: command`, `mode: live`, `target: local`, a
+`[a-z0-9-]` project alias, and a chamber `pgtap` block:
+
+```yaml
+version: 1
+executor: command
+pgtap:
+  queue_timeout_ms: 120000
+  port_base: 56321
+  min_free_gib: 5
+
+chambers:
+  example-local:
+    target: local
+    pgtap:
+      tests_path: supabase/tests
+      start_timeout_ms: 300000
+      test_timeout_ms: 120000
+
+projects:
+  example-local:
+    repo: /absolute/path/to/example-local
+    chamber: example-local
+    mode: live
+    capabilities: [pgtap, stack]
 ```
 
-The transaction fails closed when the known seed tenant is absent, so the
-broker never guesses a tenant.
+Run `supadrum pgtap <alias> $(git write-tree)` for pgTAP hooks, or
+`supadrum stack <alias> $(git write-tree) -- <command...>` to run Playwright or
+Deno suites with `SUPADRUM_*`-prefixed `supabase status -o env` variables. Full
+details, limits, and exit codes are documented in
+[`docs/pgtap.md`](docs/pgtap.md) and [`docs/stack.md`](docs/stack.md).
 
-`migration_driver` accepts `supabase` or `prisma` and defaults to `supabase`
-for backward compatibility. The Supabase driver plans with
-`supabase db push --dry-run --linked` and applies with
-`supabase db push --linked --yes`, each preceded by `supabase link
---project-ref <ref>`. `--linked` takes no connection string: it reads the
-CLI's own `.temp` state in the repository, and a link made on a machine that
-had IPv6 pins the direct host, which publishes an AAAA record and nothing
-else. Relinking targets the session pooler — the same one the direct database
-route uses — so the push works on a network without IPv6, and the connection
-stays in the environment instead of becoming a `--db-url` argument. The Prisma driver plans with
-`prisma migrate status`, applies versioned production migrations with
-`prisma migrate deploy`, and inspects `public._prisma_migrations`. Prisma is
-resolved from the repository's installed `node_modules/.bin` first, then from
-the runner `PATH`. Supadrum passes the vault-resolved `DATABASE_URL` and
-`DIRECT_DATABASE_URL` only through the child environment and redacts both the
-URI and its decoded password from captured output. A Prisma plan with pending
-migrations completes successfully with `pending_migrations: true`; connection,
-history-divergence, and failed-migration errors still fail closed.
+### Migrations, Prisma baselines, and deploy
 
-Existing Prisma databases can establish migration history through the
-`migration.baseline` operation. In manual mode it is approval-gated. Its
-payload is an explicit contiguous prefix of `prisma/migrations`:
+`migration_driver` accepts `supabase` (default) or `prisma`. Only one project
+per chamber may set `migrations: owner`.
 
-```json
-{
-  "migrations": [
-    "20260101090000_init",
-    "20260101100000_enable_rls"
-  ]
-}
+- **Supabase remote**: plans with `supabase db push --dry-run --linked` and
+  applies with `supabase db push --linked --yes` (relinking via session pooler
+  on IPv4-only networks; connection password stays in env).
+- **Supabase local**: runs `supabase db push --dry-run --local`, `db push --local`,
+  or `migration.diff` (`supabase db schema declarative sync --no-apply --strict-coverage`).
+- **Prisma remote**: runs `prisma migrate status`, `prisma migrate deploy`, and
+  `migration.baseline` (`prisma migrate resolve --applied <name>` over a clean,
+  tracked contiguous prefix of `prisma/migrations`), passing `DATABASE_URL` and
+  `DIRECT_DATABASE_URL` in env. Supadrum resolves the installed Prisma
+  package's Node entrypoint. `SUPADRUM_PRISMA_BIN` can point to an executable
+  or a JavaScript entrypoint.
+
+Projects declaring `deploy` configure operator-owned `commands` (single `argv` or
+multi-step `steps`) and optional `deploy_target`:
+
+```yaml
+version: 1
+executor: command
+vault_command: [supadrum-vault, keychain, resolve]
+
+chambers:
+  example-prod:
+    project_ref: abcdefghijklmnopqrst
+    deploy_target:
+      provider: vercel
+      project_id: prj_example123
+      org_id: team_example123
+    credentials:
+      secret_key: vault://supabase/example-prod/secret
+      management_token: vault://supabase/example-prod/management
+      database_access: vault://supabase/example-prod/postgres
+      deploy_token: vault://vercel/example-prod/token
+
+projects:
+  example-web:
+    repo: /absolute/path/to/example-web
+    chamber: example-prod
+    mode: live
+    capabilities: [deploy]
+    commands:
+      deploy.plan:
+        argv: [vercel, build, "--prod"]
+        env:
+          VERCEL_TOKEN: deploy_token
+      deploy.apply:
+        steps:
+          - argv: [vercel, pull, "--yes", "--environment=production"]
+          - argv: [vercel, build, "--prod"]
+          - argv: [vercel, deploy, "--prebuilt", "--prod"]
+        env:
+          VERCEL_TOKEN: deploy_token
 ```
 
-Every requested `migration.sql` must be tracked and clean at the submitted
-repository commit. Supadrum resolves that SHA once to its complete commit OID,
-uses the same OID for HEAD, tree, and blob checks, and compares Prisma history
-name, order, completion state, and checksum. It invokes only
-`prisma migrate resolve --applied <name>` for the missing suffix and verifies
-history after every command. A failed, incomplete, rolled-back, unexpected,
-out-of-order, or checksum-mismatched row fails closed. Retrying rereads durable
-history and skips only an already completed contiguous prefix.
-
-`migration.baseline` is Prisma-only and migration-owner-only. It records the
-submitting agent's assertion that existing schema matches the prefix; it does
-not infer or repair schema compatibility and it has no direct CLI bypass.
-
-Live operations use built-in typed adapters for project inspection, migration
-planning/application, catalog-only schema inspection, Function deployment,
-operator-mapped Function Secrets, digest-pinned repository SQL files, and
-Storage objects (`storage.admin`).
-Agents cannot supply arbitrary shell commands. The database URI and derived
-password are passed through environment only, never argv.
+Supported template variables in `commands` argv are `{{project_ref}}`,
+`{{repo_sha}}`, `{{deploy_project_id}}`, `{{deploy_org_id}}`, and scalar
+`{{payload.<path>}}` fields (`deploy_target` values always come from operator
+config, never job payloads).
 
 ## Security model
 
 - Project YAML is operator-owned policy, not agent input.
 - MCP schemas reject sensitive payload keys, PostgreSQL URLs, and vault
   references.
-- The vault resolver receives references over stdin, not argv.
-- Resolved values exist only in runner memory and child-process environment.
-- The SOPS age private identity remains in Keychain and enters only the SOPS
-  child environment.
+- The vault resolver receives `<reference>\n` over stdin (`vault_command`), and
+  external writers receive a JSON line `{"reference":"...","value":"..."}\n`
+  over stdin (`vault_write_command`) with helper stdout/stderr ignored and
+  `shell: false`; references and values never enter `argv`.
+- Supadrum handles resolved values in runner or operator CLI memory and passes
+  them only to authorized child processes. External helpers own their storage
+  and access policy.
+- In `executor: command`, live Supabase/local operations run built-in typed
+  adapters (no shell), while live `deploy.*` runs operator-owned `commands` argv
+  with `shell: false`.
+- The bundled `supadrum-vault` CLI (`keychain`, `sops`, `migrate dotenv`)
+  keeps SOPS age identity custody (`vault://supadrum/keys/age`) in macOS
+  Keychain (`darwin`-only) and passes `SOPS_AGE_KEY` only to the SOPS child
+  environment; off macOS, configure external `vault_command` (and
+  `vault_write_command` when writes are required).
 - Persisted stdout and stderr are redacted with all resolved values.
 - Automatic mode treats configured capabilities as the authorization decision;
   manual approvals remain available only through the operator CLI.
 - Sessions lease exactly one capability and block the global queue until close
   or expiry.
-- The safe default has zero external effects.
+- The safe default (`executor: dry-run`) has zero external effects.
 
 Read [`SECURITY.md`](SECURITY.md) before enabling live mode.
 
 ## Development
 
 ```bash
+npm run typecheck
 npm run check
 npm run build
 npm run smoke
 npm pack --dry-run
 ```
 
-The test suite uses temporary SQLite databases and never contacts Supabase.
+The default `npm test` suite uses temporary SQLite databases and never contacts
+Supabase. Live integration tests are opt-in:
+`SUPADRUM_THROWAWAY_PG_URL=... npx vitest run test/personal-login-guard.pg.test.ts`
+and `SUPADRUM_DOCKER_TESTS=1 npx vitest run test/pgtap.docker.test.ts`.
 
 ## License
 

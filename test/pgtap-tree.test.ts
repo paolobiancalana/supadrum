@@ -95,23 +95,41 @@ describe("pgtap tree with a recording process", () => {
     }
   );
 
-  test("extraction runs git archive with a neutral configuration and passes the paths as parameters", async () => {
+  test("extraction archives and untars with argv, isolated env, timeout and cleanup", async () => {
     const { process, source } = setup();
     await extractTree(source, OID, "/out");
-    const [call] = process.calls;
-    const script = call?.argv.join(" ") ?? "";
-    expect(script).toContain("GIT_CONFIG_GLOBAL=/dev/null");
-    expect(script).toContain("GIT_CONFIG_NOSYSTEM=1");
-    expect(script).toContain("-c filter.lfs.smudge=");
-    expect(script).toContain("-c filter.lfs.required=false");
-    expect(script).toContain("archive --format=tar");
-    expect(call?.argv.slice(-4)).toEqual(["git", "/repo", OID, "/out"]);
-    expect(call?.argv.slice(0, -4).join(" ")).not.toMatch(/\/repo|\/out|a{40}/);
+    const [gitCall, tarCall] = process.calls;
+    expect(gitCall?.argv).toEqual([
+      "git", "-C", "/repo", "-c", "filter.lfs.smudge=", "-c",
+      "filter.lfs.required=false", "archive", "--format=tar",
+      expect.stringMatching(/^--output=/), OID
+    ]);
+    expect(gitCall?.env?.GIT_CONFIG_GLOBAL).toContain("gitconfig.empty");
+    expect(gitCall?.env?.GIT_CONFIG_NOSYSTEM).toBe("1");
+    expect(gitCall?.env?.HOME).toBeUndefined();
+    expect(gitCall?.timeoutMs).toBeGreaterThan(0);
+    expect(tarCall?.argv).toEqual(["tar", "-xf", expect.stringContaining("tree.tar"), "-C", "/out"]);
+    expect(tarCall?.timeoutMs).toBeGreaterThan(0);
+    expect(existsSync(gitCall?.argv.at(-2)?.slice("--output=".length) ?? "")).toBe(false);
   });
 
-  test("a failed extraction is reported as such", async () => {
-    const { source } = setup(() => ({ exitCode: 2, stderr: "tar: No such directory\n" }));
+  test("a failed archive is reported and its temporary directory is removed", async () => {
+    const { process, source } = setup(() => ({ exitCode: 2, stderr: "archive failed\n" }));
+    const before = readdirSync(tmpdir()).filter((name) => name.startsWith("supadrum-tree-")).length;
     expect(await reasonOf(extractTree(source, OID, "/out"))).toBe("extraction_failed");
+    expect(process.calls).toHaveLength(1);
+    expect(readdirSync(tmpdir()).filter((name) => name.startsWith("supadrum-tree-")).length).toBe(before);
+  });
+
+  test("a failed tar extraction is reported and cleans its archive", async () => {
+    let calls = 0;
+    const { process, source } = setup(() => ++calls === 2
+      ? { exitCode: 2, stderr: "tar failed\n" }
+      : {});
+    const before = readdirSync(tmpdir()).filter((name) => name.startsWith("supadrum-tree-")).length;
+    expect(await reasonOf(extractTree(source, OID, "/out"))).toBe("extraction_failed");
+    expect(process.calls).toHaveLength(2);
+    expect(readdirSync(tmpdir()).filter((name) => name.startsWith("supadrum-tree-")).length).toBe(before);
   });
 });
 
@@ -155,7 +173,7 @@ describe("pgtap tree with real git", { timeout: 30_000 }, () => {
       const [program = "", ...args] = input.argv;
       const result = spawnSync(program, args, {
         cwd: input.cwd,
-        env: { ...input.env, ...this.extraEnv },
+        env: { ...this.extraEnv, ...input.env },
         encoding: "utf8"
       });
       return { exitCode: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };

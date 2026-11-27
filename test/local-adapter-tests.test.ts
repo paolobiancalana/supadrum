@@ -110,6 +110,7 @@ function setup() {
   const stored = new Map<string, string>();
   const executor = new LiveSupabaseExecutor({
     process,
+    executables: { npm: ["npm"] },
     passwordVault: {
       async put(reference, value) { stored.set(reference, value); },
       async get(reference) { return stored.get(reference) ?? ""; }
@@ -120,6 +121,19 @@ function setup() {
 }
 
 describe("local adapter tests", () => {
+  test("requires an explicit vault writer off macOS before accessing the stack", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const { process: subprocess, repository } = setup();
+    const executor = new LiveSupabaseExecutor({ process: subprocess });
+    Object.defineProperty(process, "platform", { ...descriptor, value: "win32" });
+    try {
+      await expect(executor.execute(job(), project(repository), {} as never))
+        .rejects.toThrow(/vault_command and vault_write_command/);
+      expect(subprocess.calls.every(({ argv }) => argv[0] === "git")).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", descriptor);
+    }
+  });
   test("reapplies the pinned fixture on the current local stack before the test script", async () => {
     const { executor, process, repository } = setup();
     const fixture = "database/supabase/fixtures/contract.sql";

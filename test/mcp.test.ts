@@ -129,7 +129,7 @@ function createStdioConfig(prefix: string): string {
   );
 }
 
-function createStdioClient(name: string, configPath: string) {
+function createStdioClient(name: string, configPath: string, toolNames = "") {
   const client = new Client({ name, version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -139,7 +139,8 @@ function createStdioClient(name: string, configPath: string) {
     ],
     env: {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
-      SUPADRUM_CONFIG: configPath
+      SUPADRUM_CONFIG: configPath,
+      SUPADRUM_MCP_TOOL_NAMES: toolNames
     },
     stderr: "pipe"
   });
@@ -1190,6 +1191,46 @@ describe("configuration reloading", () => {
 });
 
 describe("MCP protocol surface (stdio)", () => {
+  test("offers a portable tool catalog over stdio when opted in", async () => {
+    const configPath = createStdioConfig("supadrum-stdio-tool-names-");
+    const canonical = createStdioClient("stdio-canonical", configPath);
+    const portable = createStdioClient("stdio-portable", configPath, "portable");
+    await canonical.client.connect(canonical.transport);
+    try {
+      await portable.client.connect(portable.transport);
+      const { tools: canonicalTools } = await canonical.client.listTools();
+      const { tools: portableTools } = await portable.client.listTools();
+      expect(canonicalTools.map(({ name }) => name).sort()).toEqual([
+        "jobs.cancel",
+        "jobs.status",
+        "jobs.submit",
+        "jobs.wait",
+        "projects.inspect",
+        "projects.list",
+        "sessions.close",
+        "sessions.exec",
+        "sessions.open"
+      ]);
+      expect(portableTools).toEqual(
+        canonicalTools.map((tool) => ({ ...tool, name: tool.name.replaceAll(".", "_") }))
+      );
+      const args = { project: "alpha" };
+      const result = await portable.client.callTool({
+        name: "projects_inspect",
+        arguments: args
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({ name: "alpha" });
+      expect(result).toEqual(await canonical.client.callTool({
+        name: "projects.inspect",
+        arguments: args
+      }));
+    } finally {
+      await portable.client.close();
+      await canonical.client.close();
+    }
+  });
+
   test("reloads configuration for a running MCP server when the file changes", async () => {
     const configPath = writeConfig(
       "supadrum-mcp-reload-",

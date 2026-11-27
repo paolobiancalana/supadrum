@@ -3,11 +3,17 @@ import { createHash, randomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import {
   accessSync,
+  closeSync,
   constants,
   existsSync,
+  fchmodSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
   statfsSync,
   writeFileSync
 } from "node:fs";
@@ -23,8 +29,9 @@ import {
 } from "node:path";
 
 import { pgtapBrokerDefaults, type PgtapBrokerConfig, type ProjectConfig } from "./config.js";
+import { resolveNodeCommand } from "./command-resolution.js";
 import type { ExecutionResult, Job } from "./domain.js";
-import type { CommandRunner } from "./local-stack.js";
+import { localNetworkName, type CommandRunner } from "./local-stack.js";
 import { buildPgtapConfig, PgtapConfigError } from "./pgtap-config.js";
 import { PgtapRunFailure, type PgtapReason } from "./pgtap-reasons.js";
 import {
@@ -63,6 +70,13 @@ import {
 import { runStorageAdmin } from "./storage-admin.js";
 import { parseStorageAdminPayload } from "./storage-payload.js";
 import { parseTypesGeneratePayload } from "./types-generate.js";
+import { invokeLocalFunction } from "./local-functions.js";
+import {
+  activateLocalWorkers, activateLocalWorkerSql, scheduleLocalWorkersSql, stopLocalWorkerSql, verifyLocalWorkersSql
+} from "./local-worker-activation.js";
+import { LocalSecretCheckPayload, localSecretUpdate } from "./local-edge-payload.js";
+import { resolveLocalSecrets } from "./local-edge-secrets.js";
+import { MissingCredentialsError } from "./runner.js";
 import {
   analyzeMigrationHistory,
   parseMigrationBaselinePayload,
@@ -271,15 +285,15 @@ begin
       organization_id, organization_ids, email_verified,
       failed_login_attempts, locked_until
     ) values (
-      ${emailLiteral}, 'Test Materic', 'Test', 'Materic', 'it',
+      ${emailLiteral}, 'Test Account', 'Test', 'Account', 'it',
       target_organization_id, array[target_organization_id]::uuid[], true,
       0, null
     ) returning id into target_user_id;
   else
     update public.users
-    set full_name = 'Test Materic',
+    set full_name = 'Test Account',
         first_name = 'Test',
-        last_name = 'Materic',
+        last_name = 'Account',
         organization_id = target_organization_id,
         organization_ids = array[target_organization_id]::uuid[],
         email_verified = true,
@@ -389,6 +403,7 @@ interface LiveExecutorOptions {
   readonly fetch?: typeof fetch;
   readonly resolveReference?: (reference: string) => Promise<string>;
   readonly executables?: Partial<LiveExecutables>;
+  readonly resolveCommand?: typeof resolveNodeCommand;
   readonly passwordVault?: VaultBackend;
   readonly pgtap?: PgtapBrokerConfig;
   /** Parent of the disposable folders; tests point it away from `$HOME`. */
@@ -413,6 +428,9 @@ const STACK_EXCLUDED_SERVICES = "studio,logflare,vector,supavisor,postgres-meta"
 const PGTAP_PROBE_REPOSITORY = "public.ecr.aws/supabase/postgres";
 
 type PgtapPhase = "prepare" | "start" | "test" | "cleanup";
+
+/** `supabase status` said the stack is not running; any other status failure is not that answer. */
+class LocalStackUnavailable extends Error {}
 
 /** A refusal or verdict of `pgtap.run`, raised before its result exists. */
 class PgtapStop extends Error {
@@ -489,33 +507,10 @@ interface LiveExecutables {
   readonly supabase: string;
   readonly psql: string;
   readonly prisma: string;
+  readonly npm?: readonly string[];
 }
 
-export function resolveExecutable(
-  name: "git" | "supabase" | "psql" | "prisma",
-  environment: NodeJS.ProcessEnv = process.env
-): string {
-  const override =
-    environment[`SUPADRUM_${name.toUpperCase()}_BIN`];
-  const candidates = [
-    ...(override ? [override] : []),
-    ...(environment.PATH?.split(delimiter).map((directory) =>
-      join(directory, name)
-    ) ?? []),
-    `/opt/homebrew/bin/${name}`,
-    `/usr/local/bin/${name}`,
-    `/usr/bin/${name}`
-  ];
-  for (const candidate of new Set(candidates)) {
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {}
-  }
-  throw new Error(
-    `Executable ${name} not found; set SUPADRUM_${name.toUpperCase()}_BIN`
-  );
-}
+export { resolveExecutable } from "./command-resolution.js";
 
 function redact(text: string, values: readonly string[]): string {
   return [...new Set(values)]
@@ -600,6 +595,7 @@ export class LiveSupabaseExecutor implements Executor {
     | ((reference: string) => Promise<string>)
     | undefined;
   readonly #executables: LiveExecutables;
+  readonly #resolveCommand: typeof resolveNodeCommand;
   readonly #passwordVault: VaultBackend | undefined;
   readonly #pgtap: PgtapBrokerConfig;
   readonly #cacheRoot: string;
@@ -616,11 +612,13 @@ export class LiveSupabaseExecutor implements Executor {
     this.#fetch = options.fetch ?? fetch;
     this.#resolveReference = options.resolveReference;
     this.#passwordVault = options.passwordVault;
+    this.#resolveCommand = options.resolveCommand ?? resolveNodeCommand;
     this.#executables = {
       git: options.executables?.git ?? "git",
       supabase: options.executables?.supabase ?? "supabase",
       psql: options.executables?.psql ?? "psql",
-      prisma: options.executables?.prisma ?? "prisma"
+      prisma: options.executables?.prisma ?? "prisma",
+      ...(options.executables?.npm ? { npm: options.executables.npm } : {})
     };
   }
 
@@ -670,6 +668,94 @@ export class LiveSupabaseExecutor implements Executor {
     const repositoryOid = await this.#verifyRepository(repository, job);
 
     if (project.target === "local") {
+      if (job.operation === "secrets.set") {
+        if (!project.capabilities.includes("secrets") || !project.capabilities.includes("edge-functions") || !project.local_runtime) {
+          throw new Error("Local secret updates require secrets, edge-functions and an operator registration");
+        }
+        localSecretUpdate(job.payload, project.local_runtime.secrets);
+        return this.execute({ ...job, operation: "functions.runtime.restart", payload: {} }, project, credentials);
+      }
+      if (job.operation === "functions.runtime.restart") {
+        if (!project.capabilities.includes("edge-functions") || !project.capabilities.includes("secrets") ||
+            project.mode !== "live" || Object.keys(job.payload).length || !project.local_runtime) {
+          throw new Error("Local runtime restart requires edge-functions, secrets and an operator registration");
+        }
+        const runtime = project.local_runtime;
+        // A stack that status reports as down has no worker to stop, and the restart is how it comes back
+        // after a failed one. Any other status failure keeps the fail-closed stop: the state is not known.
+        const running = await this.#assertLocalStack(repository, project.supabase_dir).then(() => true, error => {
+          if (error instanceof LocalStackUnavailable) return false;
+          throw error;
+        });
+        if (running) await this.execute({ ...job, operation: "functions.workers.stop", payload: {} }, project, credentials);
+        if (!this.#resolveReference) throw new MissingCredentialsError(runtime.secrets);
+        const values = await resolveLocalSecrets(runtime.secrets, project.managed_secrets ?? {}, this.#resolveReference);
+        const network = runtime.network ?? localNetworkName(repository);
+        if (!/^[a-zA-Z0-9_-]{1,128}$/.test(network)) throw new Error("Invalid local runtime network");
+        await this.#ensureLoopbackNetwork(network, repository);
+        const cwd = project.supabase_dir ?? repository;
+        let stopped: LiveProcessResult | undefined;
+        try {
+          stopped = await this.#process.run({ argv: [this.#executables.supabase, "stop"], cwd,
+            env: this.#localEnvironment({ NO_COLOR: "1" }), timeoutMs: 120_000 });
+        } catch { /* Do not expose process errors. */ }
+        if (!stopped || stopped.exitCode !== 0 || stopped.timedOut) throw new Error("Local runtime stop failed; stack state is unknown");
+        await this.#ensureLoopbackNetwork(network, repository);
+        const stopStack = async () => {
+          try {
+            const fallback = await this.#process.run({ argv: [this.#executables.supabase, "stop"], cwd,
+              env: this.#localEnvironment({ NO_COLOR: "1" }), timeoutMs: 120_000 });
+            return fallback.exitCode === 0 && !fallback.timedOut;
+          } catch { return false; }
+        };
+        let started: LiveProcessResult | undefined;
+        try {
+          started = await this.#process.run({ argv: [this.#executables.supabase, "start", "--network-id", network], cwd,
+            env: this.#localEnvironment({ NO_COLOR: "1", ...values }), timeoutMs: 300_000 });
+        } catch { /* The child may have started resources before failing. */ }
+        if (!started || started.exitCode !== 0 || started.timedOut) {
+          const safe = await stopStack();
+          throw new Error(safe ? "Local runtime start failed; project stack stopped" : "Local runtime start failed; worker state is unknown");
+        }
+        try { await this.execute({ ...job, operation: "functions.workers.stop", payload: {} }, project, credentials); }
+        catch {
+          const safe = await stopStack();
+          throw new Error(safe ? "Local worker stop failed; project stack stopped" : "Local worker stop failed; worker state is unknown");
+        }
+        const database = await this.#assertLocalStack(repository, project.supabase_dir);
+        await invokeLocalFunction(project, { name: runtime.probe }, database.status, this.#fetch);
+        const verification = { target: "local", repo_sha_verified: true, repository_oid: repositoryOid };
+        if (!runtime.workers?.autostart) return { output: { runtime_ready: true, workers_stopped: true }, verification };
+        try { await this.execute({ ...job, operation: "functions.workers.activate", payload: {} }, project, credentials); }
+        catch (error) {
+          // The runtime is up and the workers are stopped (or the activation said otherwise); say both.
+          throw new Error(`Local runtime restarted; worker activation failed: ${error instanceof Error ? error.message : "unknown"}`);
+        }
+        return { output: { runtime_ready: true, workers_stopped: false, workers_active: true }, verification };
+      }
+      if (job.operation === "secrets.check") {
+        if (!project.capabilities.includes("secrets") || project.mode !== "live") throw new Error("Project lacks local secrets capability");
+        const { names } = LocalSecretCheckPayload.parse(job.payload);
+        if (!this.#resolveReference) throw new MissingCredentialsError(names);
+        await resolveLocalSecrets(names, project.managed_secrets ?? {}, this.#resolveReference);
+        return { output: { checked: names }, verification: { target: "local", repo_sha_verified: true, repository_oid: repositoryOid } };
+      }
+      if (job.operation === "functions.workers.activate") {
+        return this.#activateLocalWorkers(job, project, repository, repositoryOid, credentials);
+      }
+      if (job.operation === "functions.workers.stop") {
+        if (!project.capabilities.includes("edge-functions") || project.mode !== "live" || Object.keys(job.payload).length) {
+          throw new Error("Local worker stop requires the edge-functions capability and an empty payload");
+        }
+        await this.#localPsql(project, repository, stopLocalWorkerSql(project.local_worker_jobs ?? []),
+          "Local worker stop failed; worker state is unknown");
+        return { output: { stopped: true }, verification: { target: "local", repo_sha_verified: true, repository_oid: repositoryOid } };
+      }
+      if (job.operation === "functions.invoke") {
+        const database = await this.#assertLocalStack(repository, project.supabase_dir);
+        const output = await invokeLocalFunction(project, job.payload, database.status, this.#fetch);
+        return { output, verification: { target: "local", repo_sha_verified: true, repository_oid: repositoryOid } };
+      }
       if (job.operation === "auth.admin") {
         return this.#executeLocalAuthAdmin(
           job,
@@ -863,9 +949,7 @@ export class LiveSupabaseExecutor implements Executor {
     let residue = "";
     let caught: unknown;
     try {
-      // The fixed 60 s include extraction, `bash -c 'git archive | tar'`: a
-      // timeout signals bash only, and git or tar may hold the pipes open a
-      // while longer. That delays when the kill is seen, not the cleanup.
+      // The preparation deadline also bounds Git archive and tar extraction.
       const network = await phase("prepare", PGTAP_PREPARE_MS, async (run) => {
         const source = { process: run.live, git: this.#executables.git, repository };
         await verifyTree(source, job.repo_sha);
@@ -1078,6 +1162,97 @@ export class LiveSupabaseExecutor implements Executor {
     return this.#runSupabase(args, repository, credentials);
   }
 
+  /** One psql session against the local stack. The process output stays here; callers see only `failure`. */
+  async #localPsql(project: ProjectConfig, repository: string, sql: string, failure: string, timeoutMs = 15_000): Promise<void> {
+    const database = await this.#assertLocalStack(repository, project.supabase_dir);
+    let result: LiveProcessResult | undefined;
+    try {
+      result = await this.#process.run({
+        argv: [this.#executables.psql, ...SCHEMA_INSPECTION_PSQL_ARGS], cwd: repository,
+        env: this.#localEnvironment({ PGHOST: database.host, PGPORT: database.port,
+          PGDATABASE: database.database, PGUSER: database.user, PGPASSWORD: database.password, PGSSLMODE: "disable" }),
+        stdin: sql, timeoutMs
+      });
+    } catch { /* Do not expose process errors. */ }
+    if (!result || result.exitCode !== 0 || result.timedOut) throw new Error(failure);
+  }
+
+  /**
+   * The network the stack starts on must be bound to host loopback. A missing one is created that way: `supabase stop`
+   * removes a network that carries the CLI's project label, and `supabase start` would recreate it on every interface.
+   */
+  async #ensureLoopbackNetwork(network: string, repository: string): Promise<void> {
+    const run = (argv: string[]) => this.#process.run({ argv, cwd: repository, env: this.#localEnvironment({ NO_COLOR: "1" }), timeoutMs: 15_000 });
+    const inspected = await run(["docker", "network", "inspect", network]);
+    if (inspected.exitCode !== 0) {
+      const created = await run(["docker", "network", "create", "-o", "com.docker.network.bridge.host_binding_ipv4=127.0.0.1", network]);
+      if (created.exitCode !== 0) throw new Error("Local runtime network could not be created");
+      return;
+    }
+    let loopback = false;
+    try {
+      const n = JSON.parse(inspected.stdout);
+      loopback = Array.isArray(n) && n.length === 1 && n[0]?.Options?.["com.docker.network.bridge.host_binding_ipv4"] === "127.0.0.1";
+    } catch { /* refuse unsafe network */ }
+    if (!loopback) throw new Error("Local runtime network is not bound to loopback");
+  }
+
+  /** A file of the pinned commit, never the working tree: what runs is what the commit says. */
+  async #committedFile(repository: string, repositoryOid: string, path: string): Promise<string> {
+    this.#repositoryPath(repository, path, "Worker schedule script");
+    let committed: LiveProcessResult | undefined;
+    try {
+      committed = await this.#process.run({ argv: [this.#executables.git, "-C", repository, "show", `${repositoryOid}:${path}`],
+        cwd: repository, env: { PATH: process.env.PATH } });
+    } catch { /* Do not expose process errors. */ }
+    if (!committed || committed.exitCode !== 0) throw new Error("Local worker schedule script is not in the pinned commit");
+    return String(committed.stdout);
+  }
+
+  /**
+   * Schedules the registered workers from committed SQL and starts them, all or none. Every step failure leaves
+   * this project's workers stopped (`activateLocalWorkers`); the messages are fixed so no process output or
+   * secret reference reaches the result.
+   */
+  async #activateLocalWorkers(
+    job: Job,
+    project: ProjectConfig,
+    repository: string,
+    repositoryOid: string,
+    credentials: ResolvedCredentials
+  ): Promise<ExecutionResult> {
+    const runtime = project.local_runtime;
+    const workers = runtime?.workers;
+    const names = project.local_worker_jobs;
+    if (!project.capabilities.includes("edge-functions") || !project.capabilities.includes("secrets") ||
+        project.mode !== "live" || Object.keys(job.payload).length || !runtime || !workers || !names) {
+      throw new Error("Local worker activation requires edge-functions, secrets and an operator registration");
+    }
+    await activateLocalWorkers({
+      stop: async () => { await this.execute({ ...job, operation: "functions.workers.stop", payload: {} }, project, credentials); },
+      secrets: async () => {
+        if (!this.#resolveReference) throw new MissingCredentialsError(runtime.secrets);
+        await resolveLocalSecrets(runtime.secrets, project.managed_secrets ?? {}, this.#resolveReference);
+      },
+      runtime: async () => {
+        const database = await this.#assertLocalStack(repository, project.supabase_dir);
+        await invokeLocalFunction(project, { name: runtime.probe }, database.status, this.#fetch);
+      },
+      schedule: async () => {
+        const scripts: string[] = [];
+        for (const path of workers.schedule_sql) scripts.push(await this.#committedFile(repository, repositoryOid, path));
+        await this.#localPsql(project, repository, scheduleLocalWorkersSql(scripts, names),
+          "Local worker schedule failed", 60_000);
+      },
+      verify: () => this.#localPsql(project, repository, verifyLocalWorkersSql(names), "Local worker verification failed"),
+      activate: () => this.#localPsql(project, repository, activateLocalWorkerSql(names), "Local worker activation failed")
+    });
+    return {
+      output: { workers_active: true, jobs: names.length },
+      verification: { target: "local", repo_sha_verified: true, repository_oid: repositoryOid }
+    };
+  }
+
   async #verifyRepository(
     repository: string,
     job: Job
@@ -1136,6 +1311,9 @@ export class LiveSupabaseExecutor implements Executor {
     const scriptName = job.payload.script as string;
     const registration = registeredAdapterTest(project, scriptName);
     if (!registration) throw new Error("Adapter test script is not registered");
+    if (!this.#passwordVault && process.platform !== "darwin") {
+      throw new Error("Adapter test passwords require vault_command and vault_write_command on this platform");
+    }
     await this.#verifyCleanRepository(repository);
     const database = await this.#assertLocalStack(repository, project.supabase_dir);
     if (registration.setup_sql_path) {
@@ -1264,7 +1442,11 @@ export class LiveSupabaseExecutor implements Executor {
       authPasswords.push(accountPassword);
     }
     const result = await this.#process.run({
-      argv: ["npm", "run", registration.npm_script],
+      argv: [
+        ...(this.#executables.npm ?? this.#resolveCommand("npm").argv),
+        "run",
+        registration.npm_script
+      ],
       cwd: repository,
       env: {
         PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
@@ -1497,6 +1679,14 @@ export class LiveSupabaseExecutor implements Executor {
         throw new Error("Project lacks auth-admin capability");
       }
       const { name, account } = passwordAccountRequest(project, job.payload);
+      const passwordVault = this.#passwordVault ??
+        (process.platform === "darwin" ? new MacOsKeychainBackend() : undefined);
+      const resolvePassword = passwordVault
+        ? (reference: string) => passwordVault.get(reference)
+        : this.#resolveReference;
+      if (!resolvePassword) {
+        throw new Error("Local Auth passwords require vault_command on this platform");
+      }
       const database = await this.#assertLocalStack(repository, supabaseDir);
       validateLocalPasswordStatus(database.status);
       const reconciled = await this.#process.run({
@@ -1514,9 +1704,8 @@ export class LiveSupabaseExecutor implements Executor {
       if (reconciled.exitCode !== 0) {
         throw new Error(`Local Auth placeholder reconciliation failed with exit code ${reconciled.exitCode}`);
       }
-      const passwordVault = this.#passwordVault ?? new MacOsKeychainBackend();
       let password: string;
-      try { password = await passwordVault.get(account.password_ref); }
+      try { password = await resolvePassword(account.password_ref); }
       catch { throw new Error("Local Auth password vault is unavailable"); }
       await upsertLocalPasswordAccount(account, password, database.status, this.#fetch);
       return {
@@ -1674,7 +1863,7 @@ export class LiveSupabaseExecutor implements Executor {
       env: this.#localEnvironment({ NO_COLOR: "1" })
     });
     if (status.exitCode !== 0) {
-      throw new Error(
+      throw new LocalStackUnavailable(
         `Local Supabase stack is unavailable (exit code ${status.exitCode})`
       );
     }
@@ -1724,9 +1913,8 @@ export class LiveSupabaseExecutor implements Executor {
     credentials: ResolvedCredentials
   ): Promise<ExecutionResult> {
     const password = databasePassword(credentials.database_access);
-    const executable = this.#prismaExecutable(repository);
     const argv = [
-      executable,
+      ...this.#prismaCommand(repository),
       "migrate",
       operation === "plan" ? "status" : "deploy"
     ];
@@ -1765,18 +1953,15 @@ export class LiveSupabaseExecutor implements Executor {
     };
   }
 
-  #prismaExecutable(repository: string): string {
-    const localExecutable = join(
-      repository,
-      "node_modules",
-      ".bin",
-      "prisma"
-    );
+  #prismaCommand(repository: string): readonly string[] {
+    if (this.#executables.prisma !== "prisma") {
+      return [this.#executables.prisma];
+    }
     try {
-      accessSync(localExecutable, constants.X_OK);
-      return localExecutable;
-    } catch {
-      return this.#executables.prisma;
+      return this.#resolveCommand("prisma", { repository }).argv;
+    } catch (error) {
+      if (process.platform === "win32" || process.env.SUPADRUM_PRISMA_BIN) throw error;
+      return [this.#executables.prisma];
     }
   }
 
@@ -1965,7 +2150,7 @@ export class LiveSupabaseExecutor implements Executor {
       initialHistory
     );
     const resolved: string[] = [];
-    const executable = this.#prismaExecutable(repository);
+    const prismaCommand = this.#prismaCommand(repository);
     const environment = this.#prismaEnvironment(credentials);
     const secrets = [
       ...Object.values(credentials),
@@ -1975,7 +2160,7 @@ export class LiveSupabaseExecutor implements Executor {
     for (const name of initialPlan.missing) {
       const result = await this.#process.run({
         argv: [
-          executable,
+          ...prismaCommand,
           "migrate",
           "resolve",
           "--applied",
@@ -2078,6 +2263,52 @@ export class LiveSupabaseExecutor implements Executor {
       output,
       "Types output file"
     );
+    const relativePath = relative(resolve(repository), absolutePath);
+    const segments = relativePath.split(sep);
+    const windows = process.platform === "win32";
+    if (!relativePath || segments.some((segment) =>
+      segment.toLowerCase() === ".git" ||
+      (windows && (
+        /[<>:"\\|?*\u0000-\u001f]|[. ]$|~[0-9]+(?:\.|$)/.test(segment) ||
+        /^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³])$/i
+          .test(segment.split(".", 1)[0]!.trimEnd())
+      ))
+    )) {
+      throw new Error("Types output file must be a regular project path outside Git metadata");
+    }
+    const root = realpathSync(repository);
+    const target = join(root, relativePath);
+    const inspectOutput = () => {
+      if (realpathSync(root) !== root) {
+        throw new Error("Types output file repository changed");
+      }
+      let path = root;
+      for (const [index, segment] of segments.entries()) {
+        path = join(path, segment);
+        const entry = lstatSync(path, { throwIfNoEntry: false });
+        if (!entry) return undefined;
+        const leaf = index === segments.length - 1;
+        if (
+          !(leaf ? entry.isFile() && entry.nlink === 1 : entry.isDirectory()) ||
+          (windows && relative(path, realpathSync(path)) !== "")
+        ) {
+          throw new Error("Types output file must use regular directories and an unlinked regular file");
+        }
+        if (leaf) return entry;
+      }
+    };
+    const previous = inspectOutput();
+    if (previous) accessSync(target, constants.W_OK);
+    const ensureUnchanged = () => {
+      const current = inspectOutput();
+      if (
+        current?.dev !== previous?.dev || current?.ino !== previous?.ino ||
+        current?.size !== previous?.size || current?.mtimeMs !== previous?.mtimeMs ||
+        current?.ctimeMs !== previous?.ctimeMs
+      ) {
+        throw new Error("Types output file changed during generation");
+      }
+    };
     if (credentials && !project.project_ref) {
       throw new Error(`Project ${job.project} has no project_ref`);
     }
@@ -2119,14 +2350,29 @@ export class LiveSupabaseExecutor implements Executor {
     if (!generated.trim()) {
       throw new Error("Type generation produced no output");
     }
-    mkdirSync(dirname(absolutePath), { recursive: true });
-    writeFileSync(absolutePath, generated);
+    ensureUnchanged();
+    mkdirSync(dirname(target), { recursive: true });
+    ensureUnchanged();
+    const temporaryPath = join(dirname(target), ".supadrum-types-" + randomBytes(12).toString("hex"));
+    const fd = openSync(temporaryPath, "wx", previous ? previous.mode & 0o777 : 0o666);
+    try {
+      try {
+        writeFileSync(fd, generated);
+        if (previous && !windows) fchmodSync(fd, previous.mode & 0o777);
+      } finally {
+        closeSync(fd);
+      }
+      ensureUnchanged();
+      renameSync(temporaryPath, target);
+    } finally {
+      rmSync(temporaryPath, { force: true });
+    }
     return {
       output: { exit_code: 0, stdout: "", stderr },
       verification: {
         repo_sha_verified: true,
         repository_oid: repositoryOid,
-        output: relative(resolve(repository), absolutePath),
+        output: relativePath,
         digest: createHash("sha256").update(generated).digest("hex"),
         bytes: Buffer.byteLength(generated),
         ...(credentials ? {} : { target: "local", local_preflight: true })

@@ -4,13 +4,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  realpathSync,
+  realpathSync as realpathSyncNative,
   statSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 import { describe, expect, test } from "vitest";
 import { parse, stringify } from "yaml";
 
@@ -23,14 +24,11 @@ import { MissingVaultValueError } from "../src/vault-cli.js";
 import type { VaultBackend } from "../src/vault.js";
 
 const execFileAsync = promisify(execFile);
+const realpathSync = realpathSyncNative.native;
 const repositoryRoot = process.cwd();
-const tsxLoader = join(
-  repositoryRoot,
-  "node_modules",
-  "tsx",
-  "dist",
-  "loader.mjs"
-);
+const tsxLoader = pathToFileURL(
+  join(repositoryRoot, "node_modules", "tsx", "dist", "loader.mjs")
+).href;
 const cliSource = join(repositoryRoot, "src", "cli.ts");
 
 class MemoryVault implements VaultBackend {
@@ -104,7 +102,7 @@ process.stdin.on("end", () => {
 
 /** An operator root: somewhere to put a config, and repositories to point at. */
 function workspace(prefix: string) {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   return {
     root,
     configPath: join(root, "config.yml"),
@@ -154,7 +152,7 @@ function cli(overrides: Partial<CliRuntimeShape> = {}) {
   // cwd and home default to the same directory: project discovery searches
   // both, so a test that moves one and not the other is usually not testing
   // what it means to. Pass `homeDirectory` explicitly to separate them.
-  const root = overrides.cwd ?? mkdtempSync(join(tmpdir(), "supadrum-cli-"));
+  const root = overrides.cwd ?? realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-")));
   return {
     io: {
       stdout: (text: string) => out.push(text),
@@ -196,7 +194,7 @@ describe("operator CLI", () => {
   });
 
   test("configures migration ownership and per-project mode", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-mode-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-mode-")));
     const webRepository = join(root, "example-web");
     const iosRepository = join(root, "example-ios");
     const configPath = join(root, "config.yml");
@@ -302,7 +300,7 @@ projects:
   });
 
   test("repairs an existing repository without re-discovering its configured ref", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-repair-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-repair-")));
     const repository = join(root, "Documents", "example-service");
     const frontend = join(repository, "frontend");
     const configPath = join(root, "config.yml");
@@ -348,8 +346,9 @@ projects:
         keychain: () => new MemoryVault()
       }
     )).toBe(0);
-    expect(loadConfig(configPath).projects["example-service"]?.repo)
-      .toContain("/Documents/example-service");
+    expect(loadConfig(configPath).projects["example-service"]?.repo).toBe(
+      realpathSync(repository)
+    );
     expect(output.join("")).toContain(
       "supadrum project credentials set example-service"
     );
@@ -550,7 +549,7 @@ projects:
   });
 
   test("creates initialized operator config with owner-only permissions", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-init-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-init-")));
     const configPath = join(root, "config", "supadrum.yml");
 
     await execFileAsync(
@@ -559,7 +558,9 @@ projects:
       { cwd: repositoryRoot }
     );
 
-    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    }
   });
 
   test("runs an isolated end-to-end dry-run demo", async () => {
@@ -583,7 +584,7 @@ projects:
   });
 
   test("adds a sibling project from an unrelated Supadrum root", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-add-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-add-")));
     const cwd = join(root, "supadrum");
     const project = join(root, "example-ios");
     const configHome = join(root, "operator");
@@ -648,10 +649,12 @@ projects:
         restart_required: true
       }
     });
-    expect(result.repository).toContain("/example-ios");
+    expect(result.repository).toBe(realpathSync(project));
     expect(config.executor).toBe("dry-run");
-    expect(config.projects["example-ios"]?.repo).toContain("/example-ios");
-    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    expect(config.projects["example-ios"]?.repo).toBe(realpathSync(project));
+    if (process.platform !== "win32") {
+      expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    }
     expect(
       readFileSync(
         join(project, ".agents", "skills", "supadrum", "SKILL.md"),
@@ -700,7 +703,7 @@ projects:
     );
     expect(JSON.parse(inspected.stdout)).toMatchObject({
       name: "example-ios",
-      repo: expect.stringContaining("/example-ios"),
+      repo: realpathSync(project),
       project_ref: "abcdefghijklmnopqrst",
       executor: "dry-run"
     });
@@ -709,8 +712,8 @@ projects:
   });
 
   test("adds a local project without discovering or requesting a remote ref", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-local-"));
-    const repository = join(root, "materic-ai");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-local-")));
+    const repository = join(root, "exampleapp-ai");
     const configPath = join(root, "operator", "config.yml");
     execFileSync("git", ["init", "--quiet", repository]);
 
@@ -719,7 +722,7 @@ projects:
       [
         "project",
         "add",
-        "materic-ai-local",
+        "exampleapp-ai-local",
         "--local",
         "--repo",
         repository,
@@ -747,11 +750,11 @@ projects:
 
     expect(JSON.parse(chunks.join(""))).toMatchObject({
       added: true,
-      alias: "materic-ai-local",
+      alias: "exampleapp-ai-local",
       target: "local",
       ready: true
     });
-    expect(loadConfig(configPath).projects["materic-ai-local"]).toMatchObject({
+    expect(loadConfig(configPath).projects["exampleapp-ai-local"]).toMatchObject({
       target: "local",
       mode: "live",
       capabilities: ["migrations"]
@@ -760,9 +763,9 @@ projects:
 
   test("starts only a registered local project from its repository", async () => {
     const space = workspace("supadrum-cli-local-start-");
-    const repository = space.gitRepo("presnap");
+    const repository = space.gitRepo("sampleapp");
     addLocalProject({
-      alias: "presnap-local",
+      alias: "sampleapp-local",
       repository,
       config_path: space.configPath
     });
@@ -776,7 +779,7 @@ projects:
     });
 
     expect(await runCli([
-      "project", "start", "presnap-local", "--config", space.configPath
+      "project", "start", "sampleapp-local", "--config", space.configPath
     ], harness.io, harness.runtime)).toBe(0);
     expect(started).toEqual([realpathSync(repository)]);
     expect(harness.stdout()).toBe("stack ready\n");
@@ -805,7 +808,7 @@ projects:
   });
 
   test("supports opting out and repairing Codex setup later", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-agent-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-agent-")));
     const cwd = join(root, "supadrum");
     const project = join(root, "example-ios");
     const configHome = join(root, "operator");
@@ -1109,7 +1112,9 @@ describe("operator CLI: bootstrap commands", () => {
       await runCli(["init", configPath], harness.io, harness.runtime)
     ).toBe(0);
 
-    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    }
     expect(loadConfig(configPath).projects).toBeDefined();
   });
 
@@ -1178,7 +1183,7 @@ describe("operator CLI: input validation and prompting", () => {
     const space = workspace("supadrum-cli-validate-");
     // Discovery walks up from cwd and home, so an unrelated directory is the
     // only way to reach the prompt: a sibling of the repo would be found.
-    const away = mkdtempSync(join(tmpdir(), "supadrum-cli-away-"));
+    const away = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-away-")));
     return {
       ...space,
       away,
@@ -1227,7 +1232,7 @@ describe("operator CLI: input validation and prompting", () => {
   });
 
   test("fails loudly under --yes rather than waiting for an answer", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-noninteractive-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-noninteractive-")));
     const harness = cli({
       cwd: root,
       question: async () => {
@@ -1433,8 +1438,8 @@ describe("operator CLI: failure paths that guide the operator", () => {
   });
 
   test("says where to pass a repository it cannot discover", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-norepo-"));
-    const away = mkdtempSync(join(tmpdir(), "supadrum-cli-norepo-away-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-norepo-")));
+    const away = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-norepo-away-")));
     const configPath = join(root, "config.yml");
     writeFileSync(
       configPath,
@@ -1632,7 +1637,7 @@ describe("operator CLI: misconfiguration is reported, not crashed on", () => {
   });
 
   test("does not attach the setup hint to an unrelated failure", async () => {
-    const root = mkdtempSync(join(tmpdir(), "supadrum-cli-notgit-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "supadrum-cli-notgit-")));
     const repository = join(root, "plain-directory");
     mkdirSync(repository);
     const harness = cli({ cwd: root });
