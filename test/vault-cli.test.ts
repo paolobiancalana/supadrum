@@ -759,7 +759,9 @@ describe("age-encrypted vault", () => {
       });
 
       expect(await readFile(path, "utf8")).toBe(encrypted);
-      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect((await stat(path)).mode & 0o777).toBe(0o600);
+      }
       expect(await readFile(path, "utf8")).not.toContain("top-secret-canary");
       expect(runner.invocations[0]).toEqual({
         argv: [
